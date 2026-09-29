@@ -1290,8 +1290,9 @@ async def async_main():
             return web.Response(text="Bad Request", status=400)
 
     web_app = web.Application()
+    # aiohttp automatically handles HEAD for GET routes; adding a separate
+    # HEAD route would cause a duplicate-route RuntimeError.
     web_app.router.add_get("/health", health_handler)
-    web_app.router.add_head("/health", health_handler)
     web_app.router.add_post(f"/{webhook_path}", webhook_handler)
 
     runner = web.AppRunner(web_app)
