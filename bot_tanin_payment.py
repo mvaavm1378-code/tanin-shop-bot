@@ -37,8 +37,8 @@ from telegram.ext import (
 # ----------------------------------------------------------------------------
 # تنظیمات
 # ----------------------------------------------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+BOT_TOKEN = "8861541435:AAFXKJk6tfODRcVHb9wZgCeB-RrE2nK_hwU"
+ADMIN_IDS = [1241323861]
 
 # Supabase PostgreSQL connection string.
 # Put the value from Supabase > Connect > PostgreSQL in SUPABASE_DB_URL.
@@ -813,7 +813,7 @@ async def admin_bank_detail(q, account_id):
         f"حساب: <code>{escape(a['account_number'] or '-')}</code>\n"
         f"شبا: <code>{escape(a['iban'] or '-')}</code>\n"
         f"وضعیت: <b>{state}</b>\n"
-        f"آخرین تغییر: {escape(str(a['updated_at']) if a['updated_at'] else '-')}"
+        f"آخرین تغییر: {escape(a['updated_at'] or '-')}"
     )
     buttons = []
     if a["active"]:
