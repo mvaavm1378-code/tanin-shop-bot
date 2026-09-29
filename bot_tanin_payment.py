@@ -813,7 +813,7 @@ async def admin_bank_detail(q, account_id):
         f"حساب: <code>{escape(a['account_number'] or '-')}</code>\n"
         f"شبا: <code>{escape(a['iban'] or '-')}</code>\n"
         f"وضعیت: <b>{state}</b>\n"
-        f"آخرین تغییر: {escape(a['updated_at'] or '-')}"
+        f"آخرین تغییر: {escape(str(a['updated_at']) if a['updated_at'] else '-')}"
     )
     buttons = []
     if a["active"]:
