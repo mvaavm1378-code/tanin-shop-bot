@@ -14,12 +14,8 @@ import asyncio
 import psycopg
 from psycopg.rows import dict_row
 import logging
-import json
 from html import escape
 from datetime import datetime
-
-import tornado.web
-import tornado.httpserver
 
 from telegram import (
     Update,
@@ -817,7 +813,7 @@ async def admin_bank_detail(q, account_id):
         f"حساب: <code>{escape(a['account_number'] or '-')}</code>\n"
         f"شبا: <code>{escape(a['iban'] or '-')}</code>\n"
         f"وضعیت: <b>{state}</b>\n"
-        f"آخرین تغییر: {escape(a['updated_at'] or '-')}"
+        f"آخرین تغییر: {escape(str(a['updated_at']) if a['updated_at'] else '-')}"
     )
     buttons = []
     if a["active"]:
@@ -1215,41 +1211,17 @@ async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ----------------------------------------------------------------------------
-# راه‌اندازی ربات روی Render Web Service
+# راه‌اندازی ربات
 # ----------------------------------------------------------------------------
-class HealthHandler(tornado.web.RequestHandler):
-    def get(self):
-        self.set_header("Content-Type", "text/plain; charset=utf-8")
-        self.write("Bot is running")
+def main():
+    # Web Service رایگان Render باید یک HTTP port باز کند.
+    # برای ربات تلگرام از Webhook استفاده می‌کنیم تا خود Telegram
+    # آپدیت‌ها را به URL عمومی Render ارسال کند.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
-    def head(self):
-        self.set_header("Content-Type", "text/plain; charset=utf-8")
-        self.set_status(200)
-
-
-class TelegramWebhookHandler(tornado.web.RequestHandler):
-    async def post(self):
-        expected_secret = os.getenv("WEBHOOK_SECRET", "").strip()
-        if expected_secret:
-            received_secret = self.request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if received_secret != expected_secret:
-                self.set_status(403)
-                self.finish("Forbidden")
-                return
-
-        try:
-            data = json.loads(self.request.body.decode("utf-8"))
-            update = Update.de_json(data, self.application.settings["ptb_application"].bot)
-            await self.application.settings["ptb_application"].update_queue.put(update)
-            self.set_status(200)
-            self.finish("OK")
-        except Exception:
-            logger.exception("Failed to process Telegram webhook request")
-            self.set_status(400)
-            self.finish("Bad Request")
-
-
-async def main_async():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set. Add BOT_TOKEN to the Render environment variables.")
 
@@ -1287,6 +1259,7 @@ async def main_async():
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_input))
 
+    # Render این متغیر را برای Web Service تنظیم می‌کند.
     hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
     if not hostname:
         raise RuntimeError("RENDER_EXTERNAL_HOSTNAME is not available. Deploy this bot as a Render Web Service.")
@@ -1298,34 +1271,16 @@ async def main_async():
 
     logger.info("Bot is starting with Telegram webhook: %s", webhook_url)
 
-    await app.initialize()
-    await app.start()
-    await app.bot.set_webhook(
-        url=webhook_url,
+    # run_webhook خودش HTTP server را روی 0.0.0.0 و PORT اجرا می‌کند.
+    # secret token اختیاری است، ولی در Render توصیه می‌شود فعال باشد.
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=webhook_path,
+        webhook_url=webhook_url,
         secret_token=webhook_secret or None,
         drop_pending_updates=False,
     )
-
-    tornado_app = tornado.web.Application([
-        (r"/health/?", HealthHandler),
-        (rf"/{webhook_path}/?", TelegramWebhookHandler),
-    ], ptb_application=app)
-    server = tornado.httpserver.HTTPServer(tornado_app)
-    server.listen(port, address="0.0.0.0")
-    logger.info("HTTP server is listening on 0.0.0.0:%s", port)
-    logger.info("Health endpoint: https://%s/health", hostname)
-
-    try:
-        await asyncio.Event().wait()
-    finally:
-        server.stop()
-        await app.bot.delete_webhook(drop_pending_updates=False)
-        await app.stop()
-        await app.shutdown()
-
-
-def main():
-    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
