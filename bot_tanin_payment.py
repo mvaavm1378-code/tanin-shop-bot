@@ -18,6 +18,7 @@ import json
 from html import escape
 from aiohttp import web
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from telegram import (
     Update,
@@ -56,6 +57,89 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# منطقه زمانی رسمی ربات برای ثبت و نمایش زمان‌ها
+IRAN_TZ = ZoneInfo("Asia/Tehran")
+
+
+def iran_now_naive():
+    """Current Iran local time as a naive datetime for existing DB string columns."""
+    return datetime.now(IRAN_TZ).replace(tzinfo=None)
+
+
+def _to_iran_datetime(value):
+    """Convert a DB datetime/string to Iran time. Naive values are assumed Iran-local."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text or text == "-":
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                try:
+                    dt = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    dt = None
+            if dt is None:
+                return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IRAN_TZ)
+    return dt.astimezone(IRAN_TZ)
+
+
+def gregorian_to_jalali(gy, gm, gd):
+    """Convert Gregorian date to Jalali date without external dependencies."""
+    g_days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    j_days_in_month = [31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 29]
+    gy2 = gy - 1600
+    gm2 = gm - 1
+    gd2 = gd - 1
+    g_day_no = 365 * gy2 + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400
+    for i in range(gm2):
+        g_day_no += g_days_in_month[i]
+    if gm2 > 1 and ((gy % 4 == 0 and gy % 100 != 0) or (gy % 400 == 0)):
+        g_day_no += 1
+    g_day_no += gd2
+    j_day_no = g_day_no - 79
+    j_np = j_day_no // 12053
+    j_day_no %= 12053
+    jy = 979 + 33 * j_np + 4 * (j_day_no // 1461)
+    j_day_no %= 1461
+    if j_day_no >= 366:
+        jy += (j_day_no - 1) // 365
+        j_day_no = (j_day_no - 1) % 365
+    for i in range(11):
+        if j_day_no < j_days_in_month[i]:
+            jm = i + 1
+            jd = j_day_no + 1
+            break
+        j_day_no -= j_days_in_month[i]
+    else:
+        jm = 12
+        jd = j_day_no + 1
+    return jy, jm, jd
+
+
+def format_iran_jalali(value, include_time=True):
+    dt = _to_iran_datetime(value)
+    if dt is None:
+        return "-"
+    jy, jm, jd = gregorian_to_jalali(dt.year, dt.month, dt.day)
+    result = f"{jy:04d}/{jm:02d}/{jd:02d}"
+    if include_time:
+        result += f" - {dt.hour:02d}:{dt.minute:02d}"
+    return result
+
+
+def format_iran_jalali_fa(value, include_time=True):
+    text = format_iran_jalali(value, include_time=include_time)
+    return str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹") and text.translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
 
 # مراحل مکالمه برای ثبت سفارش
 ASK_NAME, ASK_PHONE, ASK_GENDER, ASK_ADDRESS = range(4)
@@ -222,7 +306,7 @@ def cart_item_keyboard(item_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     conn = get_conn()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
     conn.execute(
         """INSERT INTO customers(user_id, username, full_name, first_seen, last_seen)
            VALUES (%s, %s, %s, %s, %s)
@@ -358,7 +442,7 @@ async def remove_from_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     conn = get_conn()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
     conn.execute(
         """INSERT INTO customers(user_id, username, full_name, first_seen, last_seen)
            VALUES (%s, %s, %s, %s, %s)
@@ -400,7 +484,7 @@ def save_saved_data(user_id, data_type, value):
     value = (value or "").strip()
     if not value or data_type not in SAVED_TYPES:
         return
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
     conn = get_conn()
     conn.execute(
         """INSERT INTO customer_saved_data(user_id, data_type, value, created_at, updated_at)
@@ -414,7 +498,7 @@ def save_saved_data(user_id, data_type, value):
 
 def update_saved_data(user_id, data_id, data_type, value):
     value = (value or "").strip()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
     conn = get_conn()
     conn.execute(
         "UPDATE customer_saved_data SET value=%s, updated_at=%s WHERE id=%s AND user_id=%s AND data_type=%s",
@@ -697,7 +781,7 @@ async def create_pending_payment(message, context, user=None):
     user_id = message.chat_id
     username = (user.username if user is not None else message.from_user.username) or ""
     conn = get_conn()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
     full_name = context.user_data["full_name"].strip()
     phone = context.user_data["phone"].strip()
     address = context.user_data["address"].strip()
@@ -791,25 +875,24 @@ async def cancel_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def customer_orders_keyboard(rows):
     buttons = []
     for o in rows:
-        created = str(o["created_at"] or "-")
-        order_date = created[:10] if len(created) >= 10 else created
+        order_date = format_iran_jalali_fa(o["created_at"], include_time=False)
         buttons.append([
             InlineKeyboardButton(
                 f"📦 سفارش #{o['id']} | {order_date}",
                 callback_data=f"customer_order:view:{o['id']}"
             )
         ])
-    buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="customer_order:close")])
+    buttons.append([InlineKeyboardButton("🔙 بستن", callback_data="customer_order:close")])
     return InlineKeyboardMarkup(buttons)
 
 
 def customer_order_detail_text(o):
-    finalized = o.get("finalized_at") or o.get("created_at") or "-"
+    finalized = o.get("finalized_at") or o.get("created_at")
     return (
         f"📦 <b>جزئیات سفارش #{o['id']}</b>\n"
         f"━━━━━━━━━━━━━━\n"
-        f"📅 تاریخ سفارش: <b>{escape(str(o['created_at'] or '-'))}</b>\n"
-        f"✅ نهایی شده در: <b>{escape(str(finalized))}</b>\n"
+        f"📅 تاریخ سفارش: <b>{escape(format_iran_jalali_fa(o.get('created_at'), include_time=True))}</b>\n"
+        f"✅ نهایی شده در: <b>{escape(format_iran_jalali_fa(finalized, include_time=True))}</b>\n"
         f"📌 وضعیت: <b>{escape(str(o['status'] or '-'))}</b>\n"
         f"💳 وضعیت پرداخت: <b>{escape(str(o['payment_status'] or '-'))}</b>\n\n"
         f"👤 نام: {escape(str(o['full_name'] or '-'))}\n"
@@ -1230,7 +1313,7 @@ async def bank_accounts_action(q, context, action, account_id):
     a = conn.execute("SELECT * FROM bank_accounts WHERE id=%s", (account_id,)).fetchone()
     if not a:
         conn.close(); await q.answer("حساب پیدا نشد.", show_alert=True); return
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
     if action == "activate":
         conn.execute("UPDATE bank_accounts SET active=FALSE, updated_at=%s", (now,))
         conn.execute("UPDATE bank_accounts SET active=TRUE, updated_at=%s WHERE id=%s", (now, account_id))
@@ -1284,7 +1367,7 @@ async def receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pending:
         conn.close(); return
     file_id = update.message.photo[-1].file_id if update.message.photo else update.message.document.file_id
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
     conn.execute("UPDATE pending_payments SET receipt_file_id=%s, payment_status='در انتظار بررسی' WHERE id=%s", (file_id, pending['id']))
     conn.commit(); conn.close()
     await update.message.reply_text("✅ رسید دریافت شد. پرداختت برای بررسی ارسال شد.\n🟡 تا تأیید پرداخت، سفارش نهایی ثبت نمی‌شود.", reply_markup=main_menu_keyboard(user_id))
@@ -1317,7 +1400,7 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
         conn.close(); await q.answer("پرداخت پیدا نشد.", show_alert=True); return
     if pending['payment_status'] not in ('در انتظار بررسی',):
         conn.close(); await q.answer("این پرداخت قبلاً بررسی شده است.", show_alert=True); return
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
     if action == 'reject':
         conn.execute("UPDATE pending_payments SET payment_status='رد شد', reviewed_at=%s, admin_id=%s WHERE id=%s", (now, q.from_user.id, pid))
         conn.commit(); conn.close()
@@ -1477,7 +1560,7 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not iban.startswith("IR") and len(iban)!=24:
                 await update.message.reply_text("❌ شماره شبا باید ۲۴ رقم یا با IR مجموعاً ۲۶ کاراکتر باشد. دوباره بفرست:"); return
             if not iban.startswith("IR"): iban="IR"+iban
-            flow["iban"]=iban; now=datetime.now().strftime("%Y-%m-%d %H:%M")
+            flow["iban"]=iban; now=iran_now_naive().strftime("%Y-%m-%d %H:%M")
             conn=get_conn()
             if flow["mode"]=="edit":
                 conn.execute("""UPDATE bank_accounts SET bank_name=%s, owner_name=%s, card_number=%s, account_number=%s, iban=%s, updated_at=%s WHERE id=%s""",
