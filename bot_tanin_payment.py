@@ -123,7 +123,7 @@ def init_db():
             "cart_items": {"id", "user_id", "product_id", "qty"},
             "bank_accounts": {"id", "bank_name", "owner_name", "card_number", "account_number", "iban", "active", "created_at", "updated_at"},
             "pending_payments": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "payment_status", "receipt_file_id", "created_at", "reviewed_at", "order_id", "admin_id"},
-            "orders": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "status", "created_at", "payment_status", "transaction_ref"},
+            "orders": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "status", "created_at", "finalized_at", "payment_status", "transaction_ref"},
             "app_meta": {"key", "value"},
         }
         for table, cols in expected_columns.items():
@@ -788,11 +788,43 @@ async def cancel_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------------
 # سفارش‌های من / پشتیبانی
 # ----------------------------------------------------------------------------
+def customer_orders_keyboard(rows):
+    buttons = []
+    for o in rows:
+        created = str(o["created_at"] or "-")
+        order_date = created[:10] if len(created) >= 10 else created
+        buttons.append([
+            InlineKeyboardButton(
+                f"📦 سفارش #{o['id']} | {order_date}",
+                callback_data=f"customer_order:view:{o['id']}"
+            )
+        ])
+    buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="customer_order:close")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def customer_order_detail_text(o):
+    finalized = o.get("finalized_at") or o.get("created_at") or "-"
+    return (
+        f"📦 <b>جزئیات سفارش #{o['id']}</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📅 تاریخ سفارش: <b>{escape(str(o['created_at'] or '-'))}</b>\n"
+        f"✅ نهایی شده در: <b>{escape(str(finalized))}</b>\n"
+        f"📌 وضعیت: <b>{escape(str(o['status'] or '-'))}</b>\n"
+        f"💳 وضعیت پرداخت: <b>{escape(str(o['payment_status'] or '-'))}</b>\n\n"
+        f"👤 نام: {escape(str(o['full_name'] or '-'))}\n"
+        f"📞 شماره تماس: {escape(str(o['phone'] or '-'))}\n"
+        f"📍 آدرس: {escape(str(o['address'] or '-'))}\n\n"
+        f"🛍 <b>محصولات:</b>\n{escape(str(o['items_summary'] or '-'))}\n\n"
+        f"💰 مبلغ: <b>{int(o['total_price'] or 0):,} تومان</b>"
+    )
+
+
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conn = get_conn()
     rows = conn.execute(
-        "SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC", (user_id,)
+        "SELECT id, created_at FROM orders WHERE user_id=%s ORDER BY id DESC", (user_id,)
     ).fetchall()
     conn.close()
 
@@ -800,13 +832,74 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("هنوز سفارشی ثبت نکردی.")
         return
 
-    for o in rows:
-        await update.message.reply_text(
-            f"📦 سفارش #{o['id']} - {o['created_at']}\n"
-            f"وضعیت: {o['status']}\n"
-            f"{o['items_summary']}\n"
-            f"مبلغ: {o['total_price']:,} تومان"
+    await update.message.reply_text(
+        "📦 <b>سفارش‌های من</b>\n\nسفارش موردنظرت رو انتخاب کن:",
+        parse_mode="HTML",
+        reply_markup=customer_orders_keyboard(rows),
+    )
+
+
+async def customer_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    parts = q.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "close":
+        await q.answer()
+        try:
+            await q.message.delete()
+        except Exception:
+            await q.edit_message_text("منوی سفارش‌ها بسته شد.")
+        return
+
+    if action == "list":
+        conn = get_conn()
+        rows = conn.execute(
+            "SELECT id, created_at FROM orders WHERE user_id=%s ORDER BY id DESC", (q.from_user.id,)
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await q.answer()
+            await q.edit_message_text("هنوز سفارشی ثبت نکردی.")
+            return
+        await q.answer()
+        await q.edit_message_text(
+            "📦 <b>سفارش‌های من</b>\n\nسفارش موردنظرت رو انتخاب کن:",
+            parse_mode="HTML",
+            reply_markup=customer_orders_keyboard(rows),
         )
+        return
+
+    if action != "view" or len(parts) != 3:
+        await q.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+
+    try:
+        order_id = int(parts[2])
+    except ValueError:
+        await q.answer("شماره سفارش نامعتبر است.", show_alert=True)
+        return
+
+    conn = get_conn()
+    order = conn.execute(
+        "SELECT * FROM orders WHERE id=%s AND user_id=%s", (order_id, q.from_user.id)
+    ).fetchone()
+    conn.close()
+
+    if not order:
+        await q.answer("این سفارش برای حساب شما پیدا نشد.", show_alert=True)
+        return
+
+    await q.answer()
+    await q.edit_message_text(
+        customer_order_detail_text(order),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 بازگشت به سفارش‌ها", callback_data="customer_order:list")]
+        ]),
+    )
+
+    return
 
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1235,10 +1328,10 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
     # approve: only here is the real order inserted and cart cleared
     cur = conn.execute("""INSERT INTO orders
-        (user_id, full_name, phone, address, items_summary, total_price, status, created_at, payment_status, transaction_ref)
-        VALUES (%s, %s, %s, %s, %s, %s, 'در انتظار بررسی', %s, 'تأیید شده', %s)
+        (user_id, full_name, phone, address, items_summary, total_price, status, created_at, finalized_at, payment_status, transaction_ref)
+        VALUES (%s, %s, %s, %s, %s, %s, 'در انتظار بررسی', %s, %s, 'تأیید شده', %s)
         RETURNING id""",
-        (pending['user_id'], pending['full_name'], pending['phone'], pending['address'], pending['items_summary'], pending['total_price'], now, f"CARD-TRANSFER-{pid}"))
+        (pending['user_id'], pending['full_name'], pending['phone'], pending['address'], pending['items_summary'], pending['total_price'], now, now, f"CARD-TRANSFER-{pid}"))
     order_id = cur.fetchone()["id"]
     conn.execute("DELETE FROM cart_items WHERE user_id=%s", (pending['user_id'],))
     conn.execute("UPDATE pending_payments SET payment_status='تأیید شده', reviewed_at=%s, admin_id=%s, order_id=%s WHERE id=%s", (now, q.from_user.id, order_id, pid))
@@ -1546,6 +1639,7 @@ async def async_main():
 
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(order_callback, pattern=r"^order:"))
+    app.add_handler(CallbackQueryHandler(customer_order_callback, pattern=r"^customer_order:"))
     app.add_handler(CallbackQueryHandler(payment_admin_callback, pattern=r"^payadmin:"))
     app.add_handler(CallbackQueryHandler(payment_callback, pattern=r"^pay:"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, receipt_photo))
