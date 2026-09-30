@@ -488,14 +488,49 @@ async def cancel_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conn = get_conn()
+
+    # سفارش‌های نهایی: مبلغ این سفارش‌ها ثابت می‌ماند و با تغییر قیمت محصولات تغییر نمی‌کند.
     rows = conn.execute(
         "SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC", (user_id,)
     ).fetchall()
+
+    # سفارش در انتظار پرداخت: مبلغ از قیمت فعلی محصولات محاسبه می‌شود.
+    # فقط «در انتظار رسید» قابل تغییر است؛ بعد از ارسال رسید مبلغ قفل می‌شود.
+    pending = conn.execute(
+        """SELECT * FROM pending_payments
+           WHERE user_id=%s AND payment_status='در انتظار رسید'
+           ORDER BY id DESC LIMIT 1""", (user_id,)
+    ).fetchone()
+    if pending:
+        current_total = conn.execute(
+            """SELECT COALESCE(SUM(products.price * cart_items.qty), 0) AS total
+               FROM cart_items
+               JOIN products ON cart_items.product_id = products.id
+               WHERE cart_items.user_id=%s AND products.active=TRUE""",
+            (user_id,),
+        ).fetchone()["total"]
+        if current_total and current_total != pending["total_price"]:
+            conn.execute(
+                "UPDATE pending_payments SET total_price=%s WHERE id=%s",
+                (current_total, pending["id"]),
+            )
+            conn.commit()
+            pending = dict(pending)
+            pending["total_price"] = current_total
+
     conn.close()
 
-    if not rows:
+    if not rows and not pending:
         await update.message.reply_text("هنوز سفارشی ثبت نکردی.")
         return
+
+    if pending:
+        await update.message.reply_text(
+            f"🟡 سفارش در انتظار پرداخت\n"
+            f"وضعیت: در انتظار رسید\n"
+            f"مبلغ فعلی: {pending['total_price']:,} تومان\n"
+            f"برای پرداخت، دستور /checkout را بفرست."
+        )
 
     for o in rows:
         await update.message.reply_text(
@@ -1129,7 +1164,21 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif step == "price":
             try: price=int(text.replace(",","")); assert price>=0
             except Exception: conn.close(); await update.message.reply_text("❌ قیمت نامعتبر است."); return
-            conn.execute("UPDATE products SET price=%s WHERE id=%s",(price,pid)); flow["step"]="photo"; await update.message.reply_text("لینک عکس جدید را بفرست؛ برای بدون عکس «ندارد».")
+            conn.execute("UPDATE products SET price=%s WHERE id=%s",(price,pid))
+            # سفارش‌هایی که هنوز رسید برایشان ارسال نشده، باید قیمت جدید را ببینند.
+            # سفارش‌هایی که رسید ارسال شده یا پرداختشان تأیید شده، مبلغ قبلی را حفظ می‌کنند.
+            conn.execute("""UPDATE pending_payments AS pp
+               SET total_price = totals.total
+               FROM (
+                   SELECT ci.user_id, SUM(p.price * ci.qty) AS total
+                   FROM cart_items ci
+                   JOIN products p ON p.id = ci.product_id
+                   WHERE ci.product_id=%s AND p.active=TRUE
+                   GROUP BY ci.user_id
+               ) AS totals
+               WHERE pp.user_id=totals.user_id
+                 AND pp.payment_status='در انتظار رسید'""", (pid,))
+            flow["step"]="photo"; await update.message.reply_text("لینک عکس جدید را بفرست؛ برای بدون عکس «ندارد».")
         elif step == "photo":
             photo_url="" if text.lower() in ("ندارد","ندارم","-","no") else text; conn.execute("UPDATE products SET photo_url=%s WHERE id=%s",(photo_url,pid)); conn.commit(); p=conn.execute("SELECT * FROM products WHERE id=%s",(pid,)).fetchone(); conn.close(); context.user_data.pop("admin_flow",None); await update.message.reply_text(f"✅ محصول «{p['name']}» ویرایش شد.",reply_markup=admin_panel_keyboard()); return
         conn.commit(); conn.close()
