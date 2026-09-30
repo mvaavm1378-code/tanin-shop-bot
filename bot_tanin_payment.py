@@ -58,7 +58,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # مراحل مکالمه برای ثبت سفارش
-ASK_NAME, ASK_PHONE, ASK_ADDRESS = range(3)
+ASK_NAME, ASK_PHONE, ASK_GENDER, ASK_ADDRESS = range(4)
 
 # ----------------------------------------------------------------------------
 # دیتابیس
@@ -115,7 +115,7 @@ def init_db():
         # Check the columns that this version of the bot relies on.
         expected_columns = {
             "products": {"id", "name", "category", "size", "color", "price", "photo_url", "active", "pack_info"},
-            "customers": {"user_id", "username", "full_name", "phone", "first_seen", "last_seen"},
+            "customers": {"user_id", "username", "full_name", "phone", "gender", "first_seen", "last_seen"},
             "cart_items": {"id", "user_id", "product_id", "qty"},
             "bank_accounts": {"id", "bank_name", "owner_name", "card_number", "account_number", "iban", "active", "created_at", "updated_at"},
             "pending_payments": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "payment_status", "receipt_file_id", "created_at", "reviewed_at", "order_id", "admin_id"},
@@ -380,15 +380,95 @@ async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_NAME
 
 
+def normalize_iran_phone(value):
+    """Normalize Iranian mobile numbers to 11-digit 09xxxxxxxxx format."""
+    if not value:
+        return None
+    translation = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    phone = str(value).translate(translation).replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    if phone.startswith("+98"):
+        phone = "0" + phone[3:]
+    elif phone.startswith("0098"):
+        phone = "0" + phone[4:]
+    if len(phone) == 11 and phone.startswith("09") and phone.isdigit():
+        return phone
+    return None
+
+
+def phone_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 ارسال شماره موبایل", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def gender_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("👨 مرد"), KeyboardButton("👩 زن")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["full_name"] = update.message.text
-    await update.message.reply_text("شماره تماس‌ت رو بفرست:")
+    context.user_data["full_name"] = update.message.text.strip()
+    await update.message.reply_text(
+        "📱 لطفاً شماره موبایل خودت رو با دکمه زیر از تلگرام ارسال کن:\n\n"
+        "شماره باید متعلق به همین حساب تلگرام باشد.",
+        reply_markup=phone_keyboard(),
+    )
     return ASK_PHONE
 
 
+async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.contact:
+        await update.message.reply_text(
+            "❌ لطفاً شماره را فقط با دکمه «📱 ارسال شماره موبایل» بفرست.",
+            reply_markup=phone_keyboard(),
+        )
+        return ASK_PHONE
+
+    contact = update.message.contact
+    if contact.user_id is not None and contact.user_id != update.effective_user.id:
+        await update.message.reply_text(
+            "❌ این شماره به حساب تلگرام شما مربوط نیست. لطفاً شماره خودت را ارسال کن.",
+            reply_markup=phone_keyboard(),
+        )
+        return ASK_PHONE
+
+    phone = normalize_iran_phone(contact.phone_number)
+    if not phone:
+        await update.message.reply_text(
+            "❌ شماره باید یک موبایل ایرانی ۱۱ رقمی و با 09 شروع شود. دوباره ارسال کن.",
+            reply_markup=phone_keyboard(),
+        )
+        return ASK_PHONE
+
+    context.user_data["phone"] = phone
+    await update.message.reply_text(
+        "جنسیت خودت رو انتخاب کن:",
+        reply_markup=gender_keyboard(),
+    )
+    return ASK_GENDER
+
+
 async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["phone"] = update.message.text
-    await update.message.reply_text("آدرس کامل برای ارسال رو بفرست:")
+    gender_text = (update.message.text or "").strip()
+    gender_map = {"👨 مرد": "مرد", "👩 زن": "زن"}
+    gender = gender_map.get(gender_text)
+    if not gender:
+        await update.message.reply_text(
+            "لطفاً یکی از گزینه‌های «👨 مرد» یا «👩 زن» را انتخاب کن.",
+            reply_markup=gender_keyboard(),
+        )
+        return ASK_GENDER
+
+    context.user_data["gender"] = gender
+    await update.message.reply_text(
+        "آدرس کامل برای ارسال رو بفرست:",
+        reply_markup=None,
+    )
     return ASK_ADDRESS
 
 
@@ -400,9 +480,10 @@ async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_name = context.user_data["full_name"].strip()
     phone = context.user_data["phone"].strip()
     address = context.user_data["address"].strip()
+    gender = context.user_data["gender"]
     conn.execute(
-        "UPDATE customers SET phone=%s, full_name=%s, username=%s, last_seen=%s WHERE user_id=%s",
-        (phone, full_name, update.effective_user.username or "", now, user_id),
+        "UPDATE customers SET phone=%s, gender=%s, full_name=%s, username=%s, last_seen=%s WHERE user_id=%s",
+        (phone, gender, full_name, update.effective_user.username or "", now, user_id),
     )
     rows = conn.execute(
         """SELECT products.id AS product_id, products.name, products.price,
@@ -444,6 +525,7 @@ async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("full_name", None)
     context.user_data.pop("phone", None)
     context.user_data.pop("address", None)
+    context.user_data.pop("gender", None)
 
     await show_payment_instructions(update.message, {
         "id": pending_id, "total_price": total, "payment_status": "در انتظار رسید"
@@ -488,49 +570,14 @@ async def cancel_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conn = get_conn()
-
-    # سفارش‌های نهایی: مبلغ این سفارش‌ها ثابت می‌ماند و با تغییر قیمت محصولات تغییر نمی‌کند.
     rows = conn.execute(
         "SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC", (user_id,)
     ).fetchall()
-
-    # سفارش در انتظار پرداخت: مبلغ از قیمت فعلی محصولات محاسبه می‌شود.
-    # فقط «در انتظار رسید» قابل تغییر است؛ بعد از ارسال رسید مبلغ قفل می‌شود.
-    pending = conn.execute(
-        """SELECT * FROM pending_payments
-           WHERE user_id=%s AND payment_status='در انتظار رسید'
-           ORDER BY id DESC LIMIT 1""", (user_id,)
-    ).fetchone()
-    if pending:
-        current_total = conn.execute(
-            """SELECT COALESCE(SUM(products.price * cart_items.qty), 0) AS total
-               FROM cart_items
-               JOIN products ON cart_items.product_id = products.id
-               WHERE cart_items.user_id=%s AND products.active=TRUE""",
-            (user_id,),
-        ).fetchone()["total"]
-        if current_total and current_total != pending["total_price"]:
-            conn.execute(
-                "UPDATE pending_payments SET total_price=%s WHERE id=%s",
-                (current_total, pending["id"]),
-            )
-            conn.commit()
-            pending = dict(pending)
-            pending["total_price"] = current_total
-
     conn.close()
 
-    if not rows and not pending:
+    if not rows:
         await update.message.reply_text("هنوز سفارشی ثبت نکردی.")
         return
-
-    if pending:
-        await update.message.reply_text(
-            f"🟡 سفارش در انتظار پرداخت\n"
-            f"وضعیت: در انتظار رسید\n"
-            f"مبلغ فعلی: {pending['total_price']:,} تومان\n"
-            f"برای پرداخت، دستور /checkout را بفرست."
-        )
 
     for o in rows:
         await update.message.reply_text(
@@ -785,6 +832,7 @@ async def admin_customer_detail(q, user_id):
         f"آیدی: <code>{c['user_id']}</code>\n"
         f"تلگرام: @{c['username'] or '-'}\n"
         f"تلفن: {c['phone'] or '-'}\n"
+        f"جنسیت: {c['gender'] or '-'}\n"
         f"اولین ورود: {c['first_seen'] or '-'}\n"
         f"آخرین فعالیت: {c['last_seen'] or '-'}\n\n"
         f"📦 تعداد سفارش‌ها: {len(orders)}\n"
@@ -1164,21 +1212,7 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif step == "price":
             try: price=int(text.replace(",","")); assert price>=0
             except Exception: conn.close(); await update.message.reply_text("❌ قیمت نامعتبر است."); return
-            conn.execute("UPDATE products SET price=%s WHERE id=%s",(price,pid))
-            # سفارش‌هایی که هنوز رسید برایشان ارسال نشده، باید قیمت جدید را ببینند.
-            # سفارش‌هایی که رسید ارسال شده یا پرداختشان تأیید شده، مبلغ قبلی را حفظ می‌کنند.
-            conn.execute("""UPDATE pending_payments AS pp
-               SET total_price = totals.total
-               FROM (
-                   SELECT ci.user_id, SUM(p.price * ci.qty) AS total
-                   FROM cart_items ci
-                   JOIN products p ON p.id = ci.product_id
-                   WHERE ci.product_id=%s AND p.active=TRUE
-                   GROUP BY ci.user_id
-               ) AS totals
-               WHERE pp.user_id=totals.user_id
-                 AND pp.payment_status='در انتظار رسید'""", (pid,))
-            flow["step"]="photo"; await update.message.reply_text("لینک عکس جدید را بفرست؛ برای بدون عکس «ندارد».")
+            conn.execute("UPDATE products SET price=%s WHERE id=%s",(price,pid)); flow["step"]="photo"; await update.message.reply_text("لینک عکس جدید را بفرست؛ برای بدون عکس «ندارد».")
         elif step == "photo":
             photo_url="" if text.lower() in ("ندارد","ندارم","-","no") else text; conn.execute("UPDATE products SET photo_url=%s WHERE id=%s",(photo_url,pid)); conn.commit(); p=conn.execute("SELECT * FROM products WHERE id=%s",(pid,)).fetchone(); conn.close(); context.user_data.pop("admin_flow",None); await update.message.reply_text(f"✅ محصول «{p['name']}» ویرایش شد.",reply_markup=admin_panel_keyboard()); return
         conn.commit(); conn.close()
@@ -1302,7 +1336,8 @@ async def async_main():
         entry_points=[CommandHandler("checkout", checkout_start)],
         states={
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
-            ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_address)],
+            ASK_PHONE: [MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), ask_gender)],
+            ASK_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_address)],
             ASK_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, finalize_order)],
         },
         fallbacks=[CommandHandler("cancel", cancel_checkout)],
