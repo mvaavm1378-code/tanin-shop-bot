@@ -384,12 +384,31 @@ def normalize_iran_phone(value):
     """Normalize Iranian mobile numbers to 11-digit 09xxxxxxxxx format."""
     if not value:
         return None
-    translation = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
-    phone = str(value).translate(translation).replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
+    translation = str.maketrans(
+        "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+        "01234567890123456789",
+    )
+    phone = str(value).translate(translation)
+
+    # Remove all common separators/whitespace that Telegram may include.
+    for ch in (" ", "-", "(", ")", "\u200b", "\u200c", "\u200d", "\ufeff"):
+        phone = phone.replace(ch, "")
+
+    # Accept the common Iranian formats returned/entered by Telegram: 
+    # 09xxxxxxxxx, +989xxxxxxxxx, 00989xxxxxxxxx, 989xxxxxxxxx, 9xxxxxxxxx
     if phone.startswith("+98"):
-        phone = "0" + phone[3:]
+        phone = phone[3:]
     elif phone.startswith("0098"):
-        phone = "0" + phone[4:]
+        phone = phone[4:]
+    elif phone.startswith("98"):
+        phone = phone[2:]
+
+    # After removing the country code, an Iranian mobile should have
+    # 10 digits beginning with 9. Convert it to the local 09xxxxxxxxx form.
+    if len(phone) == 10 and phone.startswith("9") and phone.isdigit():
+        phone = "0" + phone
+
     if len(phone) == 11 and phone.startswith("09") and phone.isdigit():
         return phone
     return None
