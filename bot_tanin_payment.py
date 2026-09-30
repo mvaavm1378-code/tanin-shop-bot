@@ -60,6 +60,8 @@ logger = logging.getLogger(__name__)
 # مراحل مکالمه برای ثبت سفارش
 ASK_NAME, ASK_PHONE, ASK_GENDER, ASK_ADDRESS = range(4)
 
+SAVED_TYPES = ("name", "phone", "address")
+
 # ----------------------------------------------------------------------------
 # دیتابیس
 # ----------------------------------------------------------------------------
@@ -91,6 +93,7 @@ def init_db():
     required = {
         "products",
         "customers",
+        "customer_saved_data",
         "cart_items",
         "bank_accounts",
         "pending_payments",
@@ -116,6 +119,7 @@ def init_db():
         expected_columns = {
             "products": {"id", "name", "category", "size", "color", "price", "photo_url", "active", "pack_info"},
             "customers": {"user_id", "username", "full_name", "phone", "gender", "first_seen", "last_seen"},
+            "customer_saved_data": {"id", "user_id", "data_type", "value", "created_at", "updated_at"},
             "cart_items": {"id", "user_id", "product_id", "qty"},
             "bank_accounts": {"id", "bank_name", "owner_name", "card_number", "account_number", "iban", "active", "created_at", "updated_at"},
             "pending_payments": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "payment_status", "receipt_file_id", "created_at", "reviewed_at", "order_id", "admin_id"},
@@ -376,8 +380,89 @@ async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("سبد خریدت خالیه، اول چیزی اضافه کن.")
         return ConversationHandler.END
 
+    if await show_saved_step(update.message, context, "name"):
+        return ASK_NAME
     await update.message.reply_text("لطفاً نام و نام خانوادگی‌ت رو بفرست:")
     return ASK_NAME
+
+
+def get_saved_data(user_id, data_type):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, value FROM customer_saved_data WHERE user_id=%s AND data_type=%s ORDER BY id DESC",
+        (user_id, data_type),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def save_saved_data(user_id, data_type, value):
+    value = (value or "").strip()
+    if not value or data_type not in SAVED_TYPES:
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO customer_saved_data(user_id, data_type, value, created_at, updated_at)
+           VALUES (%s, %s, %s, %s, %s)
+           ON CONFLICT(user_id, data_type, value) DO UPDATE SET updated_at=excluded.updated_at""",
+        (user_id, data_type, value, now, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_saved_data(user_id, data_id, data_type, value):
+    value = (value or "").strip()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    conn = get_conn()
+    conn.execute(
+        "UPDATE customer_saved_data SET value=%s, updated_at=%s WHERE id=%s AND user_id=%s AND data_type=%s",
+        (value, now, data_id, user_id, data_type),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_saved_data(user_id, data_id, data_type):
+    conn = get_conn()
+    conn.execute(
+        "DELETE FROM customer_saved_data WHERE id=%s AND user_id=%s AND data_type=%s",
+        (data_id, user_id, data_type),
+    )
+    conn.commit()
+    conn.close()
+
+
+def saved_data_keyboard(data_type, rows):
+    labels = {"name": "نام", "phone": "شماره تماس", "address": "آدرس"}
+    buttons = []
+    for row in rows:
+        value = str(row["value"])
+        display = value if data_type != "address" else value.replace("\n", " ")
+        buttons.append([
+            InlineKeyboardButton(
+                f"✅ {display[:38]}",
+                callback_data=f"saved:{data_type}:use:{row['id']}"
+            ),
+            InlineKeyboardButton("✏️", callback_data=f"saved:{data_type}:edit:{row['id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"saved:{data_type}:delete:{row['id']}"),
+        ])
+    buttons.append([InlineKeyboardButton(f"➕ {labels[data_type]} جدید", callback_data=f"saved:{data_type}:new")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def show_saved_step(message, context, data_type):
+    rows = get_saved_data(message.chat_id, data_type)
+    labels = {"name": "نام و نام خانوادگی", "phone": "شماره موبایل", "address": "آدرس"}
+    if rows:
+        await message.reply_text(
+            f"📌 {labels[data_type]} قبلی را انتخاب کن یا مورد جدید اضافه کن.\n\n"
+            "برای ویرایش ✏️ و برای حذف 🗑 را بزن:",
+            reply_markup=saved_data_keyboard(data_type, rows),
+        )
+        return True
+    return False
 
 
 def normalize_iran_phone(value):
@@ -431,13 +516,54 @@ def gender_keyboard():
 
 
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["full_name"] = update.message.text.strip()
+    user_id = update.effective_user.id
+    full_name = update.message.text.strip()
+    edit_id = context.user_data.pop("editing_saved_name_id", None)
+    if edit_id:
+        update_saved_data(user_id, int(edit_id), "name", full_name)
+    else:
+        save_saved_data(user_id, "name", full_name)
+    context.user_data["full_name"] = full_name
+    if await show_saved_step(update.message, context, "phone"):
+        return ASK_PHONE
     await update.message.reply_text(
         "📱 لطفاً شماره موبایل خودت رو با دکمه زیر از تلگرام ارسال کن:\n\n"
         "شماره باید متعلق به همین حساب تلگرام باشد.",
         reply_markup=phone_keyboard(),
     )
     return ASK_PHONE
+
+
+async def handle_saved_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split(":")
+    action = parts[2]
+    user_id = q.from_user.id
+    if action == "use":
+        row = next((r for r in get_saved_data(user_id, "name") if r["id"] == int(parts[3])), None)
+        if row:
+            context.user_data["full_name"] = row["value"]
+            if await show_saved_step(q.message, context, "phone"):
+                return ASK_PHONE
+            await q.message.reply_text("📱 لطفاً شماره موبایل خودت رو با دکمه زیر از تلگرام ارسال کن:", reply_markup=phone_keyboard())
+            return ASK_PHONE
+    elif action == "new":
+        await q.message.reply_text("لطفاً نام و نام خانوادگی جدید را بفرست:")
+        return ASK_NAME
+    elif action == "edit":
+        context.user_data["editing_saved_name_id"] = parts[3]
+        await q.message.reply_text("نام جدید را بفرست:")
+        return ASK_NAME
+    elif action == "delete":
+        delete_saved_data(user_id, int(parts[3]), "name")
+        rows = get_saved_data(user_id, "name")
+        if rows:
+            await q.message.reply_text("نام حذف شد. یک نام را انتخاب کن یا نام جدید اضافه کن:", reply_markup=saved_data_keyboard("name", rows))
+            return ASK_NAME
+        await q.message.reply_text("نام حذف شد. نام و نام خانوادگی را بفرست:")
+        return ASK_NAME
+    return ASK_NAME
 
 
 async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -464,12 +590,44 @@ async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_PHONE
 
+    edit_id = context.user_data.pop("editing_saved_phone_id", None)
+    if edit_id:
+        update_saved_data(update.effective_user.id, int(edit_id), "phone", phone)
+    else:
+        save_saved_data(update.effective_user.id, "phone", phone)
     context.user_data["phone"] = phone
-    await update.message.reply_text(
-        "جنسیت خودت رو انتخاب کن:",
-        reply_markup=gender_keyboard(),
-    )
+    await update.message.reply_text("جنسیت خودت رو انتخاب کن:", reply_markup=gender_keyboard())
     return ASK_GENDER
+
+
+async def handle_saved_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split(":")
+    action = parts[2]
+    user_id = q.from_user.id
+    if action == "use":
+        row = next((r for r in get_saved_data(user_id, "phone") if r["id"] == int(parts[3])), None)
+        if row:
+            context.user_data["phone"] = row["value"]
+            await q.message.reply_text("جنسیت خودت رو انتخاب کن:", reply_markup=gender_keyboard())
+            return ASK_GENDER
+    elif action == "new":
+        await q.message.reply_text("📱 شماره موبایل جدیدت را با دکمه زیر ارسال کن:", reply_markup=phone_keyboard())
+        return ASK_PHONE
+    elif action == "edit":
+        context.user_data["editing_saved_phone_id"] = parts[3]
+        await q.message.reply_text("📱 شماره جدیدت را با دکمه زیر ارسال کن:", reply_markup=phone_keyboard())
+        return ASK_PHONE
+    elif action == "delete":
+        delete_saved_data(user_id, int(parts[3]), "phone")
+        rows = get_saved_data(user_id, "phone")
+        if rows:
+            await q.message.reply_text("شماره حذف شد. یک شماره را انتخاب کن یا شماره جدید اضافه کن:", reply_markup=saved_data_keyboard("phone", rows))
+        else:
+            await q.message.reply_text("شماره حذف شد. شماره موبایل خودت را با دکمه زیر ارسال کن:", reply_markup=phone_keyboard())
+        return ASK_PHONE
+    return ASK_PHONE
 
 
 async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -484,16 +642,60 @@ async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_GENDER
 
     context.user_data["gender"] = gender
-    await update.message.reply_text(
-        "آدرس کامل برای ارسال رو بفرست:",
-        reply_markup=None,
-    )
+    if await show_saved_step(update.message, context, "address"):
+        return ASK_ADDRESS
+    await update.message.reply_text("آدرس کامل برای ارسال رو بفرست:", reply_markup=None)
     return ASK_ADDRESS
 
 
+async def handle_saved_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split(":")
+    action = parts[2]
+    user_id = q.from_user.id
+    if action == "use":
+        row = next((r for r in get_saved_data(user_id, "address") if r["id"] == int(parts[3])), None)
+        if row:
+            context.user_data["address"] = row["value"]
+            return await finalize_order_from_callback(q.message, context)
+    elif action == "new":
+        await q.message.reply_text("آدرس جدید را بفرست:")
+        return ASK_ADDRESS
+    elif action == "edit":
+        context.user_data["editing_saved_address_id"] = parts[3]
+        await q.message.reply_text("آدرس جدید را بفرست:")
+        return ASK_ADDRESS
+    elif action == "delete":
+        delete_saved_data(user_id, int(parts[3]), "address")
+        rows = get_saved_data(user_id, "address")
+        if rows:
+            await q.message.reply_text("آدرس حذف شد. یک آدرس را انتخاب کن یا آدرس جدید اضافه کن:", reply_markup=saved_data_keyboard("address", rows))
+        else:
+            await q.message.reply_text("آدرس حذف شد. آدرس کامل برای ارسال را بفرست:")
+        return ASK_ADDRESS
+    return ASK_ADDRESS
+
+
+async def finalize_order_from_callback(message, context):
+    return await create_pending_payment(message, context, q.from_user)
+
+
 async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["address"] = update.message.text.strip()
     user_id = update.effective_user.id
+    address = update.message.text.strip()
+    edit_id = context.user_data.pop("editing_saved_address_id", None)
+    if edit_id:
+        update_saved_data(user_id, int(edit_id), "address", address)
+    else:
+        save_saved_data(user_id, "address", address)
+    context.user_data["address"] = address
+    return await create_pending_payment(update.message, context)
+
+
+async def create_pending_payment(message, context, user=None):
+    user_id = message.chat_id
+    username = (user.username if user is not None else message.from_user.username) or ""
     conn = get_conn()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     full_name = context.user_data["full_name"].strip()
@@ -512,7 +714,7 @@ async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ).fetchall()
     if not rows:
         conn.close()
-        await update.message.reply_text("🛒 سبد خریدت خالی شده. دوباره محصولاتت رو انتخاب کن.", reply_markup=main_menu_keyboard(user_id))
+        await message.reply_text("🛒 سبد خریدت خالی شده. دوباره محصولاتت رو انتخاب کن.", reply_markup=main_menu_keyboard(user_id))
         return ConversationHandler.END
 
     total = sum(r["price"] * r["qty"] for r in rows)
@@ -528,7 +730,7 @@ async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ).fetchone()
     if pending:
         conn.close()
-        await show_payment_instructions(update.message, pending)
+        await show_payment_instructions(message, pending)
         return ConversationHandler.END
 
     cur = conn.execute(
@@ -546,7 +748,7 @@ async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("address", None)
     context.user_data.pop("gender", None)
 
-    await show_payment_instructions(update.message, {
+    await show_payment_instructions(message, {
         "id": pending_id, "total_price": total, "payment_status": "در انتظار رسید"
     })
     return ConversationHandler.END
@@ -1354,10 +1556,19 @@ async def async_main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("checkout", checkout_start)],
         states={
-            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
-            ASK_PHONE: [MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), ask_gender)],
+            ASK_NAME: [
+                CallbackQueryHandler(handle_saved_name, pattern=r"^saved:name:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone),
+            ],
+            ASK_PHONE: [
+                CallbackQueryHandler(handle_saved_phone, pattern=r"^saved:phone:"),
+                MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), ask_gender),
+            ],
             ASK_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_address)],
-            ASK_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, finalize_order)],
+            ASK_ADDRESS: [
+                CallbackQueryHandler(handle_saved_address, pattern=r"^saved:address:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, finalize_order),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel_checkout)],
     )
