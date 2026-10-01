@@ -1786,6 +1786,38 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+class AdminMessageViewAdapter:
+    """سازگارکننده برای نمایش صفحه‌های ادمین با دکمه‌های ReplyKeyboard."""
+    def __init__(self, update):
+        self.message = update.effective_message
+        self.from_user = update.effective_user
+
+    async def edit_message_text(self, text, **kwargs):
+        # پیام جدید می‌فرستیم؛ پیام دریافتی از کیبورد قابل ویرایش نیست.
+        await self.message.reply_text(text, **kwargs)
+
+    async def answer(self, *args, **kwargs):
+        return None
+
+
+async def admin_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.effective_message.reply_text("دسترسی نداری.")
+        return
+
+    text = (update.effective_message.text or "").strip()
+    q = AdminMessageViewAdapter(update)
+    if text == "📦 سفارش‌ها":
+        await admin_orders_view(q, "all")
+    elif text == "💳 پرداخت‌های در انتظار":
+        await admin_pending_payments_view(q)
+    elif text == "🛠 مدیریت محصولات":
+        await admin_products_view(q)
+    elif text == "🎫 پشتیبانی":
+        await admin_tickets_view(q, "all")
+
+
 async def admin_pending_payments_view(q):
     conn = get_conn()
     rows = conn.execute(
@@ -3542,6 +3574,7 @@ async def async_main():
     app.add_handler(MessageHandler(filters.Regex(r"^💬\s*(?:مرکز پشتیبانی|پشتیبانی)$"), support))
     app.add_handler(CommandHandler("orders_admin", admin_orders))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ پنل مدیریت$"), admin_panel))
+    app.add_handler(MessageHandler(filters.Regex(r"^(?:📦 سفارش‌ها|💳 پرداخت‌های در انتظار|🛠 مدیریت محصولات|🎫 پشتیبانی)$"), admin_shortcut))
 
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(support_callback, pattern=r"^support:"))
