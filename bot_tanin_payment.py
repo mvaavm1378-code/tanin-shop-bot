@@ -2578,7 +2578,7 @@ async def async_main():
     app.add_handler(MessageHandler(filters.Regex("^🧾 کاتالوگ محصولات$"), show_catalog))
     app.add_handler(MessageHandler(filters.Regex("^🛒 سبد خرید$"), show_cart))
     app.add_handler(MessageHandler(filters.Regex("^📦 سفارش‌های من$"), my_orders))
-    app.add_handler(MessageHandler(filters.Regex("^💬 مرکز پشتیبانی$"), support))
+    app.add_handler(MessageHandler(filters.Regex(r"^💬\s*(?:مرکز پشتیبانی|پشتیبانی)$"), support))
     app.add_handler(CommandHandler("orders_admin", admin_orders))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ پنل مدیریت$"), admin_panel))
 
