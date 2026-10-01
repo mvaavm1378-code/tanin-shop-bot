@@ -179,6 +179,8 @@ def init_db():
         "products",
         "customers",
         "customer_saved_data",
+        "support_tickets",
+        "support_ticket_messages",
         "cart_items",
         "bank_accounts",
         "pending_payments",
@@ -205,6 +207,8 @@ def init_db():
             "products": {"id", "name", "category", "size", "color", "price", "photo_url", "active", "pack_info"},
             "customers": {"user_id", "username", "full_name", "phone", "gender", "first_seen", "last_seen"},
             "customer_saved_data": {"id", "user_id", "data_type", "value", "created_at", "updated_at"},
+            "support_tickets": {"id", "user_id", "order_id", "topic", "status", "created_at", "updated_at", "closed_at"},
+            "support_ticket_messages": {"id", "ticket_id", "sender_id", "sender_type", "message", "created_at"},
             "cart_items": {"id", "user_id", "product_id", "qty"},
             "bank_accounts": {"id", "bank_name", "owner_name", "card_number", "account_number", "iban", "active", "created_at", "updated_at"},
             "pending_payments": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "payment_status", "receipt_file_id", "created_at", "reviewed_at", "order_id", "admin_id"},
@@ -1401,12 +1405,158 @@ async def customer_order_callback(update: Update, context: ContextTypes.DEFAULT_
     return
 
 
+def support_center_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 پیگیری سفارش", callback_data="support:orders")],
+        [InlineKeyboardButton("💳 مشکل در پرداخت", callback_data="support:topic:پرداخت")],
+        [InlineKeyboardButton("🛍 سؤال درباره محصول", callback_data="support:topic:محصول")],
+        [InlineKeyboardButton("🚚 سؤال درباره ارسال", callback_data="support:topic:ارسال")],
+        [InlineKeyboardButton("🔄 تعویض / مرجوعی", callback_data="support:topic:تعویض")],
+        [InlineKeyboardButton("📝 ارسال درخواست پشتیبانی", callback_data="support:new")],
+        [InlineKeyboardButton("🎫 درخواست‌های من", callback_data="support:mine")],
+        [InlineKeyboardButton("❓ سؤالات متداول", callback_data="support:faq")],
+        [InlineKeyboardButton("💬 چت مستقیم با پشتیبانی", url="https://t.me/tanin_modir")],
+        [InlineKeyboardButton("📞 تماس با پشتیبانی", url="tel:+989384853486")],
+    ])
+
+
+def support_topic_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 پرداخت", callback_data="support:topic:پرداخت")],
+        [InlineKeyboardButton("🛍 محصول", callback_data="support:topic:محصول")],
+        [InlineKeyboardButton("🚚 ارسال", callback_data="support:topic:ارسال")],
+        [InlineKeyboardButton("🔄 تعویض / مرجوعی", callback_data="support:topic:تعویض")],
+        [InlineKeyboardButton("❓ سایر", callback_data="support:topic:سایر")],
+        [InlineKeyboardButton("🔙 پشتیبانی", callback_data="support:home")],
+    ])
+
+
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "💬 پشتیبانی تنین ایران\n\n"
-        "📞 شماره تماس: 09384853486\n"
-        "📱 آیدی تلگرام: @tanin_modir"
+        "💬 <b>مرکز پشتیبانی تنین ایران</b>\n\n"
+        "از این بخش می‌تونی سفارش‌هات رو پیگیری کنی، درخواست پشتیبانی ثبت کنی یا مستقیم با ما در ارتباط باشی.",
+        parse_mode="HTML", reply_markup=support_center_keyboard()
     )
+
+
+def support_ticket_status_fa(status):
+    return {
+        "new": "🔴 جدید",
+        "admin_waiting": "🟡 در انتظار پاسخ ادمین",
+        "customer_waiting": "🔵 در انتظار پاسخ مشتری",
+        "closed": "🟢 بسته‌شده",
+    }.get(status, status or "-")
+
+
+def support_ticket_list_keyboard(rows, prefix="support:view"):
+    buttons = []
+    for t in rows:
+        buttons.append([InlineKeyboardButton(
+            f"🎫 #{t['id']} | {t['topic']} | {support_ticket_status_fa(t['status'])}",
+            callback_data=f"{prefix}:{t['id']}"
+        )])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def support_orders_view(q):
+    conn=get_conn()
+    rows=conn.execute("SELECT id, created_at, status FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 20", (q.from_user.id,)).fetchall()
+    conn.close()
+    if not rows:
+        await q.edit_message_text("📦 هنوز سفارشی برای این حساب ثبت نشده.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 پشتیبانی", callback_data="support:home")]]))
+        return
+    buttons=[[InlineKeyboardButton(f"📦 سفارش #{o['id']} | {format_iran_jalali_fa(o.get('created_at'), False)} | {o['status']}", callback_data=f"customer_order:view:{o['id']}")] for o in rows]
+    buttons.append([InlineKeyboardButton("🔙 پشتیبانی", callback_data="support:home")])
+    await q.edit_message_text("📦 <b>سفارش‌های شما</b>\n\nبرای مشاهده جزئیات، یک سفارش را انتخاب کن:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def support_faq_view(q):
+    text=(
+        "❓ <b>سؤالات متداول</b>\n\n"
+        "🛒 <b>ثبت سفارش:</b> محصول را از کاتالوگ انتخاب کن و مراحل ثبت سفارش را کامل کن.\n\n"
+        "💳 <b>پرداخت:</b> پرداخت به‌صورت کارت‌به‌کارت انجام می‌شود و بعد از بررسی رسید، سفارش ثبت نهایی می‌شود.\n\n"
+        "🚚 <b>ارسال:</b> زمان و روش ارسال پس از ثبت سفارش با مشتری هماهنگ می‌شود.\n\n"
+        "🔄 <b>تعویض / مرجوعی:</b> برای بررسی شرایط، از طریق تیکت یا ارتباط مستقیم با پشتیبانی درخواستت را ثبت کن.\n\n"
+        "📦 <b>پیگیری سفارش:</b> از گزینه «📦 پیگیری سفارش» در همین بخش استفاده کن."
+    )
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 پشتیبانی", callback_data="support:home")]]))
+
+
+async def support_mine_view(q):
+    conn=get_conn()
+    rows=conn.execute("SELECT * FROM support_tickets WHERE user_id=%s ORDER BY id DESC LIMIT 30", (q.from_user.id,)).fetchall()
+    conn.close()
+    if not rows:
+        await q.edit_message_text("🎫 هنوز تیکتی ثبت نکرده‌ای.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📝 ثبت درخواست جدید", callback_data="support:new")],[InlineKeyboardButton("🔙 پشتیبانی", callback_data="support:home")]]))
+        return
+    kb=support_ticket_list_keyboard(rows)
+    buttons=list(kb.inline_keyboard)+[[InlineKeyboardButton("🔙 پشتیبانی", callback_data="support:home")]]
+    await q.edit_message_text("🎫 <b>درخواست‌های شما</b>\n\nبرای مشاهده و ادامه هر تیکت، آن را انتخاب کن:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def support_ticket_detail(q, ticket_id, is_admin_view=False):
+    conn=get_conn()
+    if is_admin_view:
+        t=conn.execute("""SELECT t.*, c.full_name, c.username
+                           FROM support_tickets t
+                           LEFT JOIN customers c ON c.user_id=t.user_id
+                           WHERE t.id=%s""", (ticket_id,)).fetchone()
+    else:
+        t=conn.execute("SELECT * FROM support_tickets WHERE id=%s AND user_id=%s", (ticket_id,q.from_user.id)).fetchone()
+    msgs=conn.execute("SELECT * FROM support_ticket_messages WHERE ticket_id=%s ORDER BY id ASC", (ticket_id,)).fetchall() if t else []
+    conn.close()
+    if not t:
+        await q.answer("تیکت پیدا نشد.", show_alert=True); return
+    lines=[f"🎫 <b>تیکت #{t['id']}</b>",f"🏷 موضوع: {escape(t['topic'])}",f"📌 وضعیت: {support_ticket_status_fa(t['status'])}",f"🕐 ثبت: {format_iran_jalali_fa(t.get('created_at'), True)}"]
+    if is_admin_view:
+        lines += [
+            f"👤 مشتری: {escape(t.get('full_name') or '-')}",
+            f"🆔 آیدی مشتری: <code>{t['user_id']}</code>",
+            f"📱 تلگرام: @{escape(t.get('username') or '-')}",
+        ]
+        if t.get('order_id'): lines.append(f"📦 سفارش: #{t['order_id']}")
+    lines.append("\n<b>💬 گفتگو:</b>")
+    for m in msgs[-15:]:
+        who="مشتری" if m['sender_type']=='customer' else "ادمین"
+        lines.append(f"<b>{who}:</b> {escape(m['message'])}")
+    if is_admin_view:
+        buttons=[]
+        if t['status']!="closed": buttons.append([InlineKeyboardButton("💬 پاسخ به مشتری", callback_data=f"adm:ticket_reply:{ticket_id}")])
+        buttons.append([InlineKeyboardButton("🟢 بستن تیکت", callback_data=f"adm:ticket_close:{ticket_id}")])
+        buttons.append([InlineKeyboardButton("👤 مشاهده مشتری", callback_data=f"adm:customer:{t['user_id']}")])
+        buttons.append([InlineKeyboardButton("🔙 تیکت‌ها", callback_data="adm:tickets")])
+    else:
+        buttons=[]
+        if t['status']!="closed": buttons.append([InlineKeyboardButton("💬 ارسال پاسخ", callback_data=f"support:reply:{ticket_id}")])
+        buttons.append([InlineKeyboardButton("🔙 درخواست‌های من", callback_data="support:mine")])
+    await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    parts=q.data.split(":",2)
+    action=parts[1] if len(parts)>1 else "home"
+    await q.answer()
+    if action=="home":
+        await q.edit_message_text("💬 <b>مرکز پشتیبانی تنین ایران</b>\n\nیک گزینه را انتخاب کن:",parse_mode="HTML",reply_markup=support_center_keyboard()); return
+    if action=="orders": await support_orders_view(q); return
+    if action=="faq": await support_faq_view(q); return
+    if action=="mine": await support_mine_view(q); return
+    if action=="new":
+        context.user_data["support_flow"]={"type":"new","step":"topic"}
+        await q.message.reply_text("📝 <b>ثبت درخواست پشتیبانی</b>\n\nموضوع درخواستت را انتخاب کن:",parse_mode="HTML",reply_markup=support_topic_keyboard()); return
+    if action=="topic":
+        topic=parts[2] if len(parts)>2 else "سایر"
+        flow=context.user_data.get("support_flow",{})
+        flow.update({"type":"new","step":"message","topic":topic})
+        context.user_data["support_flow"]=flow
+        await q.message.reply_text(f"🏷 موضوع: <b>{escape(topic)}</b>\n\nحالا متن درخواستت را بفرست:",parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لغو", callback_data="support:home")]])); return
+    if action=="reply":
+        ticket_id=int(parts[2]); context.user_data["support_flow"]={"type":"reply","ticket_id":ticket_id}
+        await q.message.reply_text("💬 پیام جدیدت را برای این تیکت بفرست:"); return
+    if action=="view": await support_ticket_detail(q,int(parts[2]),False); return
+
+
 
 
 # ----------------------------------------------------------------------------
@@ -1423,6 +1573,7 @@ def admin_panel_keyboard():
         [InlineKeyboardButton("🛍 محصولات", callback_data="adm:products")],
         [InlineKeyboardButton("📊 فروش و آمار", callback_data="adm:sales")],
         [InlineKeyboardButton("👥 مشتری‌ها", callback_data="adm:customers")],
+        [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="adm:tickets")],
         [InlineKeyboardButton("💳 تنظیمات پرداخت", callback_data="adm:payment")],
         [InlineKeyboardButton("🔄 بروزرسانی", callback_data="adm:home")],
         [InlineKeyboardButton("🔙 بستن پنل", callback_data="adm:close")],
@@ -1491,6 +1642,29 @@ def products_keyboard(rows):
         buttons.append([InlineKeyboardButton(f"#{p['id']} | {p['name']}", callback_data=f"adm:product:{p['id']}")])
     buttons.append([InlineKeyboardButton("🔙 پنل اصلی", callback_data="adm:home")])
     return InlineKeyboardMarkup(buttons)
+
+
+async def admin_tickets_view(q, status_filter="all"):
+    conn=get_conn()
+    if status_filter=="all":
+        rows=conn.execute("SELECT t.*, c.username, c.full_name FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id ORDER BY t.id DESC LIMIT 50").fetchall()
+    else:
+        rows=conn.execute("SELECT t.*, c.username, c.full_name FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id WHERE t.status=%s ORDER BY t.id DESC LIMIT 50",(status_filter,)).fetchall()
+    counts=conn.execute("SELECT status, COUNT(*) AS n FROM support_tickets GROUP BY status").fetchall()
+    conn.close()
+    count={r['status']:r['n'] for r in counts}
+    buttons=[]
+    for t in rows:
+        name=(t.get('full_name') or t.get('username') or str(t['user_id']))[:18]
+        buttons.append([InlineKeyboardButton(f"🎫 #{t['id']} | {name} | {t['topic']} | {support_ticket_status_fa(t['status'])}",callback_data=f"adm:ticket:{t['id']}")])
+    buttons += [
+        [InlineKeyboardButton(f"🔴 جدید ({count.get('new',0)})",callback_data="adm:tickets:new"),InlineKeyboardButton(f"🟡 پاسخ ادمین ({count.get('admin_waiting',0)})",callback_data="adm:tickets:admin_waiting")],
+        [InlineKeyboardButton(f"🔵 پاسخ مشتری ({count.get('customer_waiting',0)})",callback_data="adm:tickets:customer_waiting"),InlineKeyboardButton(f"🟢 بسته‌شده ({count.get('closed',0)})",callback_data="adm:tickets:closed")],
+        [InlineKeyboardButton("📊 همه تیکت‌ها",callback_data="adm:tickets:all")],
+        [InlineKeyboardButton("🔙 پنل اصلی",callback_data="adm:home")]
+    ]
+    title="🎫 <b>تیکت‌های پشتیبانی</b>"
+    await q.edit_message_text(title,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2026,6 +2200,25 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "customers":
         await admin_customers_view(q)
         return
+    if action == "tickets":
+        mode=parts[2] if len(parts)>2 else "all"
+        await admin_tickets_view(q, mode)
+        return
+    if action == "ticket":
+        await support_ticket_detail(q,int(parts[2]),True)
+        return
+    if action == "ticket_reply":
+        ticket_id=int(parts[2])
+        context.user_data["support_flow"]={"type":"admin_reply","ticket_id":ticket_id}
+        await q.message.reply_text("💬 پاسخ خود را برای مشتری بنویس:")
+        return
+    if action == "ticket_close":
+        ticket_id=int(parts[2]); now=iran_now_naive().strftime("%Y-%m-%d %H:%M")
+        conn=get_conn(); t=conn.execute("SELECT user_id FROM support_tickets WHERE id=%s",(ticket_id,)).fetchone(); conn.execute("UPDATE support_tickets SET status='closed', closed_at=%s, updated_at=%s WHERE id=%s",(now,now,ticket_id)); conn.commit(); conn.close()
+        if t:
+            try: await context.bot.send_message(t['user_id'],f"🟢 تیکت پشتیبانی #{ticket_id} بسته شد. اگر دوباره نیاز به کمک داشتی، می‌تونی درخواست جدید ثبت کنی.")
+            except Exception: pass
+        await support_ticket_detail(q,ticket_id,True); return
     if action == "payment":
         await admin_payment_view(q)
         return
@@ -2105,6 +2298,40 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not flow:
         return
     text = (update.message.text or "").strip()
+    support_flow = context.user_data.get("support_flow")
+    if support_flow:
+        user_id=update.effective_user.id
+        now=iran_now_naive().strftime("%Y-%m-%d %H:%M")
+        if support_flow.get("type") == "new" and support_flow.get("step") == "message":
+            topic=support_flow.get("topic","سایر")
+            conn=get_conn()
+            cur=conn.execute("INSERT INTO support_tickets(user_id,topic,status,created_at,updated_at) VALUES(%s,%s,'new',%s,%s) RETURNING id",(user_id,topic,now,now))
+            ticket_id=cur.fetchone()['id']
+            conn.execute("INSERT INTO support_ticket_messages(ticket_id,sender_id,sender_type,message,created_at) VALUES(%s,%s,'customer',%s,%s)",(ticket_id,user_id,text,now))
+            conn.commit(); conn.close(); context.user_data.pop("support_flow",None)
+            await update.message.reply_text(f"✅ درخواستت ثبت شد.\n🎫 شماره تیکت: #{ticket_id}\n\nپشتیبانی در اولین فرصت پاسخ می‌دهد.",reply_markup=support_center_keyboard())
+            for admin_id in ADMIN_IDS:
+                try: await context.bot.send_message(admin_id,f"🆕 <b>درخواست پشتیبانی #{ticket_id}</b>\n👤 آیدی مشتری: <code>{user_id}</code>\n🏷 موضوع: {escape(topic)}\n🕐 {format_iran_jalali_fa(now,True)}\n\n💬 {escape(text)}",parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎫 مشاهده تیکت",callback_data=f"adm:ticket:{ticket_id}")]]))
+                except Exception: pass
+            return
+        if support_flow.get("type") in ("reply","admin_reply"):
+            ticket_id=int(support_flow["ticket_id"]); sender_type="admin" if support_flow["type"]=="admin_reply" else "customer"
+            conn=get_conn(); t=conn.execute("SELECT * FROM support_tickets WHERE id=%s",(ticket_id,)).fetchone()
+            if not t or (sender_type=="customer" and t['user_id']!=user_id) or t['status']=='closed':
+                conn.close(); context.user_data.pop("support_flow",None); await update.message.reply_text("این تیکت قابل ادامه نیست."); return
+            conn.execute("INSERT INTO support_ticket_messages(ticket_id,sender_id,sender_type,message,created_at) VALUES(%s,%s,%s,%s,%s)",(ticket_id,user_id,sender_type,text,now))
+            new_status="customer_waiting" if sender_type=="admin" else "admin_waiting"
+            conn.execute("UPDATE support_tickets SET status=%s,updated_at=%s WHERE id=%s",(new_status,now,ticket_id)); conn.commit(); conn.close(); context.user_data.pop("support_flow",None)
+            if sender_type=="admin":
+                try: await context.bot.send_message(t['user_id'],f"💬 پاسخ پشتیبانی برای تیکت #{ticket_id}:\n\n{text}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎫 مشاهده تیکت",callback_data=f"support:view:{ticket_id}")]]))
+                except Exception: pass
+                await update.message.reply_text("✅ پاسخ برای مشتری ارسال شد.",reply_markup=admin_panel_keyboard())
+            else:
+                for admin_id in ADMIN_IDS:
+                    try: await context.bot.send_message(admin_id,f"💬 <b>پاسخ جدید مشتری در تیکت #{ticket_id}</b>\n👤 آیدی: <code>{user_id}</code>\n\n{escape(text)}",parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎫 مشاهده تیکت",callback_data=f"adm:ticket:{ticket_id}")]]))
+                    except Exception: pass
+                await update.message.reply_text("✅ پیام شما به پشتیبانی ارسال شد.",reply_markup=support_center_keyboard())
+            return
     if flow["type"] == "bank_account":
         step = flow["step"]
         prompts = {
@@ -2285,6 +2512,7 @@ async def async_main():
     app.add_handler(MessageHandler(filters.Regex("^⚙️ پنل مدیریت$"), admin_panel))
 
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
+    app.add_handler(CallbackQueryHandler(support_callback, pattern=r"^support:"))
     app.add_handler(CallbackQueryHandler(order_callback, pattern=r"^order:"))
     app.add_handler(CallbackQueryHandler(customer_order_callback, pattern=r"^customer_order:"))
     app.add_handler(CallbackQueryHandler(payment_admin_callback, pattern=r"^payadmin:"))
