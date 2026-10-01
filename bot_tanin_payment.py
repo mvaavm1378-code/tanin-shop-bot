@@ -579,7 +579,10 @@ async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=cart_item_keyboard(r["cid"]))
 
     await update.message.reply_text(
-        f"💰 جمع کل: {total:,} تومان\n\nبرای ثبت سفارش دستور /checkout رو بفرست."
+        f"💰 جمع کل: {total:,} تومان",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍️ ثبت سفارش", callback_data="checkout:start")]
+        ]),
     )
 
 
@@ -598,6 +601,12 @@ async def remove_from_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # فرآیند ثبت سفارش (Conversation)
 # ----------------------------------------------------------------------------
 async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer()
+        target_message = update.callback_query.message
+    else:
+        target_message = update.message
+
     u = update.effective_user
     conn = get_conn()
     now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
@@ -622,7 +631,7 @@ async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("سبد خریدت خالیه، اول چیزی اضافه کن.")
         return ConversationHandler.END
 
-    await show_checkout_quantities(update.message, user_id)
+    await show_checkout_quantities(target_message, user_id)
     return ASK_QTY
 
 
@@ -1887,7 +1896,10 @@ async def async_main():
     app.add_handler(CallbackQueryHandler(remove_from_cart, pattern=r"^remove:"))
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("checkout", checkout_start)],
+        entry_points=[
+            CommandHandler("checkout", checkout_start),
+            CallbackQueryHandler(checkout_start, pattern=r"^checkout:start$")
+        ],
         states={
             ASK_QTY: [
                 CallbackQueryHandler(checkout_quantity_callback, pattern=r"^qty:")
