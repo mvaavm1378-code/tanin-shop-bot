@@ -142,7 +142,7 @@ def format_iran_jalali_fa(value, include_time=True):
     return str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹") and text.translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
 
 # مراحل مکالمه برای ثبت سفارش
-ASK_NAME, ASK_PHONE, ASK_GENDER, ASK_ADDRESS = range(4)
+ASK_QTY, ASK_NAME, ASK_PHONE, ASK_GENDER, ASK_ADDRESS = range(5)
 
 SAVED_TYPES = ("name", "phone", "address")
 
@@ -298,6 +298,164 @@ def cart_item_keyboard(item_id):
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🗑 حذف از سبد", callback_data=f"remove:{item_id}")]]
     )
+
+
+def checkout_quantity_keyboard(rows):
+    buttons = []
+    for row in rows:
+        label = str(row["name"])[:24]
+        buttons.append([
+            InlineKeyboardButton("➖", callback_data=f"qty:minus:{row['cid']}"),
+            InlineKeyboardButton(f"{label} × {row['qty']}", callback_data=f"qty:noop:{row['cid']}"),
+            InlineKeyboardButton("➕", callback_data=f"qty:plus:{row['cid']}"),
+        ])
+    buttons.append([InlineKeyboardButton("🗑 حذف یک محصول", callback_data="qty:delete_menu")])
+    buttons.append([InlineKeyboardButton("✅ ادامه ثبت سفارش", callback_data="qty:continue")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def checkout_quantity_text(rows):
+    total = sum(r["price"] * r["qty"] for r in rows)
+    lines = ["🛒 <b>تعداد محصولات را بررسی کن</b>", "", "با دکمه‌های ➖ و ➕ تعداد هر محصول را کم یا زیاد کن:", ""]
+    for r in rows:
+        line_total = r["price"] * r["qty"]
+        lines.append(f"👕 {escape(r['name'])} — {r['qty']} × {r['price']:,} = {line_total:,} تومان")
+    lines.extend(["", f"💰 <b>جمع کل: {total:,} تومان</b>", "", "بعد از تنظیم تعداد، روی «ادامه ثبت سفارش» بزن."])
+    return "\n".join(lines)
+
+
+async def show_checkout_quantities(message, user_id):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT cart_items.id AS cid, products.name, products.price, cart_items.qty
+           FROM cart_items JOIN products ON cart_items.product_id = products.id
+           WHERE cart_items.user_id=%s AND products.active=TRUE
+           ORDER BY cart_items.id""",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        await message.reply_text("🛒 سبد خریدت خالیه، اول چیزی اضافه کن.")
+        return False
+    await message.reply_text(
+        checkout_quantity_text(rows),
+        parse_mode="HTML",
+        reply_markup=checkout_quantity_keyboard(rows),
+    )
+    return True
+
+
+async def checkout_quantity_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split(":")
+    action = parts[1]
+    user_id = q.from_user.id
+
+    if action == "continue":
+        if await show_saved_step(q.message, context, "name"):
+            return ASK_NAME
+        await q.message.reply_text("لطفاً نام و نام خانوادگی‌ت رو بفرست:")
+        return ASK_NAME
+
+    if action == "noop":
+        return ASK_QTY
+
+    if action == "delete_menu":
+        conn = get_conn()
+        rows = conn.execute(
+            """SELECT cart_items.id AS cid, products.name, cart_items.qty
+               FROM cart_items JOIN products ON cart_items.product_id = products.id
+               WHERE cart_items.user_id=%s AND products.active=TRUE
+               ORDER BY cart_items.id""",
+            (user_id,),
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await q.message.edit_text("🛒 سبد خریدت خالیه.")
+            return ConversationHandler.END
+        delete_buttons = [
+            [InlineKeyboardButton(f"🗑 {str(r['name'])[:32]}", callback_data=f"qty:delete:{r['cid']}")]
+            for r in rows
+        ]
+        delete_buttons.append([InlineKeyboardButton("🔙 برگشت", callback_data="qty:back")])
+        await q.message.edit_text(
+            "کدوم محصول رو می‌خوای از سبد حذف کنی؟",
+            reply_markup=InlineKeyboardMarkup(delete_buttons),
+        )
+        return ASK_QTY
+
+    if action == "back":
+        conn = get_conn()
+        rows = conn.execute(
+            """SELECT cart_items.id AS cid, products.name, products.price, cart_items.qty
+               FROM cart_items JOIN products ON cart_items.product_id = products.id
+               WHERE cart_items.user_id=%s AND products.active=TRUE
+               ORDER BY cart_items.id""",
+            (user_id,),
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await q.message.edit_text("🛒 سبد خریدت خالیه.")
+            return ConversationHandler.END
+        await q.message.edit_text(
+            checkout_quantity_text(rows), parse_mode="HTML", reply_markup=checkout_quantity_keyboard(rows)
+        )
+        return ASK_QTY
+
+    if action == "delete":
+        cart_id = int(parts[2])
+        conn = get_conn()
+        conn.execute("DELETE FROM cart_items WHERE id=%s AND user_id=%s", (cart_id, user_id))
+        conn.commit()
+        rows = conn.execute(
+            """SELECT cart_items.id AS cid, products.name, products.price, cart_items.qty
+               FROM cart_items JOIN products ON cart_items.product_id = products.id
+               WHERE cart_items.user_id=%s AND products.active=TRUE
+               ORDER BY cart_items.id""",
+            (user_id,),
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await q.message.edit_text("🛒 سبد خریدت خالی شد.")
+            return ConversationHandler.END
+        await q.message.edit_text(
+            checkout_quantity_text(rows), parse_mode="HTML", reply_markup=checkout_quantity_keyboard(rows)
+        )
+        return ASK_QTY
+
+    if action in ("plus", "minus"):
+        cart_id = int(parts[2])
+        conn = get_conn()
+        item = conn.execute(
+            """SELECT cart_items.id, cart_items.qty
+               FROM cart_items JOIN products ON cart_items.product_id = products.id
+               WHERE cart_items.id=%s AND cart_items.user_id=%s AND products.active=TRUE""",
+            (cart_id, user_id),
+        ).fetchone()
+        if not item:
+            conn.close()
+            await q.answer("این محصول دیگر در سبد نیست.", show_alert=True)
+            return ASK_QTY
+        new_qty = item["qty"] + (1 if action == "plus" else -1)
+        if new_qty < 1:
+            new_qty = 1
+        conn.execute("UPDATE cart_items SET qty=%s WHERE id=%s AND user_id=%s", (new_qty, cart_id, user_id))
+        conn.commit()
+        rows = conn.execute(
+            """SELECT cart_items.id AS cid, products.name, products.price, cart_items.qty
+               FROM cart_items JOIN products ON cart_items.product_id = products.id
+               WHERE cart_items.user_id=%s AND products.active=TRUE
+               ORDER BY cart_items.id""",
+            (user_id,),
+        ).fetchall()
+        conn.close()
+        await q.message.edit_text(
+            checkout_quantity_text(rows), parse_mode="HTML", reply_markup=checkout_quantity_keyboard(rows)
+        )
+        return ASK_QTY
+
+    return ASK_QTY
 
 
 # ----------------------------------------------------------------------------
@@ -464,10 +622,8 @@ async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("سبد خریدت خالیه، اول چیزی اضافه کن.")
         return ConversationHandler.END
 
-    if await show_saved_step(update.message, context, "name"):
-        return ASK_NAME
-    await update.message.reply_text("لطفاً نام و نام خانوادگی‌ت رو بفرست:")
-    return ASK_NAME
+    await show_checkout_quantities(update.message, user_id)
+    return ASK_QTY
 
 
 def get_saved_data(user_id, data_type):
@@ -1733,6 +1889,9 @@ async def async_main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("checkout", checkout_start)],
         states={
+            ASK_QTY: [
+                CallbackQueryHandler(checkout_quantity_callback, pattern=r"^qty:")
+            ],
             ASK_NAME: [
                 CallbackQueryHandler(handle_saved_name, pattern=r"^saved:name:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone),
