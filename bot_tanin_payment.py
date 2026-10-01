@@ -1758,14 +1758,25 @@ async def admin_customer_detail(q, user_id):
         await q.edit_message_text("مشتری پیدا نشد.", reply_markup=back_keyboard("customers"))
         return
 
+    # اطلاعات فعلی مشتری را از customer_saved_data می‌خوانیم تا آخرین
+    # نام/شماره/آدرس ذخیره‌شده توسط خود مشتری در پنل ادمین نمایش داده شود.
+    # اطلاعات داخل orders و pending_payments به‌عنوان سابقه سفارش دست‌نخورده می‌ماند.
+    saved_names = get_saved_data(user_id, "name")
+    saved_phones = get_saved_data(user_id, "phone")
+    saved_addresses = get_saved_data(user_id, "address")
+    current_name = saved_names[0]["value"] if saved_names else (c["full_name"] or "-")
+    current_phone = saved_phones[0]["value"] if saved_phones else (c["phone"] or "-")
+    current_address = saved_addresses[0]["value"] if saved_addresses else "-"
+
     total = sum((o["total_price"] or 0) for o in orders if o["status"] != "رد شد")
     text = (
-        "👤 <b>اطلاعات مشتری</b>\n\n"
-        f"نام: {c['full_name'] or '-'}\n"
+        "👤 <b>اطلاعات فعلی مشتری</b>\n\n"
+        f"نام: {escape(current_name)}\n"
         f"آیدی: <code>{c['user_id']}</code>\n"
-        f"تلگرام: @{c['username'] or '-'}\n"
-        f"تلفن: {c['phone'] or '-'}\n"
-        f"جنسیت: {c['gender'] or '-'}\n"
+        f"تلگرام: @{escape(c['username'] or '-')}\n"
+        f"تلفن: {escape(current_phone)}\n"
+        f"آدرس: {escape(current_address)}\n"
+        f"جنسیت: {escape(c['gender'] or '-')}\n"
         f"اولین ورود: {escape(format_iran_jalali_fa(c.get('first_seen'), include_time=True))}\n"
         f"آخرین فعالیت: {escape(format_iran_jalali_fa(c.get('last_seen'), include_time=True))}\n\n"
         f"📦 تعداد سفارش‌ها: {len(orders)}\n"
