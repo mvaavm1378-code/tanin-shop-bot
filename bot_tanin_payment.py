@@ -498,8 +498,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     await update.message.reply_text(
-        "سلام 👋 به فروشگاه پوشاک بچگانه و زنانه خوش اومدی!\n"
-        "از منوی زیر می‌تونی محصولات رو ببینی و سفارش بدی.",
+        "🌸 به «تولیدی تنین ایران» خوش آمدید.\n\n"
+        "🧵 از نخ تا ویترین، کنار شماییم.\n\n"
+        "💗 از اینکه ما را برای خرید خود انتخاب و به ما اعتماد کرده‌اید، سپاسگزاریم.🫰🏻",
         reply_markup=main_menu_keyboard(update.effective_user.id),
     )
 
@@ -731,6 +732,33 @@ def get_saved_data(user_id, data_type):
     return rows
 
 
+def saved_value_exists(user_id, data_type, value, exclude_id=None):
+    """Check for a previously saved equivalent value for this customer."""
+    value = (value or "").strip()
+    if not value:
+        return False
+
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, value FROM customer_saved_data WHERE user_id=%s AND data_type=%s",
+        (user_id, data_type),
+    ).fetchall()
+    conn.close()
+
+    def canonical(v):
+        v = str(v or "").strip()
+        if data_type == "name":
+            return normalize_persian_full_name(v) or re.sub(r"\s+", " ", v).replace("ي", "ی").replace("ك", "ک")
+        if data_type == "phone":
+            return normalize_iran_phone(v) or re.sub(r"\s+", "", v)
+        return re.sub(r"\s+", " ", v)
+
+    target = canonical(value)
+    return any(
+        row["id"] != exclude_id and canonical(row["value"]) == target
+        for row in rows
+    )
+
 def save_saved_data(user_id, data_type, value):
     value = (value or "").strip()
     if not value or data_type not in SAVED_TYPES:
@@ -853,6 +881,15 @@ async def handle_name_confirmation(update: Update, context: ContextTypes.DEFAULT
         return ASK_NAME
 
     user_id = q.from_user.id
+    edit_id = context.user_data.get("editing_saved_name_id")
+    if saved_value_exists(user_id, "name", full_name, int(edit_id) if edit_id else None):
+        await q.message.reply_text(
+            "⚠️ این نام و نام خانوادگی را قبلاً ثبت کرده‌ای.\n"
+            "لطفاً نام و نام خانوادگی دیگری وارد کن.",
+            reply_markup=name_input_keyboard(),
+        )
+        return ASK_NAME
+
     edit_id = context.user_data.pop("editing_saved_name_id", None)
     if edit_id:
         update_saved_data(user_id, int(edit_id), "name", full_name)
@@ -1014,11 +1051,21 @@ async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_PHONE
 
+    user_id = update.effective_user.id
+    edit_id = context.user_data.get("editing_saved_phone_id")
+    if saved_value_exists(user_id, "phone", phone, int(edit_id) if edit_id else None):
+        await update.message.reply_text(
+            "⚠️ این شماره تماس را قبلاً ثبت کرده‌ای.\n"
+            "لطفاً شماره دیگری وارد کن.",
+            reply_markup=phone_keyboard(),
+        )
+        return ASK_PHONE
+
     edit_id = context.user_data.pop("editing_saved_phone_id", None)
     if edit_id:
-        update_saved_data(update.effective_user.id, int(edit_id), "phone", phone)
+        update_saved_data(user_id, int(edit_id), "phone", phone)
     else:
-        save_saved_data(update.effective_user.id, "phone", phone)
+        save_saved_data(user_id, "phone", phone)
     context.user_data["phone"] = phone
     await update.message.reply_text("جنسیت خودت رو انتخاب کن:", reply_markup=gender_keyboard())
     return ASK_GENDER
@@ -1127,7 +1174,16 @@ async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_saved_step(update.message, context, "phone")
         return ASK_PHONE
     user_id = update.effective_user.id
-    address = update.message.text.strip()
+    address = re.sub(r"\s+", " ", update.message.text.strip())
+    edit_id = context.user_data.get("editing_saved_address_id")
+    if saved_value_exists(user_id, "address", address, int(edit_id) if edit_id else None):
+        await update.message.reply_text(
+            "⚠️ این آدرس را قبلاً ثبت کرده‌ای.\n"
+            "لطفاً آدرس دیگری وارد کن.",
+            reply_markup=address_input_keyboard(),
+        )
+        return ASK_ADDRESS
+
     edit_id = context.user_data.pop("editing_saved_address_id", None)
     if edit_id:
         update_saved_data(user_id, int(edit_id), "address", address)
