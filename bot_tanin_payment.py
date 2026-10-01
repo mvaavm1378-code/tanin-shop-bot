@@ -1419,6 +1419,7 @@ def is_admin(user_id):
 def admin_panel_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📦 سفارش‌ها", callback_data="adm:orders")],
+        [InlineKeyboardButton("🟡 پرداخت‌های در انتظار تأیید", callback_data="adm:pending_payments")],
         [InlineKeyboardButton("🛍 محصولات", callback_data="adm:products")],
         [InlineKeyboardButton("📊 فروش و آمار", callback_data="adm:sales")],
         [InlineKeyboardButton("👥 مشتری‌ها", callback_data="adm:customers")],
@@ -1504,6 +1505,122 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def admin_pending_payments_view(q):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT * FROM pending_payments
+           WHERE payment_status='در انتظار بررسی'
+           ORDER BY id DESC LIMIT 50"""
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        await q.edit_message_text(
+            "🟡 <b>پرداخت‌های در انتظار تأیید</b>\n\nموردی برای بررسی وجود ندارد.",
+            parse_mode="HTML",
+            reply_markup=back_keyboard("home"),
+        )
+        return
+
+    buttons = []
+    for p in rows:
+        date_text = format_iran_jalali_fa(p.get("created_at"), include_time=False)
+        name = (p.get("full_name") or "-")[:24]
+        amount = f"{p.get('total_price') or 0:,}"
+        buttons.append([
+            InlineKeyboardButton(
+                f"💳 #{p['id']} | {name} | {amount} تومان | {date_text}",
+                callback_data=f"adm:pending:{p['id']}",
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="adm:pending_payments")])
+    buttons.append([InlineKeyboardButton("🔙 پنل اصلی", callback_data="adm:home")])
+    await q.edit_message_text(
+        "🟡 <b>پرداخت‌های در انتظار تأیید</b>\n\n"
+        "روی هر مورد بزنید تا جزئیات و رسید پرداخت نمایش داده شود.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_pending_payment_detail(q, pending_id):
+    conn = get_conn()
+    pending = conn.execute(
+        "SELECT * FROM pending_payments WHERE id=%s", (pending_id,)
+    ).fetchone()
+    conn.close()
+
+    if not pending or pending.get("payment_status") != "در انتظار بررسی":
+        await q.answer("این پرداخت دیگر در انتظار بررسی نیست.", show_alert=True)
+        await admin_pending_payments_view(q)
+        return
+
+    text = (
+        f"🟡 <b>پرداخت در انتظار تأیید #{pending['id']}</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"👤 مشتری: {escape(pending.get('full_name') or '-')}\n"
+        f"📞 تلفن: {escape(pending.get('phone') or '-')}\n"
+        f"📍 آدرس: {escape(pending.get('address') or '-')}\n"
+        f"🕐 زمان ثبت: {escape(format_iran_jalali_fa(pending.get('created_at'), include_time=True))}\n\n"
+        f"🛍 <b>محصولات:</b>\n{escape(pending.get('items_summary') or '-')}\n\n"
+        f"💰 مبلغ: <b>{pending.get('total_price') or 0:,} تومان</b>\n"
+        f"💳 وضعیت: <b>{escape(pending.get('payment_status') or '-')}</b>"
+    )
+
+    buttons = [
+        [InlineKeyboardButton("📎 مشاهده رسید پرداخت", callback_data=f"adm:pending_receipt:{pending_id}")],
+        [
+            InlineKeyboardButton("✅ تأیید پرداخت و ثبت سفارش", callback_data=f"payadmin:approve:{pending_id}"),
+            InlineKeyboardButton("❌ رد پرداخت", callback_data=f"payadmin:reject:{pending_id}"),
+        ],
+        [InlineKeyboardButton("🔙 پرداخت‌های در انتظار", callback_data="adm:pending_payments")],
+    ]
+    await q.edit_message_text(
+        text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def admin_pending_payment_receipt(q, context, pending_id):
+    conn = get_conn()
+    pending = conn.execute(
+        "SELECT * FROM pending_payments WHERE id=%s", (pending_id,)
+    ).fetchone()
+    conn.close()
+
+    if not pending or pending.get("payment_status") != "در انتظار بررسی":
+        await q.answer("این پرداخت دیگر در انتظار بررسی نیست.", show_alert=True)
+        return
+
+    file_id = pending.get("receipt_file_id")
+    if not file_id:
+        await q.answer("برای این پرداخت رسیدی ثبت نشده است.", show_alert=True)
+        return
+
+    caption = (
+        f"🧾 <b>رسید پرداخت #{pending_id}</b>\n"
+        f"👤 {escape(pending.get('full_name') or '-')}\n"
+        f"💰 {pending.get('total_price') or 0:,} تومان\n"
+        f"🕐 {escape(format_iran_jalali_fa(pending.get('created_at'), include_time=True))}"
+    )
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ تأیید پرداخت و ثبت سفارش", callback_data=f"payadmin:approve:{pending_id}"),
+            InlineKeyboardButton("❌ رد پرداخت", callback_data=f"payadmin:reject:{pending_id}"),
+        ],
+        [InlineKeyboardButton("🔙 جزئیات پرداخت", callback_data=f"adm:pending:{pending_id}")],
+    ])
+
+    try:
+        await context.bot.send_photo(q.from_user.id, file_id, caption=caption, parse_mode="HTML", reply_markup=buttons)
+    except Exception:
+        try:
+            await context.bot.send_document(q.from_user.id, file_id, caption=caption, parse_mode="HTML", reply_markup=buttons)
+        except Exception as e:
+            logger.warning(f"Could not send pending receipt to admin {q.from_user.id}: {e}")
+            await q.answer("نمایش رسید ممکن نیست.", show_alert=True)
+
+
 async def admin_products_view(q):
     conn = get_conn()
     rows = conn.execute(
@@ -1548,6 +1665,9 @@ async def admin_orders_view(q, mode="all"):
                 callback_data=f"order:view:{o['id']}"
             )
         ])
+    buttons.append([
+        InlineKeyboardButton("🟡 پرداخت‌های در انتظار", callback_data="adm:pending_payments"),
+    ])
     buttons.append([
         InlineKeyboardButton("🆕 جدید", callback_data="adm:orders:new"),
         InlineKeyboardButton("📦 فعال", callback_data="adm:orders:active"),
@@ -1868,6 +1988,15 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "orders":
         mode = parts[2] if len(parts) > 2 else "all"
         await admin_orders_view(q, mode)
+        return
+    if action == "pending_payments":
+        await admin_pending_payments_view(q)
+        return
+    if action == "pending":
+        await admin_pending_payment_detail(q, int(parts[2]))
+        return
+    if action == "pending_receipt":
+        await admin_pending_payment_receipt(q, context, int(parts[2]))
         return
     if action == "products":
         await admin_products_view(q)
