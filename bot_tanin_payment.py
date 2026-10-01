@@ -1044,7 +1044,7 @@ async def handle_saved_address(update: Update, context: ContextTypes.DEFAULT_TYP
         row = next((r for r in get_saved_data(user_id, "address") if r["id"] == int(parts[3])), None)
         if row:
             context.user_data["address"] = row["value"]
-            return await finalize_order_from_callback(q.message, context)
+            return await finalize_order_from_callback(q.message, context, q.from_user)
     elif action == "new":
         await q.message.reply_text("آدرس جدید را بفرست:")
         return ASK_ADDRESS
@@ -1063,8 +1063,8 @@ async def handle_saved_address(update: Update, context: ContextTypes.DEFAULT_TYP
     return ASK_ADDRESS
 
 
-async def finalize_order_from_callback(message, context):
-    return await create_pending_payment(message, context, q.from_user)
+async def finalize_order_from_callback(message, context, user=None):
+    return await create_pending_payment(message, context, user)
 
 
 async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1090,7 +1090,7 @@ async def create_pending_payment(message, context, user=None):
     gender = context.user_data["gender"]
     conn.execute(
         "UPDATE customers SET phone=%s, gender=%s, full_name=%s, username=%s, last_seen=%s WHERE user_id=%s",
-        (phone, gender, full_name, update.effective_user.username or "", now, user_id),
+        (phone, gender, full_name, username, now, user_id),
     )
     rows = conn.execute(
         """SELECT products.id AS product_id, products.name, products.price,
