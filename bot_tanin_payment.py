@@ -1450,7 +1450,7 @@ def order_text(o):
         f"👤 مشتری: {o['full_name'] or '-'}\n"
         f"📞 تلفن: {o['phone'] or '-'}\n"
         f"📍 آدرس: {o['address'] or '-'}\n"
-        f"🕐 زمان: {o['created_at'] or '-'}\n\n"
+        f"🕐 زمان: {escape(format_iran_jalali_fa(o.get('created_at'), include_time=True))}\n\n"
         f"🛍 <b>محصولات:</b>\n{o['items_summary'] or '-'}\n\n"
         f"💰 مبلغ: <b>{o['total_price']:,} تومان</b>\n"
         f"💳 وضعیت پرداخت: <b>{o['payment_status'] or '-'}</b>\n"
@@ -1646,8 +1646,8 @@ async def admin_customer_detail(q, user_id):
         f"تلگرام: @{c['username'] or '-'}\n"
         f"تلفن: {c['phone'] or '-'}\n"
         f"جنسیت: {c['gender'] or '-'}\n"
-        f"اولین ورود: {c['first_seen'] or '-'}\n"
-        f"آخرین فعالیت: {c['last_seen'] or '-'}\n\n"
+        f"اولین ورود: {escape(format_iran_jalali_fa(c.get('first_seen'), include_time=True))}\n"
+        f"آخرین فعالیت: {escape(format_iran_jalali_fa(c.get('last_seen'), include_time=True))}\n\n"
         f"📦 تعداد سفارش‌ها: {len(orders)}\n"
         f"💰 مجموع خرید غیرلغوشده: {total:,} تومان"
     )
@@ -1711,7 +1711,7 @@ async def admin_bank_detail(q, account_id):
         f"حساب: <code>{escape(a['account_number'] or '-')}</code>\n"
         f"شبا: <code>{escape(a['iban'] or '-')}</code>\n"
         f"وضعیت: <b>{state}</b>\n"
-        f"آخرین تغییر: {escape(str(a['updated_at']) if a['updated_at'] else '-')}"
+        f"آخرین تغییر: {escape(format_iran_jalali_fa(a.get('updated_at'), include_time=True))}"
     )
     buttons = []
     if a["active"]:
@@ -1792,7 +1792,7 @@ async def receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption = (f"💳 <b>رسید پرداخت جدید</b>\n\n🆔 پرداخت موقت: #{pending['id']}\n"
                        f"👤 مشتری: {escape(pending['full_name'] or '-')}\n📞 تلفن: {escape(pending['phone'] or '-')}\n"
                        f"📍 آدرس: {escape(pending['address'] or '-')}\n\n🛍 محصولات:\n{escape(pending['items_summary'] or '-')}\n\n"
-                       f"💰 مبلغ: <b>{pending['total_price']:,} تومان</b>\n🕐 {now}")
+                       f"💰 مبلغ: <b>{pending['total_price']:,} تومان</b>\n🕐 {escape(format_iran_jalali_fa(now, include_time=True))}")
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ تأیید پرداخت و ثبت سفارش", callback_data=f"payadmin:approve:{pending['id']}")],
                 [InlineKeyboardButton("❌ رد پرداخت", callback_data=f"payadmin:reject:{pending['id']}")],
