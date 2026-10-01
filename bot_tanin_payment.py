@@ -272,14 +272,48 @@ def init_db():
 # ----------------------------------------------------------------------------
 # کیبوردها
 # ----------------------------------------------------------------------------
+def admin_menu_counts():
+    """تعداد موارد قابل نمایش کنار میان‌برهای منوی ادمین."""
+    conn = get_conn()
+    try:
+        orders = conn.execute(
+            "SELECT COUNT(*) AS n FROM orders WHERE status='در انتظار بررسی'"
+        ).fetchone()["n"]
+        payments = conn.execute(
+            "SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی'"
+        ).fetchone()["n"]
+        products = conn.execute(
+            "SELECT COUNT(*) AS n FROM products WHERE active=TRUE"
+        ).fetchone()["n"]
+        tickets = conn.execute(
+            "SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('new','admin_waiting')"
+        ).fetchone()["n"]
+        return {"orders": orders or 0, "payments": payments or 0,
+                "products": products or 0, "tickets": tickets or 0}
+    finally:
+        conn.close()
+
+
+def _admin_badge(label, count):
+    """عدد صفر را پنهان می‌کند و اعداد مثبت را کنار عنوان می‌آورد."""
+    return f"{label} ({count})" if count else label
+
+
 def main_menu_keyboard(user_id=None):
     # منوی ادمین کاملاً جدا از منوی مشتری است.
     if is_admin(user_id):
+        try:
+            counts = admin_menu_counts()
+        except Exception:
+            logger.exception("Could not load admin menu counters")
+            counts = {"orders": 0, "payments": 0, "products": 0, "tickets": 0}
         return ReplyKeyboardMarkup(
             [
                 [KeyboardButton("⚙️ پنل مدیریت")],
-                [KeyboardButton("📦 سفارش‌ها"), KeyboardButton("💳 پرداخت‌های در انتظار")],
-                [KeyboardButton("🛠 مدیریت محصولات"), KeyboardButton("🎫 پشتیبانی")],
+                [KeyboardButton(_admin_badge("📦 سفارش‌ها", counts["orders"])),
+                 KeyboardButton(_admin_badge("💳 پرداخت‌های در انتظار", counts["payments"]))],
+                [KeyboardButton(_admin_badge("🛠 مدیریت محصولات", counts["products"])),
+                 KeyboardButton(_admin_badge("🎫 پشتیبانی", counts["tickets"]))],
             ],
             resize_keyboard=True,
         )
@@ -1807,9 +1841,11 @@ async def admin_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (update.effective_message.text or "").strip()
+    # بخش عددیِ نشانگر را حذف می‌کنیم تا دکمه‌های دارای شمارنده هم شناسایی شوند.
+    text = re.sub(r"\s+\(\d+\)$", "", text)
     q = AdminMessageViewAdapter(update)
     if text == "📦 سفارش‌ها":
-        await admin_orders_view(q, "all")
+        await admin_orders_view(q, "new")
     elif text == "💳 پرداخت‌های در انتظار":
         await admin_pending_payments_view(q)
     elif text == "🛠 مدیریت محصولات":
@@ -3574,7 +3610,7 @@ async def async_main():
     app.add_handler(MessageHandler(filters.Regex(r"^💬\s*(?:مرکز پشتیبانی|پشتیبانی)$"), support))
     app.add_handler(CommandHandler("orders_admin", admin_orders))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ پنل مدیریت$"), admin_panel))
-    app.add_handler(MessageHandler(filters.Regex(r"^(?:📦 سفارش‌ها|💳 پرداخت‌های در انتظار|🛠 مدیریت محصولات|🎫 پشتیبانی)$"), admin_shortcut))
+    app.add_handler(MessageHandler(filters.Regex(r"^(?:📦 سفارش‌ها|💳 پرداخت‌های در انتظار|🛠 مدیریت محصولات|🎫 پشتیبانی)(?: \(\d+\))?$"), admin_shortcut))
 
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(support_callback, pattern=r"^support:"))
