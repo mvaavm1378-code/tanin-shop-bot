@@ -294,6 +294,20 @@ def product_keyboard(product_id):
     )
 
 
+def add_quantity_keyboard(product_id, qty=1):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("➖", callback_data=f"addqty:minus:{product_id}:{qty}"),
+                InlineKeyboardButton(f"📦 {qty} بسته", callback_data=f"addqty:noop:{product_id}:{qty}"),
+                InlineKeyboardButton("➕", callback_data=f"addqty:plus:{product_id}:{qty}"),
+            ],
+            [InlineKeyboardButton("✅ افزودن به سبد خرید", callback_data=f"addqty:confirm:{product_id}:{qty}")],
+            [InlineKeyboardButton("🔙 انصراف", callback_data=f"addqty:cancel:{product_id}:{qty}")],
+        ]
+    )
+
+
 def cart_item_keyboard(item_id):
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🗑 حذف از سبد", callback_data=f"remove:{item_id}")]]
@@ -523,34 +537,100 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """وقتی مشتری روی «افزودن به سبد خرید» می‌زند، ابتدا تعداد بسته را انتخاب می‌کند."""
     query = update.callback_query
-    await query.answer("به سبد خرید اضافه شد ✅")
+    await query.answer()
     product_id = int(query.data.split(":", 1)[1])
-    user_id = query.from_user.id
+    conn = get_conn()
+    product = conn.execute(
+        "SELECT * FROM products WHERE id=%s AND active=TRUE", (product_id,)
+    ).fetchone()
+    conn.close()
+
+    if not product:
+        await query.answer("این محصول دیگر موجود نیست.", show_alert=True)
+        return
+
+    pack_info = product["pack_info"] or ""
+    text = (
+        f"👕 <b>{escape(product['name'])}</b>\n\n"
+        f"{escape(pack_info)}\n" if pack_info else
+        f"👕 <b>{escape(product['name'])}</b>\n\n"
+    )
+    text += "📦 تعداد بسته‌ای که می‌خواهی به سبد اضافه کنی را انتخاب کن:"
+
+    await query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=add_quantity_keyboard(product_id, 1),
+    )
+
+
+async def add_quantity_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":")
+    action = parts[1]
+    product_id = int(parts[2])
+    qty = max(1, int(parts[3]))
 
     conn = get_conn()
     product = conn.execute(
         "SELECT * FROM products WHERE id=%s AND active=TRUE", (product_id,)
     ).fetchone()
+    conn.close()
+
     if not product:
-        conn.close()
-        await query.answer("این محصول دیگر موجود نیست.", show_alert=True)
+        await query.message.edit_text("این محصول دیگر موجود نیست.")
         return
 
-    existing = conn.execute(
-        "SELECT * FROM cart_items WHERE user_id=%s AND product_id=%s", (user_id, product_id)
-    ).fetchone()
-    if existing:
-        conn.execute(
-            "UPDATE cart_items SET qty = qty + 1 WHERE id=%s", (existing["id"],)
-        )
-    else:
-        conn.execute(
-            "INSERT INTO cart_items (user_id, product_id, qty) VALUES (%s, %s, 1)",
+    if action == "plus":
+        qty += 1
+    elif action == "minus":
+        qty = max(1, qty - 1)
+    elif action == "cancel":
+        await query.message.delete()
+        return
+    elif action == "confirm":
+        user_id = query.from_user.id
+        conn = get_conn()
+        existing = conn.execute(
+            "SELECT id, qty FROM cart_items WHERE user_id=%s AND product_id=%s",
             (user_id, product_id),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE cart_items SET qty=%s WHERE id=%s AND user_id=%s",
+                (existing["qty"] + qty, existing["id"], user_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO cart_items (user_id, product_id, qty) VALUES (%s, %s, %s)",
+                (user_id, product_id, qty),
+            )
+        conn.commit()
+        conn.close()
+        await query.message.edit_text(
+            f"✅ {qty} بسته از «{escape(product['name'])}» به سبد خرید اضافه شد.",
+            parse_mode="HTML",
         )
-    conn.commit()
-    conn.close()
+        return
+    elif action == "noop":
+        return
+
+    pack_info = product["pack_info"] or ""
+    text = (
+        f"👕 <b>{escape(product['name'])}</b>\n\n"
+        f"{escape(pack_info)}\n" if pack_info else
+        f"👕 <b>{escape(product['name'])}</b>\n\n"
+    )
+    text += f"📦 تعداد بسته‌ای که می‌خواهی به سبد اضافه کنی: <b>{qty} بسته</b>"
+
+    await query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=add_quantity_keyboard(product_id, qty),
+    )
 
 
 async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1892,6 +1972,7 @@ async def async_main():
     app.add_handler(CallbackQueryHandler(payment_callback, pattern=r"^pay:"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, receipt_photo))
     app.add_handler(CallbackQueryHandler(category_selected, pattern=r"^cat:"))
+    app.add_handler(CallbackQueryHandler(add_quantity_callback, pattern=r"^addqty:"))
     app.add_handler(CallbackQueryHandler(add_to_cart, pattern=r"^add:"))
     app.add_handler(CallbackQueryHandler(remove_from_cart, pattern=r"^remove:"))
 
