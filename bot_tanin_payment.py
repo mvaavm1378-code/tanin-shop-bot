@@ -15,6 +15,7 @@ import psycopg
 from psycopg.rows import dict_row
 import logging
 import json
+import re
 from html import escape
 from aiohttp import web
 from datetime import datetime
@@ -794,6 +795,60 @@ async def show_saved_step(message, context, data_type):
     return False
 
 
+def normalize_persian_full_name(value):
+    """Validate and normalize a Persian full name for checkout."""
+    if not value:
+        return None
+    text = str(value).strip()
+    text = text.replace("ي", "ی").replace("ى", "ی").replace("ك", "ک")
+    text = re.sub(r"\s+", " ", text)
+    # Only Arabic/Persian letters and spaces are allowed; no digits/symbols/English letters.
+    if not text or any((not ch.isalpha()) or not ("\u0600" <= ch <= "\u06ff") for ch in text if ch != " "):
+        return None
+    parts = text.split(" ")
+    if len(parts) < 2 or any(len(part) < 2 for part in parts):
+        return None
+    return text
+
+
+def name_confirm_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ بله، درست است", callback_data="nameconfirm:yes")],
+        [InlineKeyboardButton("✏️ ویرایش", callback_data="nameconfirm:edit")],
+    ])
+
+
+async def handle_name_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action = q.data.split(":", 1)[1]
+    if action == "edit":
+        context.user_data.pop("pending_full_name", None)
+        await q.message.reply_text("✏️ لطفاً نام و نام خانوادگی را دوباره وارد کن:\nمثال: محمد احمدی")
+        return ASK_NAME
+
+    full_name = context.user_data.pop("pending_full_name", None)
+    if not full_name:
+        await q.message.reply_text("❌ اطلاعات نام پیدا نشد. لطفاً نام و نام خانوادگی را دوباره وارد کن.")
+        return ASK_NAME
+
+    user_id = q.from_user.id
+    edit_id = context.user_data.pop("editing_saved_name_id", None)
+    if edit_id:
+        update_saved_data(user_id, int(edit_id), "name", full_name)
+    else:
+        save_saved_data(user_id, "name", full_name)
+    context.user_data["full_name"] = full_name
+    if await show_saved_step(q.message, context, "phone"):
+        return ASK_PHONE
+    await q.message.reply_text(
+        "📱 لطفاً شماره موبایل خودت رو با دکمه زیر از تلگرام ارسال کن:\n\n"
+        "شماره باید متعلق به همین حساب تلگرام باشد.",
+        reply_markup=phone_keyboard(),
+    )
+    return ASK_PHONE
+
+
 def normalize_iran_phone(value):
     """Normalize Iranian mobile numbers to 11-digit 09xxxxxxxxx format."""
     if not value:
@@ -845,22 +900,24 @@ def gender_keyboard():
 
 
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    full_name = update.message.text.strip()
-    edit_id = context.user_data.pop("editing_saved_name_id", None)
-    if edit_id:
-        update_saved_data(user_id, int(edit_id), "name", full_name)
-    else:
-        save_saved_data(user_id, "name", full_name)
-    context.user_data["full_name"] = full_name
-    if await show_saved_step(update.message, context, "phone"):
-        return ASK_PHONE
+    raw_name = update.message.text or ""
+    full_name = normalize_persian_full_name(raw_name)
+    if not full_name:
+        await update.message.reply_text(
+            "❌ نام و نام خانوادگی را درست وارد کن.\n\n"
+            "نام باید حداقل دو بخش داشته باشد و فقط شامل حروف فارسی باشد.\n"
+            "مثال: محمد احمدی"
+        )
+        return ASK_NAME
+
+    context.user_data["pending_full_name"] = full_name
     await update.message.reply_text(
-        "📱 لطفاً شماره موبایل خودت رو با دکمه زیر از تلگرام ارسال کن:\n\n"
-        "شماره باید متعلق به همین حساب تلگرام باشد.",
-        reply_markup=phone_keyboard(),
+        f"👤 نام و نام خانوادگی شما:\n<b>{escape(full_name)}</b>\n\n"
+        "آیا اطلاعات درست است؟",
+        parse_mode="HTML",
+        reply_markup=name_confirm_keyboard(),
     )
-    return ASK_PHONE
+    return ASK_NAME
 
 
 async def handle_saved_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -878,11 +935,11 @@ async def handle_saved_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("📱 لطفاً شماره موبایل خودت رو با دکمه زیر از تلگرام ارسال کن:", reply_markup=phone_keyboard())
             return ASK_PHONE
     elif action == "new":
-        await q.message.reply_text("لطفاً نام و نام خانوادگی جدید را بفرست:")
+        await q.message.reply_text("لطفاً نام و نام خانوادگی جدید را بفرست:\nمثال: محمد احمدی")
         return ASK_NAME
     elif action == "edit":
         context.user_data["editing_saved_name_id"] = parts[3]
-        await q.message.reply_text("نام جدید را بفرست:")
+        await q.message.reply_text("نام و نام خانوادگی جدید را بفرست:\nمثال: محمد احمدی")
         return ASK_NAME
     elif action == "delete":
         delete_saved_data(user_id, int(parts[3]), "name")
@@ -890,7 +947,7 @@ async def handle_saved_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if rows:
             await q.message.reply_text("نام حذف شد. یک نام را انتخاب کن یا نام جدید اضافه کن:", reply_markup=saved_data_keyboard("name", rows))
             return ASK_NAME
-        await q.message.reply_text("نام حذف شد. نام و نام خانوادگی را بفرست:")
+        await q.message.reply_text("نام حذف شد. نام و نام خانوادگی را بفرست:\nمثال: محمد احمدی")
         return ASK_NAME
     return ASK_NAME
 
@@ -1987,6 +2044,7 @@ async def async_main():
             ],
             ASK_NAME: [
                 CallbackQueryHandler(handle_saved_name, pattern=r"^saved:name:"),
+                CallbackQueryHandler(handle_name_confirmation, pattern=r"^nameconfirm:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone),
             ],
             ASK_PHONE: [
