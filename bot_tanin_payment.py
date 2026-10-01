@@ -28,6 +28,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -536,15 +537,32 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + (f"{escape(p['pack_info'])}\n" if p['pack_info'] else "")
             + f"قیمت: {p['price']:,} تومان"
         )
+        sent = False
         if p["photo_url"]:
-            await query.message.reply_photo(
-                p["photo_url"], caption=text, parse_mode="HTML",
-                reply_markup=product_keyboard(p["id"]),
-            )
-        else:
+            try:
+                await query.message.reply_photo(
+                    p["photo_url"], caption=text, parse_mode="HTML",
+                    reply_markup=product_keyboard(p["id"]),
+                )
+                sent = True
+            except Exception as e:
+                logger.warning(f"Could not send photo for product {p['id']}: {e}")
+        if not sent:
             await query.message.reply_text(
                 text, parse_mode="HTML", reply_markup=product_keyboard(p["id"])
             )
+
+
+async def safe_edit(message, text, **kwargs):
+    """Edit a message whether it is a photo (caption) or plain text; ignore 'not modified'."""
+    try:
+        if message.photo:
+            return await message.edit_caption(caption=text, **kwargs)
+        return await message.edit_text(text, **kwargs)
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            return None
+        raise
 
 
 async def add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -570,7 +588,8 @@ async def add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     text += "📦 تعداد بسته‌ای که می‌خواهی به سبد اضافه کنی را انتخاب کن:"
 
-    await query.message.edit_text(
+    await safe_edit(
+        query.message,
         text,
         parse_mode="HTML",
         reply_markup=add_quantity_keyboard(product_id, 1),
@@ -592,7 +611,7 @@ async def add_quantity_callback(update: Update, context: ContextTypes.DEFAULT_TY
     conn.close()
 
     if not product:
-        await query.message.edit_text("این محصول دیگر موجود نیست.")
+        await safe_edit(query.message, "این محصول دیگر موجود نیست.")
         return
 
     if action == "plus":
@@ -621,7 +640,8 @@ async def add_quantity_callback(update: Update, context: ContextTypes.DEFAULT_TY
             )
         conn.commit()
         conn.close()
-        await query.message.edit_text(
+        await safe_edit(
+            query.message,
             f"✅ {qty} بسته از «{escape(product['name'])}» به سبد خرید اضافه شد.",
             parse_mode="HTML",
         )
@@ -637,7 +657,8 @@ async def add_quantity_callback(update: Update, context: ContextTypes.DEFAULT_TY
     )
     text += f"📦 تعداد بسته‌ای که می‌خواهی به سبد اضافه کنی: <b>{qty} بسته</b>"
 
-    await query.message.edit_text(
+    await safe_edit(
+        query.message,
         text,
         parse_mode="HTML",
         reply_markup=add_quantity_keyboard(product_id, qty),
@@ -719,7 +740,7 @@ async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ).fetchall()
     conn.close()
     if not rows:
-        await update.message.reply_text("سبد خریدت خالیه، اول چیزی اضافه کن.")
+        await target_message.reply_text("سبد خریدت خالیه، اول چیزی اضافه کن.")
         return ConversationHandler.END
 
     await show_checkout_quantities(target_message, user_id)
@@ -841,10 +862,10 @@ def normalize_persian_full_name(value):
     text = text.replace("ي", "ی").replace("ى", "ی").replace("ك", "ک")
     text = re.sub(r"\s+", " ", text)
     # Only Arabic/Persian letters and spaces are allowed; no digits/symbols/English letters.
-    if not text or any((not ch.isalpha()) or not ("\u0600" <= ch <= "\u06ff") for ch in text if ch != " "):
+    if not text or any((not ch.isalpha()) or not ("\u0600" <= ch <= "\u06ff") for ch in text if ch not in (" ", "\u200c")):
         return None
     parts = text.split(" ")
-    if len(parts) < 2 or any(len(part) < 2 for part in parts):
+    if len(parts) < 2 or any(len(part.replace("\u200c", "")) < 2 for part in parts):
         return None
     return text
 
@@ -1011,6 +1032,7 @@ async def handle_saved_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("📱 لطفاً شماره موبایل خودت رو با دکمه زیر از تلگرام ارسال کن:", reply_markup=phone_keyboard())
             return ASK_PHONE
     elif action == "new":
+        context.user_data.pop("editing_saved_name_id", None)
         await q.message.reply_text("لطفاً نام و نام خانوادگی جدید را بفرست:\nمثال: محمد احمدی")
         return ASK_NAME
     elif action == "edit":
@@ -1091,6 +1113,7 @@ async def handle_saved_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await q.message.reply_text("جنسیت خودت رو انتخاب کن:", reply_markup=gender_keyboard())
             return ASK_GENDER
     elif action == "new":
+        context.user_data.pop("editing_saved_phone_id", None)
         await q.message.reply_text("📱 شماره موبایل جدیدت را با دکمه زیر ارسال کن:", reply_markup=phone_keyboard())
         return ASK_PHONE
     elif action == "edit":
@@ -1152,6 +1175,7 @@ async def handle_saved_address(update: Update, context: ContextTypes.DEFAULT_TYP
             context.user_data["address"] = row["value"]
             return await finalize_order_from_callback(q.message, context, q.from_user)
     elif action == "new":
+        context.user_data.pop("editing_saved_address_id", None)
         await q.message.reply_text("آدرس جدید را بفرست:", reply_markup=address_input_keyboard())
         return ASK_ADDRESS
     elif action == "edit":
@@ -1233,7 +1257,20 @@ async def create_pending_payment(message, context, user=None):
            ORDER BY id DESC LIMIT 1""", (user_id,)
     ).fetchone()
     if pending:
+        if pending["payment_status"] == "در انتظار رسید":
+            # هنوز رسیدی ارسال نشده؛ اطلاعات و مبلغ را با سبد فعلی هماهنگ می‌کنیم.
+            conn.execute(
+                """UPDATE pending_payments
+                   SET full_name=%s, phone=%s, address=%s, items_summary=%s, total_price=%s
+                   WHERE id=%s AND payment_status='در انتظار رسید'""",
+                (full_name, phone, address, summary, total, pending["id"]),
+            )
+            conn.commit()
+            pending = dict(pending)
+            pending["total_price"] = total
         conn.close()
+        for key in ("full_name", "phone", "address", "gender"):
+            context.user_data.pop(key, None)
         await show_payment_instructions(message, pending)
         return ConversationHandler.END
 
@@ -1602,20 +1639,20 @@ def order_text(o):
     return (
         f"📦 <b>سفارش #{o['id']}</b>\n"
         f"━━━━━━━━━━━━━━\n"
-        f"👤 مشتری: {o['full_name'] or '-'}\n"
-        f"📞 تلفن: {o['phone'] or '-'}\n"
-        f"📍 آدرس: {o['address'] or '-'}\n"
+        f"👤 مشتری: {escape(str(o['full_name'] or '-'))}\n"
+        f"📞 تلفن: {escape(str(o['phone'] or '-'))}\n"
+        f"📍 آدرس: {escape(str(o['address'] or '-'))}\n"
         f"🕐 زمان: {escape(format_iran_jalali_fa(o.get('created_at'), include_time=True))}\n\n"
-        f"🛍 <b>محصولات:</b>\n{o['items_summary'] or '-'}\n\n"
+        f"🛍 <b>محصولات:</b>\n{escape(str(o['items_summary'] or '-'))}\n\n"
         f"💰 مبلغ: <b>{o['total_price']:,} تومان</b>\n"
-        f"💳 وضعیت پرداخت: <b>{o['payment_status'] or '-'}</b>\n"
-        f"📌 وضعیت: <b>{o['status']}</b>"
+        f"💳 وضعیت پرداخت: <b>{escape(str(o['payment_status'] or '-'))}</b>\n"
+        f"📌 وضعیت: <b>{escape(str(o['status']))}</b>"
     )
 
 
 def product_text(p):
     state = "فعال ✅" if p["active"] else "غیرفعال ⛔"
-    pack = f"پک: {p['pack_info']}\n" if p['pack_info'] else ""
+    pack = f"پک: {escape(p['pack_info'])}\n" if p['pack_info'] else ""
     return (
         f"🛍 <b>{escape(p['name'])}</b>\n"
         f"شناسه: #{p['id']}\n"
@@ -1718,7 +1755,7 @@ async def admin_pending_payments_view(q):
         "روی هر مورد بزنید تا جزئیات و رسید پرداخت نمایش داده شود."
     )
     markup = InlineKeyboardMarkup(buttons)
-    if q.message and q.message.photo:
+    if q.message and (q.message.photo or q.message.document):
         await q.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
     else:
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
@@ -2084,7 +2121,7 @@ async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
 async def receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.photo:
+    if not update.message or not (update.message.photo or update.message.document):
         return
     user_id = update.effective_user.id
     conn = get_conn()
@@ -2093,7 +2130,14 @@ async def receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
            ORDER BY id DESC LIMIT 1""", (user_id,)
     ).fetchone()
     if not pending:
-        conn.close(); return
+        under_review = conn.execute(
+            """SELECT id FROM pending_payments WHERE user_id=%s AND payment_status='در انتظار بررسی'
+               LIMIT 1""", (user_id,)
+        ).fetchone()
+        conn.close()
+        if under_review:
+            await update.message.reply_text("🟡 رسید قبلی شما در حال بررسی است. لطفاً منتظر نتیجه بمانید.")
+        return
     file_id = update.message.photo[-1].file_id if update.message.photo else update.message.document.file_id
     now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
     conn.execute("UPDATE pending_payments SET receipt_file_id=%s, payment_status='در انتظار بررسی' WHERE id=%s", (file_id, pending['id']))
@@ -2116,6 +2160,23 @@ async def receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Could not send payment receipt to admin {admin_id}: {e}")
 
+async def mark_admin_message(q, suffix_html):
+    """Append a status line to the admin's message (photo/document caption or plain text)."""
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 پرداخت‌های در انتظار", callback_data="adm:pending_payments")]])
+    try:
+        msg = q.message
+        if msg.photo or msg.document:
+            await q.edit_message_caption(
+                caption=(msg.caption_html or "") + suffix_html, parse_mode="HTML", reply_markup=kb
+            )
+        else:
+            await q.edit_message_text(
+                text=(msg.text_html or "") + suffix_html, parse_mode="HTML", reply_markup=kb
+            )
+    except Exception as e:
+        logger.warning(f"Could not update admin payment message: {e}")
+
+
 async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not is_admin(q.from_user.id):
@@ -2133,13 +2194,9 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
         conn.execute("UPDATE pending_payments SET payment_status='رد شد', reviewed_at=%s, admin_id=%s WHERE id=%s", (now, q.from_user.id, pid))
         conn.commit(); conn.close()
         await q.answer("پرداخت رد شد.")
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
-        await admin_pending_payments_view(q)
         try: await context.bot.send_message(pending['user_id'], "❌ رسید پرداخت شما تأیید نشد. سفارش ثبت نشد. لطفاً با پشتیبانی تماس بگیرید.")
         except Exception: pass
+        await mark_admin_message(q, "\n\n❌ <b>پرداخت رد شد</b>")
         return
     # approve: only here is the real order inserted and cart cleared
     cur = conn.execute("""INSERT INTO orders
@@ -2152,7 +2209,7 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
     conn.execute("UPDATE pending_payments SET payment_status='تأیید شده', reviewed_at=%s, admin_id=%s, order_id=%s WHERE id=%s", (now, q.from_user.id, order_id, pid))
     conn.commit(); conn.close()
     await q.answer(f"پرداخت تأیید شد؛ سفارش #{order_id} ثبت شد.")
-    await q.edit_message_caption(caption=(q.message.caption or "") + f"\n\n✅ <b>پرداخت تأیید شد — سفارش #{order_id} ثبت شد</b>", parse_mode="HTML", reply_markup=None)
+    await mark_admin_message(q, f"\n\n✅ <b>پرداخت تأیید شد — سفارش #{order_id} ثبت شد</b>")
     try:
         await context.bot.send_message(pending['user_id'], f"✅ پرداخت شما تأیید شد.\n🆔 شماره سفارش: #{order_id}\n💰 مبلغ: {pending['total_price']:,} تومان\nسفارش شما ثبت نهایی شد.")
     except Exception: pass
@@ -2329,17 +2386,17 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
             context.user_data.pop("support_flow", None)
             await update.message.reply_text(
-                f"✅ درخواستت ثبت شد.\\n🎫 شماره تیکت: #{ticket_id}\\n\\nپشتیبانی در اولین فرصت پاسخ می‌دهد.",
+                f"✅ درخواستت ثبت شد.\n🎫 شماره تیکت: #{ticket_id}\n\nپشتیبانی در اولین فرصت پاسخ می‌دهد.",
                 reply_markup=support_center_keyboard(),
             )
             for admin_id in ADMIN_IDS:
                 try:
                     await context.bot.send_message(
                         admin_id,
-                        f"🆕 <b>درخواست پشتیبانی #{ticket_id}</b>\\n"
-                        f"👤 آیدی مشتری: <code>{user_id}</code>\\n"
-                        f"🏷 موضوع: {escape(topic)}\\n"
-                        f"🕐 {format_iran_jalali_fa(now, True)}\\n\\n"
+                        f"🆕 <b>درخواست پشتیبانی #{ticket_id}</b>\n"
+                        f"👤 آیدی مشتری: <code>{user_id}</code>\n"
+                        f"🏷 موضوع: {escape(topic)}\n"
+                        f"🕐 {format_iran_jalali_fa(now, True)}\n\n"
                         f"💬 {escape(text)}",
                         parse_mode="HTML",
                         reply_markup=InlineKeyboardMarkup([[
@@ -2377,7 +2434,7 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(
                         t["user_id"],
-                        f"💬 پاسخ پشتیبانی برای تیکت #{ticket_id}:\\n\\n{text}",
+                        f"💬 پاسخ پشتیبانی برای تیکت #{ticket_id}:\n\n{text}",
                         reply_markup=InlineKeyboardMarkup([[
                             InlineKeyboardButton("🎫 مشاهده تیکت", callback_data=f"support:view:{ticket_id}")
                         ]]),
@@ -2390,8 +2447,8 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     try:
                         await context.bot.send_message(
                             admin_id,
-                            f"💬 <b>پاسخ جدید مشتری در تیکت #{ticket_id}</b>\\n"
-                            f"👤 آیدی: <code>{user_id}</code>\\n\\n{escape(text)}",
+                            f"💬 <b>پاسخ جدید مشتری در تیکت #{ticket_id}</b>\n"
+                            f"👤 آیدی: <code>{user_id}</code>\n\n{escape(text)}",
                             parse_mode="HTML",
                             reply_markup=InlineKeyboardMarkup([[
                                 InlineKeyboardButton("🎫 مشاهده تیکت", callback_data=f"adm:ticket:{ticket_id}")
@@ -2634,6 +2691,8 @@ async def async_main():
     webhook_path = os.getenv("WEBHOOK_PATH", "telegram/webhook").strip("/")
     webhook_url = f"https://{hostname}/{webhook_path}"
     webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    if not webhook_secret:
+        logger.warning("WEBHOOK_SECRET is not set; anyone who knows the webhook URL can send fake updates.")
 
     async def health_handler(request):
         return web.Response(text="Bot is running", status=200, content_type="text/plain")
