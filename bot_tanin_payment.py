@@ -1771,7 +1771,10 @@ def admin_product_keyboard(product_id, active):
     toggle = "غیرفعال کردن" if active else "فعال کردن"
     toggle_action = "deactivate" if active else "activate"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ ویرایش", callback_data=f"adm:edit_product:{product_id}")],
+        [InlineKeyboardButton("✏️ ویرایش اطلاعات", callback_data=f"adm:edit_product:{product_id}")],
+        [InlineKeyboardButton("➖ ۱۰۰هزار", callback_data=f"adm:price_adjust:{product_id}:-100000"), InlineKeyboardButton("➕ ۱۰۰هزار", callback_data=f"adm:price_adjust:{product_id}:100000")],
+        [InlineKeyboardButton("➖ ۵۰۰هزار", callback_data=f"adm:price_adjust:{product_id}:-500000"), InlineKeyboardButton("➕ ۵۰۰هزار", callback_data=f"adm:price_adjust:{product_id}:500000")],
+        [InlineKeyboardButton("💰 ثبت قیمت دلخواه", callback_data=f"adm:price_set:{product_id}")],
         [InlineKeyboardButton(f"⛔ {toggle}", callback_data=f"adm:toggle_product:{product_id}:{toggle_action}")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"adm:delete_product:{product_id}")],
         [InlineKeyboardButton("🔙 محصولات", callback_data="adm:products")],
@@ -2518,6 +2521,26 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["admin_flow"] = {"type": "edit_product", "product_id": pid, "step": "name"}
         await q.message.reply_text("✏️ نام جدید محصول را بفرست:")
         return
+    if action == "price_adjust":
+        pid, delta = int(parts[2]), int(parts[3])
+        conn = get_conn()
+        product = conn.execute("SELECT price FROM products WHERE id=%s", (pid,)).fetchone()
+        if not product:
+            conn.close()
+            await q.answer("محصول پیدا نشد.", show_alert=True)
+            return
+        new_price = max(0, int(product["price"] or 0) + delta)
+        conn.execute("UPDATE products SET price=%s WHERE id=%s", (new_price, pid))
+        conn.commit()
+        conn.close()
+        await q.answer(f"قیمت جدید: {new_price:,} تومان")
+        await admin_product_detail(q, pid)
+        return
+    if action == "price_set":
+        pid = int(parts[2])
+        context.user_data["admin_flow"] = {"type": "quick_price", "product_id": pid, "step": "price"}
+        await q.message.reply_text("💰 قیمت جدید را فقط به تومان و با عدد بفرست. برای لغو /cancel را بزن.")
+        return
     if action == "toggle_product":
         pid = int(parts[2])
         active = parts[3] == "activate"
@@ -2751,6 +2774,30 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg=f"✅ حساب جدید #{cur.fetchone()['id']} اضافه شد و فعلاً غیرفعال است. برای استفاده، آن را فعال کن."
             conn.commit(); conn.close(); context.user_data.pop("admin_flow",None)
             await update.message.reply_text(msg, reply_markup=admin_panel_keyboard()); return
+
+    if flow["type"] == "quick_price":
+        pid = flow["product_id"]
+        try:
+            raw = text.replace(",", "").replace("٬", "").replace(" ", "")
+            price = int(raw)
+            if price < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            await update.message.reply_text("❌ قیمت نامعتبر است. یک عدد صفر یا بزرگ‌تر به تومان بفرست.")
+            return
+        conn = get_conn()
+        exists = conn.execute("SELECT 1 FROM products WHERE id=%s", (pid,)).fetchone()
+        if not exists:
+            conn.close()
+            context.user_data.pop("admin_flow", None)
+            await update.message.reply_text("محصول پیدا نشد.")
+            return
+        conn.execute("UPDATE products SET price=%s WHERE id=%s", (price, pid))
+        conn.commit()
+        conn.close()
+        context.user_data.pop("admin_flow", None)
+        await update.message.reply_text(f"✅ قیمت محصول با موفقیت به {price:,} تومان تغییر کرد.", reply_markup=admin_panel_keyboard())
+        return
 
     if flow["type"] == "add_product":
         step = flow["step"]
