@@ -1767,34 +1767,44 @@ def product_text(p):
     )
 
 
-def admin_product_keyboard(product_id, active):
+def admin_product_keyboard(product_id, active, show_price_adjust=False):
     toggle = "غیرفعال کردن" if active else "فعال کردن"
     toggle_action = "deactivate" if active else "activate"
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("✏️ ویرایش اطلاعات", callback_data=f"adm:edit_product:{product_id}")],
-        [
-            InlineKeyboardButton("➖۵۰", callback_data=f"adm:price_adjust:{product_id}:-50000"),
-            InlineKeyboardButton("➕۵۰", callback_data=f"adm:price_adjust:{product_id}:50000"),
-            InlineKeyboardButton("➖۱۰۰", callback_data=f"adm:price_adjust:{product_id}:-100000"),
-            InlineKeyboardButton("➕۱۰۰", callback_data=f"adm:price_adjust:{product_id}:100000"),
-        ],
-        [
-            InlineKeyboardButton("➖۲۰۰", callback_data=f"adm:price_adjust:{product_id}:-200000"),
-            InlineKeyboardButton("➕۲۰۰", callback_data=f"adm:price_adjust:{product_id}:200000"),
-            InlineKeyboardButton("➖۳۰۰", callback_data=f"adm:price_adjust:{product_id}:-300000"),
-            InlineKeyboardButton("➕۳۰۰", callback_data=f"adm:price_adjust:{product_id}:300000"),
-        ],
-        [
-            InlineKeyboardButton("➖۴۰۰", callback_data=f"adm:price_adjust:{product_id}:-400000"),
-            InlineKeyboardButton("➕۴۰۰", callback_data=f"adm:price_adjust:{product_id}:400000"),
-            InlineKeyboardButton("➖۵۰۰", callback_data=f"adm:price_adjust:{product_id}:-500000"),
-            InlineKeyboardButton("➕۵۰۰", callback_data=f"adm:price_adjust:{product_id}:500000"),
-        ],
-        [InlineKeyboardButton("💰 ثبت قیمت دلخواه", callback_data=f"adm:price_set:{product_id}")],
+        [InlineKeyboardButton(
+            "💰 بستن ویرایش سریع قیمت" if show_price_adjust else "💰 ویرایش سریع قیمت",
+            callback_data=f"adm:price_quick_toggle:{product_id}:{0 if show_price_adjust else 1}"
+        )],
+    ]
+    if show_price_adjust:
+        rows.extend([
+            [
+                InlineKeyboardButton("➖۵۰", callback_data=f"adm:price_adjust:{product_id}:-50000"),
+                InlineKeyboardButton("➕۵۰", callback_data=f"adm:price_adjust:{product_id}:50000"),
+                InlineKeyboardButton("➖۱۰۰", callback_data=f"adm:price_adjust:{product_id}:-100000"),
+                InlineKeyboardButton("➕۱۰۰", callback_data=f"adm:price_adjust:{product_id}:100000"),
+            ],
+            [
+                InlineKeyboardButton("➖۲۰۰", callback_data=f"adm:price_adjust:{product_id}:-200000"),
+                InlineKeyboardButton("➕۲۰۰", callback_data=f"adm:price_adjust:{product_id}:200000"),
+                InlineKeyboardButton("➖۳۰۰", callback_data=f"adm:price_adjust:{product_id}:-300000"),
+                InlineKeyboardButton("➕۳۰۰", callback_data=f"adm:price_adjust:{product_id}:300000"),
+            ],
+            [
+                InlineKeyboardButton("➖۴۰۰", callback_data=f"adm:price_adjust:{product_id}:-400000"),
+                InlineKeyboardButton("➕۴۰۰", callback_data=f"adm:price_adjust:{product_id}:400000"),
+                InlineKeyboardButton("➖۵۰۰", callback_data=f"adm:price_adjust:{product_id}:-500000"),
+                InlineKeyboardButton("➕۵۰۰", callback_data=f"adm:price_adjust:{product_id}:500000"),
+            ],
+        ])
+    rows.extend([
+        [InlineKeyboardButton("💵 ثبت قیمت دلخواه", callback_data=f"adm:price_set:{product_id}")],
         [InlineKeyboardButton(f"⛔ {toggle}", callback_data=f"adm:toggle_product:{product_id}:{toggle_action}")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"adm:delete_product:{product_id}")],
         [InlineKeyboardButton("🔙 محصولات", callback_data="adm:products")],
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 def products_keyboard(rows):
@@ -2166,7 +2176,7 @@ async def admin_customer_detail(q, user_id):
     await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def admin_product_detail(q, product_id):
+async def admin_product_detail(q, product_id, show_price_adjust=False):
     conn = get_conn()
     p = conn.execute("SELECT * FROM products WHERE id=%s", (product_id,)).fetchone()
     conn.close()
@@ -2176,7 +2186,7 @@ async def admin_product_detail(q, product_id):
     await q.edit_message_text(
         product_text(p),
         parse_mode="HTML",
-        reply_markup=admin_product_keyboard(product_id, p["active"]),
+        reply_markup=admin_product_keyboard(product_id, p["active"], show_price_adjust),
     )
 
 
@@ -2536,6 +2546,11 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pid = int(parts[2])
         context.user_data["admin_flow"] = {"type": "edit_product", "product_id": pid, "step": "name"}
         await q.message.reply_text("✏️ نام جدید محصول را بفرست:")
+        return
+    if action == "price_quick_toggle":
+        pid, show = int(parts[2]), parts[3] == "1"
+        await q.answer()
+        await admin_product_detail(q, pid, show_price_adjust=show)
         return
     if action == "price_adjust":
         pid, delta = int(parts[2]), int(parts[3])
