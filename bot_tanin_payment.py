@@ -1416,7 +1416,7 @@ def support_center_keyboard():
         [InlineKeyboardButton("🎫 درخواست‌های من", callback_data="support:mine")],
         [InlineKeyboardButton("❓ سؤالات متداول", callback_data="support:faq")],
         [InlineKeyboardButton("💬 چت مستقیم با پشتیبانی", url="https://t.me/tanin_modir")],
-        [InlineKeyboardButton("📞 تماس با پشتیبانی", url="tel:+989384853486")],
+        [InlineKeyboardButton("📞 شماره تماس پشتیبانی", callback_data="support:phone")],
     ])
 
 
@@ -1541,6 +1541,9 @@ async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("💬 <b>مرکز پشتیبانی تنین ایران</b>\n\nیک گزینه را انتخاب کن:",parse_mode="HTML",reply_markup=support_center_keyboard()); return
     if action=="orders": await support_orders_view(q); return
     if action=="faq": await support_faq_view(q); return
+    if action=="phone":
+        await q.message.reply_text("📞 شماره تماس پشتیبانی:\n09384853486")
+        return
     if action=="mine": await support_mine_view(q); return
     if action=="new":
         context.user_data["support_flow"]={"type":"new","step":"topic"}
