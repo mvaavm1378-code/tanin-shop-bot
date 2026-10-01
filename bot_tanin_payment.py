@@ -1772,8 +1772,24 @@ def admin_product_keyboard(product_id, active):
     toggle_action = "deactivate" if active else "activate"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ ویرایش اطلاعات", callback_data=f"adm:edit_product:{product_id}")],
-        [InlineKeyboardButton("➖ ۱۰۰هزار", callback_data=f"adm:price_adjust:{product_id}:-100000"), InlineKeyboardButton("➕ ۱۰۰هزار", callback_data=f"adm:price_adjust:{product_id}:100000")],
-        [InlineKeyboardButton("➖ ۵۰۰هزار", callback_data=f"adm:price_adjust:{product_id}:-500000"), InlineKeyboardButton("➕ ۵۰۰هزار", callback_data=f"adm:price_adjust:{product_id}:500000")],
+        [
+            InlineKeyboardButton("➖۵۰", callback_data=f"adm:price_adjust:{product_id}:-50000"),
+            InlineKeyboardButton("➕۵۰", callback_data=f"adm:price_adjust:{product_id}:50000"),
+            InlineKeyboardButton("➖۱۰۰", callback_data=f"adm:price_adjust:{product_id}:-100000"),
+            InlineKeyboardButton("➕۱۰۰", callback_data=f"adm:price_adjust:{product_id}:100000"),
+        ],
+        [
+            InlineKeyboardButton("➖۲۰۰", callback_data=f"adm:price_adjust:{product_id}:-200000"),
+            InlineKeyboardButton("➕۲۰۰", callback_data=f"adm:price_adjust:{product_id}:200000"),
+            InlineKeyboardButton("➖۳۰۰", callback_data=f"adm:price_adjust:{product_id}:-300000"),
+            InlineKeyboardButton("➕۳۰۰", callback_data=f"adm:price_adjust:{product_id}:300000"),
+        ],
+        [
+            InlineKeyboardButton("➖۴۰۰", callback_data=f"adm:price_adjust:{product_id}:-400000"),
+            InlineKeyboardButton("➕۴۰۰", callback_data=f"adm:price_adjust:{product_id}:400000"),
+            InlineKeyboardButton("➖۵۰۰", callback_data=f"adm:price_adjust:{product_id}:-500000"),
+            InlineKeyboardButton("➕۵۰۰", callback_data=f"adm:price_adjust:{product_id}:500000"),
+        ],
         [InlineKeyboardButton("💰 ثبت قیمت دلخواه", callback_data=f"adm:price_set:{product_id}")],
         [InlineKeyboardButton(f"⛔ {toggle}", callback_data=f"adm:toggle_product:{product_id}:{toggle_action}")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"adm:delete_product:{product_id}")],
