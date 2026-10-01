@@ -273,13 +273,22 @@ def init_db():
 # کیبوردها
 # ----------------------------------------------------------------------------
 def main_menu_keyboard(user_id=None):
+    # منوی ادمین کاملاً جدا از منوی مشتری است.
+    if is_admin(user_id):
+        return ReplyKeyboardMarkup(
+            [
+                [KeyboardButton("⚙️ پنل مدیریت")],
+                [KeyboardButton("📦 سفارش‌ها"), KeyboardButton("💳 پرداخت‌های در انتظار")],
+                [KeyboardButton("🛠 مدیریت محصولات"), KeyboardButton("🎫 پشتیبانی")],
+            ],
+            resize_keyboard=True,
+        )
+
     rows = [
         [KeyboardButton("🧾 کاتالوگ محصولات")],
         [KeyboardButton("🛒 سبد خرید"), KeyboardButton("📦 سفارش‌های من")],
         [KeyboardButton("💬 مرکز پشتیبانی")],
     ]
-    if user_id in ADMIN_IDS:
-        rows.append([KeyboardButton("⚙️ پنل مدیریت")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
