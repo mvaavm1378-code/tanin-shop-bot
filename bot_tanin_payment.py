@@ -16,7 +16,9 @@ from psycopg.rows import dict_row
 import logging
 import json
 import re
+import random
 from html import escape
+import aiohttp
 from aiohttp import web
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -1614,6 +1616,7 @@ def admin_panel_keyboard():
         [InlineKeyboardButton("📊 فروش و آمار", callback_data="adm:sales")],
         [InlineKeyboardButton("👥 مشتری‌ها", callback_data="adm:customers")],
         [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="adm:tickets")],
+        [InlineKeyboardButton("📢 پست‌های کانال", callback_data="adm:channel")],
         [InlineKeyboardButton("💳 تنظیمات پرداخت", callback_data="adm:payment")],
         [InlineKeyboardButton("🔄 بروزرسانی", callback_data="adm:home")],
         [InlineKeyboardButton("🔙 بستن پنل", callback_data="adm:close")],
@@ -2279,6 +2282,55 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await context.bot.send_message(t['user_id'],f"🟢 تیکت پشتیبانی #{ticket_id} بسته شد. اگر دوباره نیاز به کمک داشتی، می‌تونی درخواست جدید ثبت کنی.")
             except Exception: pass
         await support_ticket_detail(q,ticket_id,True); return
+    if action == "channel":
+        await admin_channel_view(q)
+        return
+    if action == "chadd":
+        kind = parts[2] if len(parts) > 2 else "morning"
+        if kind not in CHANNEL_KINDS:
+            return
+        context.user_data["admin_flow"] = {"type": "channel_msg", "kind": kind}
+        await q.message.reply_text(
+            f"✍️ متن پیام {CHANNEL_KINDS[kind]} را بفرست.\n\n"
+            "برای افزودن چند پیام با هم، آن‌ها را با یک خط جداکننده بفرست:\n"
+            "---\n\n(حداکثر ۱۲۰۰ کاراکتر برای هر پیام)"
+        )
+        return
+    if action == "chlist":
+        kind = parts[2] if len(parts) > 2 else "morning"
+        page = int(parts[3]) if len(parts) > 3 else 0
+        await admin_channel_list(q, kind, page)
+        return
+    if action == "chdel":
+        kind, msg_id = parts[2], int(parts[3])
+        page = int(parts[4]) if len(parts) > 4 else 0
+        if kind in CHANNEL_KINDS:
+            conn = get_conn()
+            try:
+                conn.execute("DELETE FROM channel_messages WHERE id=%s AND kind=%s", (msg_id, kind))
+                conn.commit()
+            finally:
+                conn.close()
+        await admin_channel_list(q, kind, page)
+        return
+    if action == "chpost":
+        kind = parts[2] if len(parts) > 2 else "morning"
+        if kind not in CHANNEL_KINDS:
+            return
+        ok, info = await channel_post(context.bot, kind, force=True)
+        note = f"✅ پست {CHANNEL_KINDS[kind]} در کانال ارسال شد." if ok else f"❌ ارسال نشد: {info}"
+        await admin_channel_view(q, note)
+        return
+    if action == "chtest":
+        await admin_channel_selftest(q, context)
+        return
+    if action == "chclear":
+        removed = 0
+        for k in CHANNEL_KINDS:
+            if await channel_delete_stored(context.bot, f"channel_{k}_msg"):
+                removed += 1
+        await admin_channel_view(q, f"🧹 {removed} پست از کانال پاک شد.")
+        return
     if action == "payment":
         await admin_payment_view(q)
         return
@@ -2463,6 +2515,38 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id) or not flow:
         return
 
+    if flow["type"] == "channel_msg":
+        kind = flow.get("kind")
+        chunks = [c.strip() for c in re.split(r"\n\s*---+\s*\n", text) if c.strip()]
+        if kind not in CHANNEL_KINDS or not chunks or any(len(c) > 1200 for c in chunks):
+            await update.message.reply_text("❌ هر پیام باید حداکثر ۱۲۰۰ کاراکتر باشد. دوباره بفرست:")
+            return
+        now_txt = iran_now_naive().strftime("%Y-%m-%d %H:%M")
+        try:
+            conn = get_conn()
+            try:
+                for c in chunks:
+                    conn.execute(
+                        "INSERT INTO channel_messages(kind, text, active, created_at) VALUES(%s,%s,TRUE,%s)",
+                        (kind, c, now_txt),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning(f"Could not save channel messages: {e}")
+            context.user_data.pop("admin_flow", None)
+            await update.message.reply_text(
+                "❌ ذخیره نشد. احتمالاً جدول channel_messages هنوز در Supabase ساخته نشده است."
+            )
+            return
+        context.user_data.pop("admin_flow", None)
+        await update.message.reply_text(
+            f"✅ {len(chunks)} پیام {CHANNEL_KINDS[kind]} اضافه شد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 مدیریت کانال", callback_data="adm:channel")]]),
+        )
+        return
+
     if flow["type"] == "bank_account":
         step = flow["step"]
         prompts = {
@@ -2615,6 +2699,651 @@ async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ----------------------------------------------------------------------------
+# پست‌های زمان‌بندی‌شدهٔ کانال (صبح: صبح‌بخیر + آب‌وهوا | شب: شب‌بخیر)
+# ----------------------------------------------------------------------------
+# تنظیمات از طریق متغیرهای محیطی (Render > Environment):
+#   CHANNEL_ID              مثل @my_channel یا -1001234567890  (خالی = غیرفعال)
+#   CHANNEL_MORNING_TIME    پیش‌فرض 08:00 (به وقت تهران)
+#   CHANNEL_NIGHT_TIME      پیش‌فرض 22:00 (به وقت تهران)
+#   CHANNEL_GRACE_MINUTES   اگر ربات سر وقت بیدار نبود تا چند دقیقه بعد هنوز پست بگذارد (پیش‌فرض 180)
+_channel_raw = os.getenv("CHANNEL_ID", "").strip()
+CHANNEL_ID = int(_channel_raw) if _channel_raw.lstrip("-").isdigit() else _channel_raw
+CHANNEL_KINDS = {"morning": "صبح", "night": "شب"}
+
+
+def _parse_hhmm(name, default):
+    raw = os.getenv(name, default).strip()
+    try:
+        h, m = raw.split(":")
+        h, m = int(h), int(m)
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h * 60 + m
+    except Exception:
+        pass
+    logger.warning("%s=%r is invalid; using %s", name, raw, default)
+    h, m = default.split(":")
+    return int(h) * 60 + int(m)
+
+
+CHANNEL_MORNING_MIN = _parse_hhmm("CHANNEL_MORNING_TIME", "08:00")
+CHANNEL_NIGHT_MIN = _parse_hhmm("CHANNEL_NIGHT_TIME", "22:00")
+try:
+    CHANNEL_GRACE_MIN = max(0, int(os.getenv("CHANNEL_GRACE_MINUTES", "180")))
+except ValueError:
+    CHANNEL_GRACE_MIN = 180
+
+WEATHER_CITY = os.getenv("WEATHER_CITY_NAME", "مشهد").strip() or "مشهد"
+WEATHER_LAT = os.getenv("WEATHER_LAT", "36.2605").strip()
+WEATHER_LON = os.getenv("WEATHER_LON", "59.6168").strip()
+
+# اگر جدول channel_messages خالی باشد از این پیام‌های آماده استفاده می‌شود.
+CHANNEL_DEFAULTS = {
+    "morning": [
+        "امروز هم فرصتیه تازه؛ با یک قدم کوچک شروعش کن 🌱",
+        "هر صبح یک صفحهٔ سفید دست توئه؛ قشنگ‌ترین خط رو امروز بنویس ✨",
+        "لبخند اولین سرمایهٔ امروزته؛ خرجش کن، کم نمی‌شه 😊",
+        "کار بزرگ از یک شروع کوچیک ساخته می‌شه؛ امروز شروعش کن 💪",
+        "با یک فنجون چای و یک دل آروم، روز رو شروع کنیم ☕",
+        "امروز مهربون‌تر از دیروز باش؛ دنیا به مهربونی تو نیاز داره 💗",
+        "سختی‌های دیروز تموم شد؛ امروز نوبت خوبی‌هاست 🌸",
+        "هر روزی که با امید شروع بشه، نصف راهش رفته 🌤",
+        "برای ساختن یک روز خوب، فقط به یک نیت خوب نیاز داریم 🧵",
+        "کوچیک‌ترین قدم‌ها هم تو مسیر درست، آدم رو به مقصد می‌رسونن 🚶",
+        "امروز هر کاری کردی با عشق انجامش بده؛ نتیجه‌اش رو می‌بینی 🌷",
+        "روزت پر از اتفاق‌های خوب و دل‌خوش‌کننده باشه 🌞",
+    ],
+    "night": [
+        "شب بخیر؛ هرچی بود گذشت، به آرامش فردا فکر کن 🌙",
+        "چشم‌هات رو ببند و بابت همهٔ خوبی‌های امروز شکر کن ✨",
+        "شب آروم و خواب‌های خوش؛ فردا روز تازه‌ایه 🌌",
+        "ستاره‌ها بیدارن تا تو راحت بخوابی؛ شب بخیر ⭐",
+        "امشب خستگی روزت رو به شب بسپار و سبک بخواب 🌛",
+        "آسمون امشب برای آرزوهات بازه؛ آروم بخواب و فردا دنبالشون برو 💫",
+        "شبت آروم، دلت گرم و خوابت شیرین 💤",
+        "هر پایان یک شروعه؛ شب بخیر تا صبحی دوباره 🌠",
+        "امشب فقط به لحظه‌های قشنگ فکر کن و بخواب 🌙",
+        "شب بخیر؛ کنار هم بودن بهترین بخش هر روزه 🤍",
+        "ماه امشب هم مثل همیشه مراقب خوابته؛ شب بخیر 🌕",
+        "با دلی آروم بخواب؛ فردا هم کنارتیم 🧵",
+    ],
+}
+
+_WEEKDAYS_FA = {5: "شنبه", 6: "یکشنبه", 0: "دوشنبه", 1: "سه‌شنبه", 2: "چهارشنبه", 3: "پنج‌شنبه", 4: "جمعه"}
+_JALALI_MONTHS_FA = [
+    "فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور",
+    "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند",
+]
+_FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+# وضعیت داخل حافظه (برای اینکه هر ۳۰ ثانیه به دیتابیس کوئری نزنیم)
+_channel_done = {}
+_channel_fail = {}
+_channel_notified = {}
+_channel_lock = None
+
+
+def _fa(value):
+    return str(value).translate(_FA_DIGITS)
+
+
+def _get_channel_lock():
+    global _channel_lock
+    if _channel_lock is None:
+        _channel_lock = asyncio.Lock()
+    return _channel_lock
+
+
+def meta_get(key):
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT value FROM app_meta WHERE key=%s", (key,)).fetchone()
+        return row["value"] if row else None
+    finally:
+        conn.close()
+
+
+def meta_set(key, value):
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO app_meta(key,value) VALUES(%s,%s) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def meta_delete(key):
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM app_meta WHERE key=%s", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def channel_load_messages(kind):
+    """Active messages from DB as [(key, text)]; empty list if table is missing/empty."""
+    try:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, text FROM channel_messages WHERE kind=%s AND active=TRUE ORDER BY id",
+                (kind,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [(f"db:{r['id']}", r["text"]) for r in rows]
+    except Exception as e:
+        logger.warning(f"Could not load channel_messages ({kind}): {e}")
+        return []
+
+
+def channel_pick_message(kind):
+    """Random message that was not used recently."""
+    items = channel_load_messages(kind)
+    if not items:
+        items = [(f"d:{i}", t) for i, t in enumerate(CHANNEL_DEFAULTS[kind])]
+    recent_key = f"channel_recent_{kind}"
+    try:
+        recent = json.loads(meta_get(recent_key) or "[]")
+    except Exception:
+        recent = []
+    valid = {k for k, _ in items}
+    recent = [k for k in recent if k in valid]
+    keep = min(len(items) - 1, 30)
+    blocked = set(recent[-keep:]) if keep > 0 else set()
+    fresh = [it for it in items if it[0] not in blocked] or items
+    key, text = random.choice(fresh)
+    recent.append(key)
+    try:
+        meta_set(recent_key, json.dumps(recent[-30:]))
+    except Exception as e:
+        logger.warning(f"Could not store recent channel messages: {e}")
+    return text
+
+
+def _weather_desc(code):
+    if code == 0:
+        return "☀️", "آسمان صاف"
+    if code in (1, 2):
+        return "🌤", "کمی ابری"
+    if code == 3:
+        return "☁️", "ابری"
+    if code in (45, 48):
+        return "🌫", "مه‌آلود"
+    if code in (51, 53, 55, 56, 57):
+        return "🌦", "نم‌نم باران"
+    if code in (61, 63, 65, 66, 67):
+        return "🌧", "بارانی"
+    if code in (71, 73, 75, 77, 85, 86):
+        return "❄️", "برفی"
+    if code in (80, 81, 82):
+        return "🌧", "رگبار"
+    if code in (95, 96, 99):
+        return "⛈", "رعد و برق"
+    return "🌡", "نامشخص"
+
+
+def _parse_weather(data):
+    cur, daily = data["current"], data["daily"]
+    return {
+        "temp": cur["temperature_2m"],
+        "humidity": cur.get("relative_humidity_2m"),
+        "wind": cur.get("wind_speed_10m"),
+        "code": int(cur.get("weather_code", -1)),
+        "tmax": daily["temperature_2m_max"][0],
+        "tmin": daily["temperature_2m_min"][0],
+        "rain": (daily.get("precipitation_probability_max") or [None])[0],
+    }
+
+
+async def fetch_weather():
+    """Open-Meteo (free, no API key). Returns None on any failure."""
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={WEATHER_LAT}&longitude={WEATHER_LON}"
+        "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m"
+        "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        "&timezone=Asia%2FTehran&forecast_days=1"
+    )
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logger.warning("Weather API returned HTTP %s", resp.status)
+                    return None
+                return _parse_weather(await resp.json())
+    except Exception as e:
+        logger.warning(f"Weather fetch failed: {e}")
+        return None
+
+
+def _weather_block(w):
+    emoji, desc = _weather_desc(w["code"])
+    lines = [
+        f"{emoji} <b>آب‌وهوای {escape(WEATHER_CITY)}</b>",
+        f"{desc}",
+        f"🌡 دمای فعلی: {_fa(round(w['temp']))}°",
+        f"🔼 بیشینه {_fa(round(w['tmax']))}°  |  🔽 کمینه {_fa(round(w['tmin']))}°",
+    ]
+    if w.get("rain") is not None:
+        lines.append(f"☔ احتمال بارش: {_fa(round(w['rain']))}٪")
+    if w.get("humidity") is not None:
+        lines.append(f"💧 رطوبت: {_fa(round(w['humidity']))}٪")
+    if w.get("wind") is not None:
+        lines.append(f"🌬 باد: {_fa(round(w['wind']))} کیلومتر بر ساعت")
+    return "\n".join(lines)
+
+
+def channel_date_line(now):
+    jy, jm, jd = gregorian_to_jalali(now.year, now.month, now.day)
+    return _fa(f"{_WEEKDAYS_FA[now.weekday()]} {jd} {_JALALI_MONTHS_FA[jm - 1]} {jy}")
+
+
+async def channel_build_text(kind, now):
+    message = escape(channel_pick_message(kind))
+    if kind == "morning":
+        parts = ["☀️ <b>صبح بخیر!</b>", f"📅 {channel_date_line(now)}", "", message]
+        weather = await fetch_weather()
+        if weather:
+            parts += ["", _weather_block(weather)]
+        return "\n".join(parts)
+    return "\n".join(["🌙 <b>شب بخیر</b>", "", message])
+
+
+async def channel_delete_stored(bot, meta_key):
+    """Delete the stored channel post (if any). A post removed by hand is not an error."""
+    try:
+        mid = meta_get(meta_key)
+    except Exception as e:
+        logger.warning(f"Could not read {meta_key}: {e}")
+        return False
+    if not mid:
+        return False
+    deleted = True
+    try:
+        await bot.delete_message(CHANNEL_ID, int(mid))
+    except Exception as e:
+        deleted = False
+        logger.info(f"Channel post {mid} was not deleted (already removed?): {e}")
+    try:
+        meta_delete(meta_key)
+    except Exception as e:
+        logger.warning(f"Could not clear {meta_key}: {e}")
+    return deleted
+
+
+async def channel_post(bot, kind, force=False):
+    """Send the morning/night post. Returns (ok, info). Never raises."""
+    if not CHANNEL_ID:
+        return False, "CHANNEL_ID تنظیم نشده است."
+    async with _get_channel_lock():
+        now = datetime.now(IRAN_TZ)
+        today = now.strftime("%Y-%m-%d")
+        date_key = f"channel_{kind}_date"
+        try:
+            if not force:
+                if _channel_done.get(kind) == today:
+                    return True, "قبلاً ارسال شده"
+                if meta_get(date_key) == today:
+                    _channel_done[kind] = today
+                    return True, "قبلاً ارسال شده"
+
+            text = await channel_build_text(kind, now)
+            old_ids = {}
+            for k in CHANNEL_KINDS:
+                try:
+                    old_ids[k] = meta_get(f"channel_{k}_msg")
+                except Exception:
+                    old_ids[k] = None
+
+            msg = await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+
+            # پست جدید رفت؛ حالا پست‌های قبلی (همان نوع و نوع دیگر) پاک می‌شوند.
+            for k, mid in old_ids.items():
+                if not mid:
+                    continue
+                try:
+                    await bot.delete_message(CHANNEL_ID, int(mid))
+                except Exception as e:
+                    logger.info(f"Old channel post {mid} was not deleted: {e}")
+                if k != kind:
+                    try:
+                        meta_delete(f"channel_{k}_msg")
+                    except Exception:
+                        pass
+            meta_set(f"channel_{kind}_msg", msg.message_id)
+            meta_set(date_key, today)
+            _channel_done[kind] = today
+            return True, "ارسال شد"
+        except Exception as e:
+            logger.exception("Channel post (%s) failed: %s", kind, e)
+            return False, str(e)
+
+
+async def channel_tick(context: ContextTypes.DEFAULT_TYPE):
+    """Runs every 30s. Posts at the scheduled time, or shortly after if the bot was asleep."""
+    if not CHANNEL_ID:
+        return
+    now = datetime.now(IRAN_TZ)
+    today = now.strftime("%Y-%m-%d")
+    now_min = now.hour * 60 + now.minute
+    for kind, sched in (("morning", CHANNEL_MORNING_MIN), ("night", CHANNEL_NIGHT_MIN)):
+        if _channel_done.get(kind) == today:
+            continue
+        if not (sched <= now_min <= min(sched + CHANNEL_GRACE_MIN, 1439)):
+            continue
+        last_fail = _channel_fail.get(kind)
+        if last_fail and (now - last_fail).total_seconds() < 300:
+            continue
+        ok, info = await channel_post(context.bot, kind)
+        if ok:
+            _channel_fail.pop(kind, None)
+            continue
+        _channel_fail[kind] = now
+        if _channel_notified.get(kind) != today:
+            _channel_notified[kind] = today
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(
+                        admin_id,
+                        f"⚠️ ارسال پست {CHANNEL_KINDS[kind]} کانال ناموفق بود.\n{info}\n\n"
+                        "بررسی کن ربات در کانال ادمین باشد و دسترسی «ارسال پیام» و «حذف پیام» داشته باشد. "
+                        "هر ۵ دقیقه دوباره تلاش می‌شود.",
+                    )
+                except Exception:
+                    pass
+
+
+def setup_channel_jobs(app):
+    if not CHANNEL_ID:
+        logger.info("CHANNEL_ID is not set; channel auto-posting is disabled.")
+        return
+    if app.job_queue is None:
+        logger.warning(
+            "JobQueue is unavailable; channel auto-posting is disabled. "
+            "Use python-telegram-bot[job-queue] in requirements.txt."
+        )
+        return
+    app.job_queue.run_repeating(channel_tick, interval=30, first=10, name="channel_tick")
+    logger.info(
+        "Channel auto-posting enabled: morning %02d:%02d, night %02d:%02d (Asia/Tehran)",
+        CHANNEL_MORNING_MIN // 60, CHANNEL_MORNING_MIN % 60,
+        CHANNEL_NIGHT_MIN // 60, CHANNEL_NIGHT_MIN % 60,
+    )
+
+
+# ---- پنل ادمین: مدیریت پست‌های کانال ----
+SELFTEST_DELAY_SECONDS = 20
+
+
+async def channel_selftest_job(context: ContextTypes.DEFAULT_TYPE):
+    """Fired by JobQueue after the self-test button: proves the scheduler works and the bot can post + delete."""
+    data = context.job.data or {}
+    admin_id = data.get("admin_id")
+    started = data.get("started")
+    elapsed = None
+    if started is not None:
+        elapsed = round((datetime.now(IRAN_TZ) - started).total_seconds())
+    lines = ["🧪 <b>نتیجهٔ تست زندهٔ زمان‌بندی</b>", ""]
+    if elapsed is not None:
+        lines.append(f"✅ زمان‌بند job را اجرا کرد (حدود {_fa(elapsed)} ثانیه بعد از زدن دکمه).")
+    msg = None
+    try:
+        msg = await context.bot.send_message(
+            CHANNEL_ID, "🧪 پیام تست ربات؛ چند ثانیه دیگر پاک می‌شود.", disable_notification=True
+        )
+        lines.append("✅ ارسال پیام در کانال موفق بود.")
+    except Exception as e:
+        lines.append(f"❌ ارسال در کانال ناموفق بود: {escape(str(e))}")
+    if msg is not None:
+        await asyncio.sleep(5)
+        try:
+            await context.bot.delete_message(CHANNEL_ID, msg.message_id)
+            lines.append("✅ حذف پیام از کانال موفق بود.")
+        except Exception as e:
+            lines.append(f"❌ حذف پیام ناموفق بود (دسترسی «حذف پیام‌ها» را بررسی کن): {escape(str(e))}")
+    all_ok = all(l.startswith("✅") for l in lines[2:])
+    lines += ["", "🎉 همه‌چیز سالمه." if all_ok else "⚠️ مورد ❌ بالا را برطرف کن و دوباره تست بزن."]
+    if admin_id:
+        try:
+            await context.bot.send_message(admin_id, "\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Could not send self-test result to admin: {e}")
+
+
+async def admin_channel_selftest(q, context):
+    """Instant checks now + a live scheduled job a few seconds later."""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧪 تست دوباره", callback_data="adm:chtest")],
+        [InlineKeyboardButton("🔙 مدیریت کانال", callback_data="adm:channel")],
+    ])
+    if not CHANNEL_ID:
+        await _safe_edit_text(
+            q, "🧪 <b>تست مکانیزم</b>\n\n❌ متغیر محیطی <code>CHANNEL_ID</code> تنظیم نشده است.",
+            parse_mode="HTML", reply_markup=keyboard,
+        )
+        return
+    await _safe_edit_text(q, "⏳ در حال تست ...")
+
+    lines = ["🧪 <b>نتیجهٔ تست مکانیزم</b>", ""]
+    good = True
+
+    def add(ok, text):
+        nonlocal good
+        good = good and ok
+        lines.append(("✅ " if ok else "❌ ") + text)
+
+    add(True, f"کانال: <code>{escape(str(CHANNEL_ID))}</code>")
+
+    # 1) JobQueue
+    jq = context.job_queue
+    jobs = jq.get_jobs_by_name("channel_tick") if jq else []
+    if jobs:
+        add(True, "زمان‌بند (JobQueue) فعال است و کار اصلی کانال در حال اجراست.")
+    elif jq is None:
+        add(False, "زمان‌بند در دسترس نیست؛ در requirements بنویس <code>python-telegram-bot[job-queue]</code>.")
+    else:
+        add(False, "کار اصلی کانال ثبت نشده است (ری‌دیپلوی کن).")
+
+    # 2) database
+    try:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT kind, COUNT(*) AS n FROM channel_messages WHERE active=TRUE GROUP BY kind"
+            ).fetchall()
+        finally:
+            conn.close()
+        counts = {r["kind"]: r["n"] for r in rows}
+        add(True, f"دیتابیس: پیام صبح {_fa(counts.get('morning', 0))} | پیام شب {_fa(counts.get('night', 0))} "
+                  "(اگر صفر باشد از پیام‌های آماده استفاده می‌شود).")
+    except Exception:
+        add(False, "جدول <code>channel_messages</code> در Supabase ساخته نشده (فعلاً از پیام‌های آماده استفاده می‌شود).")
+
+    # 3) bot permissions in the channel
+    try:
+        me = await context.bot.get_chat_member(CHANNEL_ID, context.bot.id)
+        if me.status == "creator":
+            add(True, "ربات مالک کانال است.")
+        elif me.status == "administrator":
+            add(bool(getattr(me, "can_post_messages", False)), "دسترسی «ارسال پیام» ربات در کانال.")
+            add(bool(getattr(me, "can_delete_messages", False)), "دسترسی «حذف پیام‌ها» ربات در کانال.")
+        else:
+            add(False, f"ربات ادمین کانال نیست (وضعیت: {escape(str(me.status))}).")
+    except Exception as e:
+        add(False, f"دسترسی به کانال ممکن نیست: {escape(str(e))}")
+
+    # 4) weather
+    weather = await fetch_weather()
+    if weather:
+        add(True, f"آب‌وهوای {escape(WEATHER_CITY)}: {_fa(round(weather['temp']))}° — {_weather_desc(weather['code'])[1]}")
+    else:
+        add(False, "دریافت آب‌وهوا ناموفق بود (پست صبح بدون آب‌وهوا ارسال می‌شود).")
+
+    # 5) what the scheduler would do right now
+    now = datetime.now(IRAN_TZ)
+    today = now.strftime("%Y-%m-%d")
+    now_min = now.hour * 60 + now.minute
+    lines += ["", f"🕐 ساعت تهران: {_fa(now.strftime('%H:%M'))}"]
+    for kind, sched in (("morning", CHANNEL_MORNING_MIN), ("night", CHANNEL_NIGHT_MIN)):
+        try:
+            done = _channel_done.get(kind) == today or meta_get(f"channel_{kind}_date") == today
+        except Exception:
+            done = False
+        hhmm = _fa(f"{sched // 60:02d}:{sched % 60:02d}")
+        if done:
+            state = "امروز ارسال شده ✔️"
+        elif now_min < sched:
+            state = f"در انتظار ساعت {hhmm} ({_fa(sched - now_min)} دقیقه دیگر)"
+        elif now_min <= min(sched + CHANNEL_GRACE_MIN, 1439):
+            state = f"ساعتش رسیده؛ در تیک بعدی (حداکثر ۳۰ ثانیه) ارسال می‌شود"
+        else:
+            state = "امروز از بازهٔ مجاز گذشته؛ فردا ارسال می‌شود"
+        lines.append(f"{'☀️' if kind == 'morning' else '🌙'} پست {CHANNEL_KINDS[kind]}: {state}")
+
+    # 6) live scheduler test
+    if jq is not None:
+        jq.run_once(
+            channel_selftest_job, when=SELFTEST_DELAY_SECONDS,
+            data={"admin_id": q.from_user.id, "started": now}, name="channel_selftest",
+        )
+        lines += ["", f"⏱ تست زندهٔ زمان‌بند: تا {_fa(SELFTEST_DELAY_SECONDS)} ثانیه دیگر یک پیام تست در کانال "
+                      "ارسال و چند ثانیه بعد پاک می‌شود و نتیجه همین‌جا برایت می‌آید."]
+    lines += ["", "🎉 تست‌های فوری سالم‌اند." if good else "⚠️ مورد ❌ بالا را برطرف کن و دوباره تست بزن."]
+    await _safe_edit_text(q, "\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+
+
+def channel_admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧪 تست مکانیزم", callback_data="adm:chtest")],
+        [InlineKeyboardButton("➕ پیام صبح", callback_data="adm:chadd:morning"),
+         InlineKeyboardButton("➕ پیام شب", callback_data="adm:chadd:night")],
+        [InlineKeyboardButton("📋 لیست صبح", callback_data="adm:chlist:morning:0"),
+         InlineKeyboardButton("📋 لیست شب", callback_data="adm:chlist:night:0")],
+        [InlineKeyboardButton("📤 ارسال پست صبح همین الان", callback_data="adm:chpost:morning")],
+        [InlineKeyboardButton("📤 ارسال پست شب همین الان", callback_data="adm:chpost:night")],
+        [InlineKeyboardButton("🧹 پاک‌کردن پست‌های فعلی کانال", callback_data="adm:chclear")],
+        [InlineKeyboardButton("🔄 بروزرسانی", callback_data="adm:channel")],
+        [InlineKeyboardButton("🔙 پنل اصلی", callback_data="adm:home")],
+    ])
+
+
+async def _safe_edit_text(q, text, **kwargs):
+    try:
+        await q.edit_message_text(text, **kwargs)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def admin_channel_view(q, note=""):
+    if not CHANNEL_ID:
+        await _safe_edit_text(
+            q,
+            "📢 <b>پست‌های کانال</b>\n\nمتغیر محیطی <code>CHANNEL_ID</code> تنظیم نشده است، "
+            "پس ارسال خودکار غیرفعال است.",
+            parse_mode="HTML", reply_markup=back_keyboard("home"),
+        )
+        return
+    counts = {}
+    table_ok = True
+    try:
+        conn = get_conn()
+        try:
+            for r in conn.execute(
+                "SELECT kind, COUNT(*) AS n FROM channel_messages WHERE active=TRUE GROUP BY kind"
+            ).fetchall():
+                counts[r["kind"]] = r["n"]
+        finally:
+            conn.close()
+    except Exception:
+        table_ok = False
+
+    def last_post(kind):
+        try:
+            d = meta_get(f"channel_{kind}_date")
+        except Exception:
+            d = None
+        return format_iran_jalali_fa(d, include_time=False) if d else "—"
+
+    def t(minutes):
+        return _fa(f"{minutes // 60:02d}:{minutes % 60:02d}")
+
+    lines = []
+    if note:
+        lines += [escape(note), ""]
+    lines += [
+        "📢 <b>پست‌های کانال</b>",
+        "",
+        f"🎯 کانال: <code>{escape(str(CHANNEL_ID))}</code>",
+        f"☀️ پست صبح: ساعت {t(CHANNEL_MORNING_MIN)} — آخرین ارسال: {last_post('morning')}",
+        f"🌙 پست شب: ساعت {t(CHANNEL_NIGHT_MIN)} — آخرین ارسال: {last_post('night')}",
+        "",
+    ]
+    if table_ok:
+        lines.append(
+            f"📝 پیام‌های ثبت‌شده: صبح {_fa(counts.get('morning', 0))} | شب {_fa(counts.get('night', 0))}"
+        )
+        if not counts.get("morning") or not counts.get("night"):
+            lines.append("ℹ️ برای هر دسته‌ای که پیامی ثبت نکنی، از پیام‌های آمادهٔ داخل ربات استفاده می‌شود.")
+    else:
+        lines.append("⚠️ جدول <code>channel_messages</code> در Supabase ساخته نشده؛ فعلاً از پیام‌های آماده استفاده می‌شود.")
+    await _safe_edit_text(q, "\n".join(lines), parse_mode="HTML", reply_markup=channel_admin_keyboard())
+
+
+async def admin_channel_list(q, kind, page=0):
+    if kind not in CHANNEL_KINDS:
+        return
+    per_page = 8
+    page = max(0, page)
+    try:
+        conn = get_conn()
+        try:
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM channel_messages WHERE kind=%s", (kind,)
+            ).fetchone()["n"]
+            rows = conn.execute(
+                "SELECT id, text FROM channel_messages WHERE kind=%s ORDER BY id DESC LIMIT %s OFFSET %s",
+                (kind, per_page, page * per_page),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        await _safe_edit_text(q, "❌ جدول channel_messages در دسترس نیست.", reply_markup=back_keyboard("channel"))
+        return
+    if not rows and page > 0:
+        await admin_channel_list(q, kind, page - 1)
+        return
+    if not rows:
+        await _safe_edit_text(
+            q, f"📋 هنوز پیام {CHANNEL_KINDS[kind]} ثبت نشده است.\n(از پیام‌های آماده استفاده می‌شود.)",
+            reply_markup=back_keyboard("channel"),
+        )
+        return
+    lines = [f"📋 <b>پیام‌های {CHANNEL_KINDS[kind]}</b> ({_fa(total)} مورد)", ""]
+    buttons = []
+    for r in rows:
+        preview = " ".join(str(r["text"]).split())
+        lines.append(f"#{r['id']}: {escape(preview[:90])}")
+        buttons.append([InlineKeyboardButton(
+            f"🗑 #{r['id']} | {preview[:24]}", callback_data=f"adm:chdel:{kind}:{r['id']}:{page}"
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"adm:chlist:{kind}:{page - 1}"))
+    if (page + 1) * per_page < total:
+        nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"adm:chlist:{kind}:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🔙 مدیریت کانال", callback_data="adm:channel")])
+    await _safe_edit_text(q, "\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+# ----------------------------------------------------------------------------
 # راه‌اندازی ربات
 # ----------------------------------------------------------------------------
 async def async_main():
@@ -2682,6 +3411,7 @@ async def async_main():
     )
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_input))
+    setup_channel_jobs(app)
 
     hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
     if not hostname:
