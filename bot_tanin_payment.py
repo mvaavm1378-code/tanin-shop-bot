@@ -578,7 +578,7 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"👕 <b>{escape(p['name'])}</b>\n"
             f"سایز: {escape(p['size'] or '-') }\n"
-            f"رنگ‌بندی طبق ژورنال موجود\n"
+            f"رنگ‌بندی: {escape(p.get('color') or '-')}\n"
             + (f"{escape(p['pack_info'])}\n" if p['pack_info'] else "")
             + f"قیمت: {p['price']:,} تومان"
         )
@@ -1760,46 +1760,39 @@ def product_text(p):
         f"شناسه: #{p['id']}\n"
         f"دسته: {escape(p['category'])}\n"
         f"سایز: {escape(p['size'] or '-')}\n"
-        "رنگ‌بندی طبق ژورنال موجود\n"
+        f"رنگ‌بندی: {escape(p.get('color') or '-')}\n"
         f"{pack}"
         f"قیمت: {p['price']:,} تومان\n"
         f"وضعیت: {state}"
     )
 
 
-def admin_product_keyboard(product_id, active, show_price_adjust=False):
+def admin_product_keyboard(product_id, active, show_quick_edit=False, show_price_adjust=False):
     toggle = "غیرفعال کردن" if active else "فعال کردن"
     toggle_action = "deactivate" if active else "activate"
-    rows = [
-        [InlineKeyboardButton("✏️ ویرایش اطلاعات", callback_data=f"adm:edit_product:{product_id}")],
-        [InlineKeyboardButton(
-            "💰 بستن ویرایش سریع قیمت" if show_price_adjust else "💰 ویرایش سریع قیمت",
-            callback_data=f"adm:price_quick_toggle:{product_id}:{0 if show_price_adjust else 1}"
-        )],
-    ]
-    if show_price_adjust:
+    rows = [[InlineKeyboardButton(
+        "⚡ بستن ویرایش سریع" if show_quick_edit else "⚡ ویرایش سریع",
+        callback_data=f"adm:quick_toggle:{product_id}:{0 if show_quick_edit else 1}"
+    )]]
+    if show_quick_edit:
         rows.extend([
-            [
-                InlineKeyboardButton("➖۵۰", callback_data=f"adm:price_adjust:{product_id}:-50000"),
-                InlineKeyboardButton("➕۵۰", callback_data=f"adm:price_adjust:{product_id}:50000"),
-                InlineKeyboardButton("➖۱۰۰", callback_data=f"adm:price_adjust:{product_id}:-100000"),
-                InlineKeyboardButton("➕۱۰۰", callback_data=f"adm:price_adjust:{product_id}:100000"),
-            ],
-            [
-                InlineKeyboardButton("➖۲۰۰", callback_data=f"adm:price_adjust:{product_id}:-200000"),
-                InlineKeyboardButton("➕۲۰۰", callback_data=f"adm:price_adjust:{product_id}:200000"),
-                InlineKeyboardButton("➖۳۰۰", callback_data=f"adm:price_adjust:{product_id}:-300000"),
-                InlineKeyboardButton("➕۳۰۰", callback_data=f"adm:price_adjust:{product_id}:300000"),
-            ],
-            [
-                InlineKeyboardButton("➖۴۰۰", callback_data=f"adm:price_adjust:{product_id}:-400000"),
-                InlineKeyboardButton("➕۴۰۰", callback_data=f"adm:price_adjust:{product_id}:400000"),
-                InlineKeyboardButton("➖۵۰۰", callback_data=f"adm:price_adjust:{product_id}:-500000"),
-                InlineKeyboardButton("➕۵۰۰", callback_data=f"adm:price_adjust:{product_id}:500000"),
-            ],
+            [InlineKeyboardButton("📝 ویرایش سریع نام", callback_data=f"adm:quick_field:{product_id}:name")],
+            [InlineKeyboardButton("📏 ویرایش سریع سایز", callback_data=f"adm:quick_field:{product_id}:size")],
+            [InlineKeyboardButton("🎨 ویرایش سریع رنگ‌بندی", callback_data=f"adm:quick_field:{product_id}:color")],
+            [InlineKeyboardButton("📦 ویرایش سریع پک", callback_data=f"adm:quick_field:{product_id}:pack_info")],
+            [InlineKeyboardButton(
+                "💰 بستن گزینه‌های قیمت" if show_price_adjust else "💰 ویرایش سریع قیمت",
+                callback_data=f"adm:price_quick_toggle:{product_id}:{0 if show_price_adjust else 1}"
+            )],
         ])
+        if show_price_adjust:
+            rows.extend([
+                [InlineKeyboardButton("➖۵۰", callback_data=f"adm:price_adjust:{product_id}:-50000"), InlineKeyboardButton("➕۵۰", callback_data=f"adm:price_adjust:{product_id}:50000"), InlineKeyboardButton("➖۱۰۰", callback_data=f"adm:price_adjust:{product_id}:-100000"), InlineKeyboardButton("➕۱۰۰", callback_data=f"adm:price_adjust:{product_id}:100000")],
+                [InlineKeyboardButton("➖۲۰۰", callback_data=f"adm:price_adjust:{product_id}:-200000"), InlineKeyboardButton("➕۲۰۰", callback_data=f"adm:price_adjust:{product_id}:200000"), InlineKeyboardButton("➖۳۰۰", callback_data=f"adm:price_adjust:{product_id}:-300000"), InlineKeyboardButton("➕۳۰۰", callback_data=f"adm:price_adjust:{product_id}:300000")],
+                [InlineKeyboardButton("➖۴۰۰", callback_data=f"adm:price_adjust:{product_id}:-400000"), InlineKeyboardButton("➕۴۰۰", callback_data=f"adm:price_adjust:{product_id}:400000"), InlineKeyboardButton("➖۵۰۰", callback_data=f"adm:price_adjust:{product_id}:-500000"), InlineKeyboardButton("➕۵۰۰", callback_data=f"adm:price_adjust:{product_id}:500000")],
+            ])
+        rows.append([InlineKeyboardButton("💵 ثبت قیمت دلخواه", callback_data=f"adm:price_set:{product_id}")])
     rows.extend([
-        [InlineKeyboardButton("💵 ثبت قیمت دلخواه", callback_data=f"adm:price_set:{product_id}")],
         [InlineKeyboardButton(f"⛔ {toggle}", callback_data=f"adm:toggle_product:{product_id}:{toggle_action}")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"adm:delete_product:{product_id}")],
         [InlineKeyboardButton("🔙 محصولات", callback_data="adm:products")],
@@ -2176,7 +2169,7 @@ async def admin_customer_detail(q, user_id):
     await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def admin_product_detail(q, product_id, show_price_adjust=False):
+async def admin_product_detail(q, product_id, show_price_adjust=False, show_quick_edit=False):
     conn = get_conn()
     p = conn.execute("SELECT * FROM products WHERE id=%s", (product_id,)).fetchone()
     conn.close()
@@ -2186,7 +2179,7 @@ async def admin_product_detail(q, product_id, show_price_adjust=False):
     await q.edit_message_text(
         product_text(p),
         parse_mode="HTML",
-        reply_markup=admin_product_keyboard(product_id, p["active"], show_price_adjust),
+        reply_markup=admin_product_keyboard(product_id, p["active"], show_quick_edit, show_price_adjust),
     )
 
 
@@ -2547,10 +2540,24 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["admin_flow"] = {"type": "edit_product", "product_id": pid, "step": "name"}
         await q.message.reply_text("✏️ نام جدید محصول را بفرست:")
         return
+    if action == "quick_toggle":
+        pid, show = int(parts[2]), parts[3] == "1"
+        await q.answer()
+        await admin_product_detail(q, pid, show_quick_edit=show)
+        return
+    if action == "quick_field":
+        pid, field = int(parts[2]), parts[3]
+        prompts = {"name": "نام جدید محصول را بفرست:", "size": "سایز جدید را بفرست:", "color": "رنگ‌بندی جدید را بفرست:", "pack_info": "اطلاعات پک جدید را بفرست؛ برای حذف پک «ندارد» را بفرست:"}
+        if field not in prompts:
+            await q.answer("گزینه نامعتبر است.", show_alert=True); return
+        context.user_data["admin_flow"] = {"type": "quick_product_field", "product_id": pid, "field": field}
+        await q.answer()
+        await q.message.reply_text("✏️ " + prompts[field] + " برای لغو /cancel را بزن:")
+        return
     if action == "price_quick_toggle":
         pid, show = int(parts[2]), parts[3] == "1"
         await q.answer()
-        await admin_product_detail(q, pid, show_price_adjust=show)
+        await admin_product_detail(q, pid, show_price_adjust=show, show_quick_edit=True)
         return
     if action == "price_adjust":
         pid, delta = int(parts[2]), int(parts[3])
@@ -2851,6 +2858,46 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (flow["name"],flow["category"],flow["size"],"رنگ‌بندی طبق ژورنال موجود",flow["price"],photo_url,flow["pack_info"]))
             pid=cur.fetchone()["id"]; conn.commit(); conn.close(); context.user_data.pop("admin_flow",None)
             await update.message.reply_text(f"✅ محصول «{flow['name']}» اضافه شد.\nشناسه: #{pid}", reply_markup=admin_panel_keyboard())
+        return
+
+    if flow["type"] == "quick_product_field":
+        pid, field = flow["product_id"], flow["field"]
+        value = text.strip()
+        if field == "name" and not value:
+            await update.message.reply_text("❌ نام نمی‌تواند خالی باشد. دوباره بفرست:"); return
+        if field == "pack_info" and value.lower() in ("ندارد", "ندارم", "-", "no"):
+            value = ""
+        column = {"name": "name", "size": "size", "color": "color", "pack_info": "pack_info"}.get(field)
+        if not column:
+            context.user_data.pop("admin_flow", None); return
+        conn = get_conn()
+        exists = conn.execute("SELECT 1 FROM products WHERE id=%s", (pid,)).fetchone()
+        if not exists:
+            conn.close(); context.user_data.pop("admin_flow", None)
+            await update.message.reply_text("محصول پیدا نشد."); return
+        conn.execute(f"UPDATE products SET {column}=%s WHERE id=%s", (value, pid))
+        conn.commit(); conn.close(); context.user_data.pop("admin_flow", None)
+        await update.message.reply_text("✅ اطلاعات محصول با موفقیت تغییر کرد.")
+        return
+
+    if flow["type"] == "quick_name":
+        pid = flow["product_id"]
+        name = text.strip()
+        if not name:
+            await update.message.reply_text("❌ نام نمی‌تواند خالی باشد. نام جدید را بفرست:")
+            return
+        conn = get_conn()
+        product = conn.execute("SELECT id FROM products WHERE id=%s", (pid,)).fetchone()
+        if not product:
+            conn.close()
+            context.user_data.pop("admin_flow", None)
+            await update.message.reply_text("محصول پیدا نشد.")
+            return
+        conn.execute("UPDATE products SET name=%s WHERE id=%s", (name, pid))
+        conn.commit()
+        conn.close()
+        context.user_data.pop("admin_flow", None)
+        await update.message.reply_text(f"✅ نام محصول با موفقیت به «{name}» تغییر کرد.")
         return
 
     if flow["type"] == "edit_product":
