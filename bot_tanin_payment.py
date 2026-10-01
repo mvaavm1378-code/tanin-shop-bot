@@ -1536,12 +1536,15 @@ async def admin_pending_payments_view(q):
 
     buttons.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="adm:pending_payments")])
     buttons.append([InlineKeyboardButton("🔙 پنل اصلی", callback_data="adm:home")])
-    await q.edit_message_text(
+    text = (
         "🟡 <b>پرداخت‌های در انتظار تأیید</b>\n\n"
-        "روی هر مورد بزنید تا جزئیات و رسید پرداخت نمایش داده شود.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        "روی هر مورد بزنید تا جزئیات و رسید پرداخت نمایش داده شود."
     )
+    markup = InlineKeyboardMarkup(buttons)
+    if q.message and q.message.photo:
+        await q.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def admin_pending_payment_detail(q, pending_id):
@@ -1790,6 +1793,7 @@ async def admin_customer_detail(q, user_id):
                 callback_data=f"order:view:{o['id']}"
             )
         ])
+    buttons.append([InlineKeyboardButton(str(c["user_id"]), url=f"tg://user?id={c['user_id']}")])
     buttons.append([InlineKeyboardButton("🔙 مشتری‌ها", callback_data="adm:customers")])
     await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -1952,7 +1956,11 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
         conn.execute("UPDATE pending_payments SET payment_status='رد شد', reviewed_at=%s, admin_id=%s WHERE id=%s", (now, q.from_user.id, pid))
         conn.commit(); conn.close()
         await q.answer("پرداخت رد شد.")
-        await q.edit_message_caption(caption=(q.message.caption or "") + "\n\n❌ <b>پرداخت رد شد</b>", parse_mode="HTML", reply_markup=None)
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await admin_pending_payments_view(q)
         try: await context.bot.send_message(pending['user_id'], "❌ رسید پرداخت شما تأیید نشد. سفارش ثبت نشد. لطفاً با پشتیبانی تماس بگیرید.")
         except Exception: pass
         return
