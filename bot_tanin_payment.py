@@ -304,7 +304,7 @@ def add_quantity_keyboard(product_id, qty=1):
                 InlineKeyboardButton("➕", callback_data=f"addqty:plus:{product_id}:{qty}"),
             ],
             [InlineKeyboardButton("✅ افزودن به سبد خرید", callback_data=f"addqty:confirm:{product_id}:{qty}")],
-            [InlineKeyboardButton("🔙 انصراف", callback_data=f"addqty:cancel:{product_id}:{qty}")],
+            [InlineKeyboardButton("🔙 مرحله قبلی", callback_data=f"addqty:cancel:{product_id}:{qty}")],
         ]
     )
 
@@ -326,6 +326,7 @@ def checkout_quantity_keyboard(rows):
         ])
     buttons.append([InlineKeyboardButton("🗑 حذف یک محصول", callback_data="qty:delete_menu")])
     buttons.append([InlineKeyboardButton("✅ ادامه ثبت سفارش", callback_data="qty:continue")])
+    buttons.append([InlineKeyboardButton("🔙 مرحله قبلی", callback_data="qty:back_cart")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -366,6 +367,10 @@ async def checkout_quantity_callback(update: Update, context: ContextTypes.DEFAU
     parts = q.data.split(":")
     action = parts[1]
     user_id = q.from_user.id
+
+    if action == "back_cart":
+        await q.message.reply_text("🔙 به سبد خرید برگشتی.", reply_markup=main_menu_keyboard(user_id))
+        return ConversationHandler.END
 
     if action == "continue":
         if await show_saved_step(q.message, context, "name"):
@@ -779,6 +784,7 @@ def saved_data_keyboard(data_type, rows):
             InlineKeyboardButton("🗑", callback_data=f"saved:{data_type}:delete:{row['id']}"),
         ])
     buttons.append([InlineKeyboardButton(f"➕ {labels[data_type]} جدید", callback_data=f"saved:{data_type}:new")])
+    buttons.append([InlineKeyboardButton("🔙 مرحله قبلی", callback_data=f"saved:{data_type}:back")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -811,10 +817,19 @@ def normalize_persian_full_name(value):
     return text
 
 
+def name_input_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("🔙 مرحله قبلی")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 def name_confirm_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ بله، درست است", callback_data="nameconfirm:yes")],
         [InlineKeyboardButton("✏️ ویرایش", callback_data="nameconfirm:edit")],
+        [InlineKeyboardButton("🔙 مرحله قبلی", callback_data="nameconfirm:back")],
     ])
 
 
@@ -822,6 +837,11 @@ async def handle_name_confirmation(update: Update, context: ContextTypes.DEFAULT
     q = update.callback_query
     await q.answer()
     action = q.data.split(":", 1)[1]
+    if action == "back":
+        context.user_data.pop("pending_full_name", None)
+        context.user_data.pop("editing_saved_name_id", None)
+        await show_checkout_quantities(q.message, q.from_user.id)
+        return ASK_QTY
     if action == "edit":
         context.user_data.pop("pending_full_name", None)
         await q.message.reply_text("✏️ لطفاً نام و نام خانوادگی را دوباره وارد کن:\nمثال: محمد احمدی")
@@ -885,7 +905,10 @@ def normalize_iran_phone(value):
 
 def phone_keyboard():
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("📱 ارسال شماره موبایل", request_contact=True)]],
+        [
+            [KeyboardButton("📱 ارسال شماره موبایل", request_contact=True)],
+            [KeyboardButton("🔙 مرحله قبلی")],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -893,7 +916,10 @@ def phone_keyboard():
 
 def gender_keyboard():
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("👨 مرد"), KeyboardButton("👩 زن")]],
+        [
+            [KeyboardButton("👨 مرد"), KeyboardButton("👩 زن")],
+            [KeyboardButton("🔙 مرحله قبلی")],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -901,12 +927,18 @@ def gender_keyboard():
 
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_name = update.message.text or ""
+    if raw_name.strip() == "🔙 مرحله قبلی":
+        context.user_data.pop("pending_full_name", None)
+        context.user_data.pop("editing_saved_name_id", None)
+        await show_checkout_quantities(update.message, update.effective_user.id)
+        return ASK_QTY
     full_name = normalize_persian_full_name(raw_name)
     if not full_name:
         await update.message.reply_text(
             "❌ نام و نام خانوادگی را درست وارد کن.\n\n"
             "نام باید حداقل دو بخش داشته باشد و فقط شامل حروف فارسی باشد.\n"
-            "مثال: محمد احمدی"
+            "مثال: محمد احمدی",
+            reply_markup=name_input_keyboard(),
         )
         return ASK_NAME
 
@@ -926,6 +958,9 @@ async def handle_saved_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = q.data.split(":")
     action = parts[2]
     user_id = q.from_user.id
+    if action == "back":
+        await show_checkout_quantities(q.message, user_id)
+        return ASK_QTY
     if action == "use":
         row = next((r for r in get_saved_data(user_id, "name") if r["id"] == int(parts[3])), None)
         if row:
@@ -953,6 +988,9 @@ async def handle_saved_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.contact and (update.message.text or "").strip() == "🔙 مرحله قبلی":
+        await show_saved_step(update.message, context, "name")
+        return ASK_NAME
     if not update.message.contact:
         await update.message.reply_text(
             "❌ لطفاً شماره را فقط با دکمه «📱 ارسال شماره موبایل» بفرست.",
@@ -992,6 +1030,9 @@ async def handle_saved_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
     parts = q.data.split(":")
     action = parts[2]
     user_id = q.from_user.id
+    if action == "back":
+        await show_saved_step(q.message, context, "name")
+        return ASK_NAME
     if action == "use":
         row = next((r for r in get_saved_data(user_id, "phone") if r["id"] == int(parts[3])), None)
         if row:
@@ -1018,6 +1059,9 @@ async def handle_saved_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gender_text = (update.message.text or "").strip()
+    if gender_text == "🔙 مرحله قبلی":
+        await show_saved_step(update.message, context, "phone")
+        return ASK_PHONE
     gender_map = {"👨 مرد": "مرد", "👩 زن": "زن"}
     gender = gender_map.get(gender_text)
     if not gender:
@@ -1030,8 +1074,16 @@ async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["gender"] = gender
     if await show_saved_step(update.message, context, "address"):
         return ASK_ADDRESS
-    await update.message.reply_text("آدرس کامل برای ارسال رو بفرست:", reply_markup=None)
+    await update.message.reply_text("آدرس کامل برای ارسال رو بفرست:", reply_markup=address_input_keyboard())
     return ASK_ADDRESS
+
+
+def address_input_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("🔙 مرحله قبلی")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 async def handle_saved_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1040,17 +1092,20 @@ async def handle_saved_address(update: Update, context: ContextTypes.DEFAULT_TYP
     parts = q.data.split(":")
     action = parts[2]
     user_id = q.from_user.id
+    if action == "back":
+        await show_saved_step(q.message, context, "phone")
+        return ASK_PHONE
     if action == "use":
         row = next((r for r in get_saved_data(user_id, "address") if r["id"] == int(parts[3])), None)
         if row:
             context.user_data["address"] = row["value"]
             return await finalize_order_from_callback(q.message, context, q.from_user)
     elif action == "new":
-        await q.message.reply_text("آدرس جدید را بفرست:")
+        await q.message.reply_text("آدرس جدید را بفرست:", reply_markup=address_input_keyboard())
         return ASK_ADDRESS
     elif action == "edit":
         context.user_data["editing_saved_address_id"] = parts[3]
-        await q.message.reply_text("آدرس جدید را بفرست:")
+        await q.message.reply_text("آدرس جدید را بفرست:", reply_markup=address_input_keyboard())
         return ASK_ADDRESS
     elif action == "delete":
         delete_saved_data(user_id, int(parts[3]), "address")
@@ -1058,7 +1113,7 @@ async def handle_saved_address(update: Update, context: ContextTypes.DEFAULT_TYP
         if rows:
             await q.message.reply_text("آدرس حذف شد. یک آدرس را انتخاب کن یا آدرس جدید اضافه کن:", reply_markup=saved_data_keyboard("address", rows))
         else:
-            await q.message.reply_text("آدرس حذف شد. آدرس کامل برای ارسال را بفرست:")
+            await q.message.reply_text("آدرس حذف شد. آدرس کامل برای ارسال را بفرست:", reply_markup=address_input_keyboard())
         return ASK_ADDRESS
     return ASK_ADDRESS
 
@@ -1068,6 +1123,9 @@ async def finalize_order_from_callback(message, context, user=None):
 
 
 async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if (update.message.text or "").strip() == "🔙 مرحله قبلی":
+        await show_saved_step(update.message, context, "phone")
+        return ASK_PHONE
     user_id = update.effective_user.id
     address = update.message.text.strip()
     edit_id = context.user_data.pop("editing_saved_address_id", None)
