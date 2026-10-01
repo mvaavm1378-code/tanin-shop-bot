@@ -1608,75 +1608,19 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 
-async def admin_dashboard_stats():
-    """Return small, fast counters used only by the admin dashboard."""
-    conn = get_conn()
-    try:
-        pending = conn.execute(
-            "SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی'"
-        ).fetchone()["n"]
-        orders = conn.execute(
-            "SELECT COUNT(*) AS n FROM orders WHERE status='در انتظار بررسی'"
-        ).fetchone()["n"]
-        tickets = conn.execute(
-            "SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('new','admin_waiting')"
-        ).fetchone()["n"]
-        products = conn.execute(
-            "SELECT COUNT(*) AS n FROM products WHERE active=TRUE"
-        ).fetchone()["n"]
-        customers = conn.execute(
-            "SELECT COUNT(*) AS n FROM customers"
-        ).fetchone()["n"]
-        return {
-            "pending": pending or 0,
-            "orders": orders or 0,
-            "tickets": tickets or 0,
-            "products": products or 0,
-            "customers": customers or 0,
-        }
-    finally:
-        conn.close()
-
-
 def admin_panel_keyboard():
-    """Admin-only navigation. Customer shopping actions never appear here."""
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💳 پرداخت‌های در انتظار", callback_data="adm:pending_payments"),
-            InlineKeyboardButton("📦 سفارش‌ها", callback_data="adm:orders"),
-        ],
-        [
-            InlineKeyboardButton("🛠 مدیریت محصولات", callback_data="adm:products"),
-            InlineKeyboardButton("👥 مشتری‌ها", callback_data="adm:customers"),
-        ],
-        [
-            InlineKeyboardButton("📊 فروش و آمار", callback_data="adm:sales"),
-            InlineKeyboardButton("🎫 پشتیبانی", callback_data="adm:tickets"),
-        ],
-        [
-            InlineKeyboardButton("📢 مدیریت کانال", callback_data="adm:channel"),
-            InlineKeyboardButton("💳 تنظیمات پرداخت", callback_data="adm:payment"),
-        ],
-        [
-            InlineKeyboardButton("🔄 بروزرسانی داشبورد", callback_data="adm:home"),
-            InlineKeyboardButton("✕ بستن پنل", callback_data="adm:close"),
-        ],
+        [InlineKeyboardButton("📦 سفارش‌ها", callback_data="adm:orders")],
+        [InlineKeyboardButton("🟡 پرداخت‌های در انتظار تأیید", callback_data="adm:pending_payments")],
+        [InlineKeyboardButton("🛍 محصولات", callback_data="adm:products")],
+        [InlineKeyboardButton("📊 فروش و آمار", callback_data="adm:sales")],
+        [InlineKeyboardButton("👥 مشتری‌ها", callback_data="adm:customers")],
+        [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="adm:tickets")],
+        [InlineKeyboardButton("📢 پست‌های کانال", callback_data="adm:channel")],
+        [InlineKeyboardButton("💳 تنظیمات پرداخت", callback_data="adm:payment")],
+        [InlineKeyboardButton("🔄 بروزرسانی", callback_data="adm:home")],
+        [InlineKeyboardButton("🔙 بستن پنل", callback_data="adm:close")],
     ])
-
-
-async def admin_dashboard_text():
-    stats = await admin_dashboard_stats()
-    return (
-        "⚙️ <b>داشبورد مدیریت تنین ایران</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "🔔 <b>وضعیت نیازمند اقدام</b>\n"
-        f"💳 پرداخت در انتظار بررسی: <b>{stats['pending']}</b>\n"
-        f"📦 سفارش در انتظار بررسی: <b>{stats['orders']}</b>\n"
-        f"🎫 تیکت جدید/نیازمند پاسخ: <b>{stats['tickets']}</b>\n\n"
-        "📊 <b>وضعیت فروشگاه</b>\n"
-        f"🛠 محصولات فعال: {stats['products']}  |  👥 مشتری‌ها: {stats['customers']}\n\n"
-        "از منوی زیر بخش موردنظر را انتخاب کن:"
-    )
 
 
 def back_keyboard(target="home"):
@@ -1771,7 +1715,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("دسترسی نداری.")
         return
     await update.message.reply_text(
-        await admin_dashboard_text(),
+        "⚙️ <b>پنل مدیریت تنین ایران</b>\n\n"
+        "از اینجا می‌تونی کل فروشگاه رو مدیریت کنی:",
         parse_mode="HTML",
         reply_markup=admin_panel_keyboard(),
     )
@@ -2290,7 +2235,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "home":
         await q.edit_message_text(
-            await admin_dashboard_text(),
+            "⚙️ <b>پنل مدیریت تنین ایران</b>\n\n"
+            "مدیریت محصولات، سفارش‌ها، فروش، مشتری‌ها و پرداخت:",
             parse_mode="HTML",
             reply_markup=admin_panel_keyboard(),
         )
