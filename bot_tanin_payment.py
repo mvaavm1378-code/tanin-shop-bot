@@ -61,7 +61,10 @@ DB_URL = (
 # اطلاعات محرمانه فقط از Environment Variables خوانده می‌شوند.
 # ----------------------------------------------------------------------------
 MELIPAYAMAK_USERNAME = os.getenv("MELIPAYAMAK_USERNAME", "").strip()
-MELIPAYAMAK_API_KEY = os.getenv("MELIPAYAMAK_API_KEY", "").strip()
+MELIPAYAMAK_API_KEY = (
+    os.getenv("MELIPAYAMAK_API_KEY", "").strip()
+    or os.getenv("MELIPAYAMAK_PASSWORD", "").strip()
+)
 MELIPAYAMAK_SENDER = os.getenv("MELIPAYAMAK_SENDER", "50004001853486").strip()
 SMS_ADMIN_PHONE = os.getenv("SMS_ADMIN_PHONE", "09384853486").strip()
 MELIPAYAMAK_URL = "https://rest.payamak-panel.com/api/SendSMS/SendSMS"
@@ -1277,15 +1280,24 @@ async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_order_sms_to_admin(pending_id, full_name, phone, total_price, items_summary):
-    """
-    ارسال اطلاع‌رسانی ثبت سفارش به مدیر.
-    خطای پیامک نباید باعث شکست ثبت سفارش یا توقف ربات شود.
-    """
-    if not (MELIPAYAMAK_USERNAME and MELIPAYAMAK_API_KEY and MELIPAYAMAK_SENDER and SMS_ADMIN_PHONE):
-        logger.warning("Melipayamak SMS is not configured; order SMS skipped.")
+    """ارسال پیامک سفارش جدید به مدیر و بررسی واقعی نتیجه API."""
+    missing = []
+    if not MELIPAYAMAK_USERNAME:
+        missing.append("MELIPAYAMAK_USERNAME")
+    if not MELIPAYAMAK_API_KEY:
+        missing.append("MELIPAYAMAK_API_KEY/MELIPAYAMAK_PASSWORD")
+    if not MELIPAYAMAK_SENDER:
+        missing.append("MELIPAYAMAK_SENDER")
+    if not SMS_ADMIN_PHONE:
+        missing.append("SMS_ADMIN_PHONE")
+
+    if missing:
+        logger.error(
+            "ORDER SMS SKIPPED for #%s: missing %s",
+            pending_id, ", ".join(missing)
+        )
         return False
 
-    # برای کوتاه و خوانا ماندن پیامک، خلاصه محصولات محدود می‌شود.
     clean_items = re.sub(r"\s+", " ", str(items_summary or "-")).strip()
     if len(clean_items) > 180:
         clean_items = clean_items[:177] + "..."
@@ -1304,36 +1316,77 @@ async def send_order_sms_to_admin(pending_id, full_name, phone, total_price, ite
         "to": SMS_ADMIN_PHONE,
         "from": MELIPAYAMAK_SENDER,
         "text": sms_text,
-        "isflash": False,
+        "isFlash": False,
     }
 
     try:
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=20)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(MELIPAYAMAK_URL, data=payload) as response:
-                body = await response.text()
+            async with session.post(
+                MELIPAYAMAK_URL,
+                data=payload,
+                headers={"Accept": "application/json, text/plain, */*"},
+            ) as response:
+                body = (await response.text()).strip()
+
+                logger.info(
+                    "Melipayamak response for order #%s: HTTP=%s BODY=%s",
+                    pending_id, response.status, body[:1000]
+                )
+
                 if response.status >= 400:
-                    logger.warning(
-                        "Melipayamak SMS HTTP error %s: %s",
-                        response.status,
-                        body[:500],
+                    logger.error(
+                        "ORDER SMS FAILED for #%s: HTTP %s",
+                        pending_id, response.status
                     )
                     return False
 
-                # در سرویس ملی پیامک، پاسخ می‌تواند JSON یا متن باشد؛
-                # فعلاً فقط موفقیت HTTP را به‌عنوان پذیرش درخواست ثبت می‌کنیم.
+                try:
+                    result = json.loads(body)
+                except (json.JSONDecodeError, TypeError):
+                    logger.error(
+                        "ORDER SMS FAILED for #%s: invalid API response: %s",
+                        pending_id, body[:1000]
+                    )
+                    return False
+
+                if not isinstance(result, dict):
+                    logger.error(
+                        "ORDER SMS FAILED for #%s: unexpected API response: %s",
+                        pending_id, body[:1000]
+                    )
+                    return False
+
+                ret_status = result.get("RetStatus", result.get("retStatus"))
+                str_status = result.get("StrRetStatus", result.get("strRetStatus", ""))
+                rec_id = result.get("Value", result.get("value", ""))
+
+                try:
+                    ret_status = int(ret_status)
+                except (TypeError, ValueError):
+                    ret_status = -1
+
+                if ret_status != 1:
+                    logger.error(
+                        "ORDER SMS REJECTED for #%s: RetStatus=%s StrRetStatus=%s Value=%s",
+                        pending_id, ret_status, str_status, rec_id
+                    )
+                    return False
+
                 logger.info(
-                    "Order SMS request sent for pending payment #%s. Response: %s",
-                    pending_id,
-                    body[:300],
+                    "ORDER SMS ACCEPTED for #%s: RecID=%s Status=%s",
+                    pending_id, rec_id, str_status
                 )
                 return True
-    except Exception as e:
-        logger.warning(
-            "Could not send order SMS for pending payment #%s: %s",
-            pending_id,
-            e,
-        )
+
+    except asyncio.TimeoutError:
+        logger.error("ORDER SMS TIMEOUT for #%s", pending_id)
+        return False
+    except aiohttp.ClientError as e:
+        logger.error("ORDER SMS NETWORK ERROR for #%s: %s", pending_id, e)
+        return False
+    except Exception:
+        logger.exception("ORDER SMS UNEXPECTED ERROR for #%s", pending_id)
         return False
 
 
