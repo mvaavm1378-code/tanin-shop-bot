@@ -28,6 +28,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     KeyboardButton,
 )
 from telegram.error import BadRequest
@@ -1241,7 +1242,11 @@ async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_GENDER
 
     context.user_data["gender"] = gender
-    if await show_saved_step(update.message, context, "address"):
+    # اگر آدرس ذخیره‌شده داریم، پیام بعدی فقط دکمه شیشه‌ای دارد؛ پس کیبورد مرد/زن
+    # را اینجا جمع می‌کنیم تا روی صفحه نماند.
+    if get_saved_data(update.effective_user.id, "address"):
+        await update.message.reply_text("✅ جنسیت ثبت شد.", reply_markup=ReplyKeyboardRemove())
+        await show_saved_step(update.message, context, "address")
         return ASK_ADDRESS
     await update.message.reply_text("آدرس کامل برای ارسال رو بفرست:", reply_markup=address_input_keyboard())
     return ASK_ADDRESS
