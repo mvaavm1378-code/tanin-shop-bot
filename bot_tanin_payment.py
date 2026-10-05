@@ -771,37 +771,71 @@ async def remove_from_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # فرآیند ثبت سفارش (Conversation)
 # ----------------------------------------------------------------------------
 async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        target_message = update.callback_query.message
+    """شروع ثبت سفارش از سبد خرید؛ خطای ثبت مشتری نباید دکمه را بی‌واکنش کند."""
+    query = update.callback_query
+    if query:
+        try:
+            await query.answer()
+        except Exception:
+            logger.exception("Could not answer checkout callback for user %s", update.effective_user.id if update.effective_user else "-")
+        target_message = query.message
     else:
         target_message = update.message
 
-    u = update.effective_user
-    conn = get_conn()
-    now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
-    conn.execute(
-        """INSERT INTO customers(user_id, username, full_name, first_seen, last_seen)
-           VALUES (%s, %s, %s, %s, %s)
-           ON CONFLICT(user_id) DO UPDATE SET
-             username=excluded.username,
-             full_name=excluded.full_name,
-             last_seen=excluded.last_seen""",
-        (u.id, u.username or "", u.full_name or "", now, now),
-    )
-    conn.commit()
-    conn.close()
     user_id = update.effective_user.id
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM cart_items WHERE user_id=%s", (user_id,)
-    ).fetchall()
-    conn.close()
+    u = update.effective_user
+
+    # ابتدا سبد را می‌خوانیم؛ اگر دیتابیس/سبد مشکل داشته باشد، کاربر پیام واضح می‌گیرد.
+    try:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM cart_items WHERE user_id=%s", (user_id,)
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception("CHECKOUT START: failed to read cart for user %s", user_id)
+        await target_message.reply_text(
+            "⚠️ فعلاً نتونستم سبد خریدت رو بررسی کنم.\n"
+            "لطفاً چند لحظه بعد دوباره روی «ثبت سفارش» بزن."
+        )
+        return ConversationHandler.END
+
     if not rows:
         await target_message.reply_text("سبد خریدت خالیه، اول چیزی اضافه کن.")
         return ConversationHandler.END
 
-    await show_checkout_quantities(target_message, user_id)
+    # ثبت/به‌روزرسانی مشتری مرحله‌ی جانبی است؛ شکست آن نباید شروع سفارش را متوقف کند.
+    try:
+        now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
+        conn = get_conn()
+        try:
+            conn.execute(
+                """INSERT INTO customers(user_id, username, full_name, first_seen, last_seen)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                     username=excluded.username,
+                     full_name=excluded.full_name,
+                     last_seen=excluded.last_seen""",
+                (u.id, u.username or "", u.full_name or "", now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception("CHECKOUT START: customer upsert failed for user %s; continuing checkout", user_id)
+
+    try:
+        await show_checkout_quantities(target_message, user_id)
+    except Exception:
+        logger.exception("CHECKOUT START: failed to show quantity screen for user %s", user_id)
+        await target_message.reply_text(
+            "⚠️ نتونستم مرحله ثبت سفارش رو باز کنم.\n"
+            "لطفاً دوباره از سبد خرید روی «ثبت سفارش» بزن."
+        )
+        return ConversationHandler.END
+
     return ASK_QTY
 
 
