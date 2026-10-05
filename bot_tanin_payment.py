@@ -1042,7 +1042,7 @@ def gender_keyboard():
     )
 
 
-async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_name = update.message.text or ""
     if raw_name.strip() == "🔙 مرحله قبلی":
         context.user_data.pop("pending_full_name", None)
@@ -3842,7 +3842,7 @@ async def async_main():
             ASK_NAME: [
                 CallbackQueryHandler(handle_saved_name, pattern=r"^saved:name:"),
                 CallbackQueryHandler(handle_name_confirmation, pattern=r"^nameconfirm:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name),
             ],
             ASK_PHONE: [
                 CallbackQueryHandler(handle_saved_phone, pattern=r"^saved:phone:"),
