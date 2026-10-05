@@ -522,7 +522,8 @@ async def checkout_quantity_callback(update: Update, context: ContextTypes.DEFAU
             return ASK_QTY
         new_qty = item["qty"] + (1 if action == "plus" else -1)
         if new_qty < 1:
-            new_qty = 1
+            conn.close()
+            return ASK_QTY
         conn.execute("UPDATE cart_items SET qty=%s WHERE id=%s AND user_id=%s", (new_qty, cart_id, user_id))
         conn.commit()
         rows = conn.execute(
@@ -827,7 +828,9 @@ async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("CHECKOUT START: customer upsert failed for user %s; continuing checkout", user_id)
 
     try:
-        await show_checkout_quantities(target_message, user_id)
+        shown = await show_checkout_quantities(target_message, user_id)
+        if not shown:
+            return ConversationHandler.END
     except Exception:
         logger.exception("CHECKOUT START: failed to show quantity screen for user %s", user_id)
         await target_message.reply_text(
@@ -3942,8 +3945,31 @@ async def async_main():
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel_checkout)],
+        allow_reentry=True,  # زدن دوباره «ثبت سفارش» مکالمه را ری‌استارت می‌کند
+        conversation_timeout=1800 if app.job_queue is not None else None,
     )
     app.add_handler(conv)
+
+    # دکمه‌های مراحل ثبت سفارش که مکالمه‌شان منقضی شده (مثلاً بعد از ری‌استارت سرور)
+    async def stale_checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.callback_query.answer(
+            "این مرحله منقضی شده؛ لطفاً دوباره از سبد خرید «ثبت سفارش» را بزن.",
+            show_alert=True,
+        )
+    app.add_handler(CallbackQueryHandler(stale_checkout_callback, pattern=r"^(qty|saved|nameconfirm):"))
+
+    # هر خطای مدیریت‌نشده هم در لاگ ثبت می‌شود و هم به کاربر اطلاع داده می‌شود
+    async def on_error(update, context):
+        logger.error("Unhandled error", exc_info=context.error)
+        if isinstance(update, Update):
+            try:
+                if update.callback_query:
+                    await update.callback_query.answer("⚠️ مشکلی پیش آمد، دوباره تلاش کن.", show_alert=True)
+                elif update.effective_message:
+                    await update.effective_message.reply_text("⚠️ مشکلی پیش آمد. لطفاً دوباره تلاش کن.")
+            except Exception:
+                logger.exception("Could not notify user about error")
+    app.add_error_handler(on_error)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_input))
     setup_channel_jobs(app)
 
