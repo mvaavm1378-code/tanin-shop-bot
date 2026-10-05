@@ -56,6 +56,16 @@ DB_URL = (
     or os.getenv("POSTGRES_URL", "").strip()
 )
 
+# ----------------------------------------------------------------------------
+# تنظیمات پیامک ملی پیامک
+# اطلاعات محرمانه فقط از Environment Variables خوانده می‌شوند.
+# ----------------------------------------------------------------------------
+MELIPAYAMAK_USERNAME = os.getenv("MELIPAYAMAK_USERNAME", "").strip()
+MELIPAYAMAK_API_KEY = os.getenv("MELIPAYAMAK_API_KEY", "").strip()
+MELIPAYAMAK_SENDER = os.getenv("MELIPAYAMAK_SENDER", "50004001853486").strip()
+SMS_ADMIN_PHONE = os.getenv("SMS_ADMIN_PHONE", "09384853486").strip()
+MELIPAYAMAK_URL = "https://rest.payamak-panel.com/api/SendSMS/SendSMS"
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -1266,6 +1276,67 @@ async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await create_pending_payment(update.message, context)
 
 
+async def send_order_sms_to_admin(pending_id, full_name, phone, total_price, items_summary):
+    """
+    ارسال اطلاع‌رسانی ثبت سفارش به مدیر.
+    خطای پیامک نباید باعث شکست ثبت سفارش یا توقف ربات شود.
+    """
+    if not (MELIPAYAMAK_USERNAME and MELIPAYAMAK_API_KEY and MELIPAYAMAK_SENDER and SMS_ADMIN_PHONE):
+        logger.warning("Melipayamak SMS is not configured; order SMS skipped.")
+        return False
+
+    # برای کوتاه و خوانا ماندن پیامک، خلاصه محصولات محدود می‌شود.
+    clean_items = re.sub(r"\s+", " ", str(items_summary or "-")).strip()
+    if len(clean_items) > 180:
+        clean_items = clean_items[:177] + "..."
+
+    sms_text = (
+        f"تنین ایران | سفارش جدید #{pending_id}\n"
+        f"مشتری: {full_name or '-'}\n"
+        f"موبایل: {phone or '-'}\n"
+        f"مبلغ: {int(total_price):,} تومان\n"
+        f"محصولات: {clean_items}"
+    )
+
+    payload = {
+        "username": MELIPAYAMAK_USERNAME,
+        "password": MELIPAYAMAK_API_KEY,
+        "to": SMS_ADMIN_PHONE,
+        "from": MELIPAYAMAK_SENDER,
+        "text": sms_text,
+        "isflash": False,
+    }
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(MELIPAYAMAK_URL, data=payload) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    logger.warning(
+                        "Melipayamak SMS HTTP error %s: %s",
+                        response.status,
+                        body[:500],
+                    )
+                    return False
+
+                # در سرویس ملی پیامک، پاسخ می‌تواند JSON یا متن باشد؛
+                # فعلاً فقط موفقیت HTTP را به‌عنوان پذیرش درخواست ثبت می‌کنیم.
+                logger.info(
+                    "Order SMS request sent for pending payment #%s. Response: %s",
+                    pending_id,
+                    body[:300],
+                )
+                return True
+    except Exception as e:
+        logger.warning(
+            "Could not send order SMS for pending payment #%s: %s",
+            pending_id,
+            e,
+        )
+        return False
+
+
 async def create_pending_payment(message, context, user=None):
     user_id = message.chat_id
     username = (user.username if user is not None else message.from_user.username) or ""
@@ -1329,6 +1400,16 @@ async def create_pending_payment(message, context, user=None):
     pending_id = cur.fetchone()["id"]
     conn.commit()
     conn.close()
+
+    # اطلاع‌رسانی پیامکی به مدیر؛ در صورت خطا، ثبت سفارش ادامه پیدا می‌کند.
+    await send_order_sms_to_admin(
+        pending_id=pending_id,
+        full_name=full_name,
+        phone=phone,
+        total_price=total,
+        items_summary=summary,
+    )
+
     context.user_data.pop("full_name", None)
     context.user_data.pop("phone", None)
     context.user_data.pop("address", None)
