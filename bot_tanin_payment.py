@@ -1349,7 +1349,8 @@ async def send_order_sms_to_admin(pending_id, full_name, phone, total_price, ite
         f"مشتری: {full_name or '-'}\n"
         f"موبایل: {phone or '-'}\n"
         f"مبلغ: {int(total_price):,} تومان\n"
-        f"محصولات: {clean_items}"
+        f"محصولات: {clean_items}\n"
+        f"لغو11"
     )
 
     payload = {
