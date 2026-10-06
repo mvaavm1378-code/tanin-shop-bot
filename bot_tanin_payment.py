@@ -1146,6 +1146,67 @@ async def handle_saved_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_NAME
 
 
+def _gender_name_key(full_name):
+    """نام را برای مقایسه یکسان می‌کند (ی/ک عربی، فاصله‌ها، نیم‌فاصله)."""
+    text = str(full_name or "").replace("ي", "ی").replace("ى", "ی").replace("ك", "ک")
+    text = text.replace("\u200c", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def get_known_gender(user_id, full_name):
+    """اگر این مشتری قبلاً برای همین نام و نام خانوادگی جنسیت ثبت کرده باشد، همان را برمی‌گرداند."""
+    key_name = _gender_name_key(full_name)
+    if not key_name:
+        return None
+    try:
+        value = meta_get(f"gender:{user_id}:{key_name}")
+        if value in ("مرد", "زن"):
+            return value
+        # سازگاری با مشتری‌های قبلی: آخرین نام/جنسیتی که روی پروفایل ثبت شده
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT full_name, gender FROM customers WHERE user_id=%s", (user_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row and row["gender"] in ("مرد", "زن") and _gender_name_key(row["full_name"]) == key_name:
+            return row["gender"]
+    except Exception:
+        logger.exception("Could not look up saved gender")
+    return None
+
+
+def set_known_gender(user_id, full_name, gender):
+    key_name = _gender_name_key(full_name)
+    if not key_name or gender not in ("مرد", "زن"):
+        return
+    try:
+        meta_set(f"gender:{user_id}:{key_name}", gender)
+    except Exception:
+        logger.exception("Could not save gender")
+
+
+async def go_to_address_step(message, context, user_id, ack_text):
+    """رفتن به مرحله آدرس؛ کیبورد قبلی (مرد/زن یا شماره موبایل) هم جمع می‌شود."""
+    if get_saved_data(user_id, "address"):
+        await message.reply_text(ack_text, reply_markup=ReplyKeyboardRemove())
+        await show_saved_step(message, context, "address")
+        return ASK_ADDRESS
+    await message.reply_text("آدرس کامل برای ارسال رو بفرست:", reply_markup=address_input_keyboard())
+    return ASK_ADDRESS
+
+
+async def proceed_after_phone(message, context, user_id):
+    """بعد از ثبت موبایل: اگر جنسیت این نام قبلاً ثبت شده، مرحله جنسیت رد می‌شود."""
+    gender = get_known_gender(user_id, context.user_data.get("full_name"))
+    if not gender:
+        await message.reply_text("جنسیت خودت رو انتخاب کن:", reply_markup=gender_keyboard())
+        return ASK_GENDER
+    context.user_data["gender"] = gender
+    return await go_to_address_step(message, context, user_id, "✅ اطلاعات ثبت شد.")
+
+
 async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.contact and (update.message.text or "").strip() == "🔙 مرحله قبلی":
         await show_saved_step(update.message, context, "name")
@@ -1189,8 +1250,7 @@ async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         save_saved_data(user_id, "phone", phone)
     context.user_data["phone"] = phone
-    await update.message.reply_text("جنسیت خودت رو انتخاب کن:", reply_markup=gender_keyboard())
-    return ASK_GENDER
+    return await proceed_after_phone(update.message, context, user_id)
 
 
 async def handle_saved_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1206,8 +1266,7 @@ async def handle_saved_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
         row = next((r for r in get_saved_data(user_id, "phone") if r["id"] == int(parts[3])), None)
         if row:
             context.user_data["phone"] = row["value"]
-            await q.message.reply_text("جنسیت خودت رو انتخاب کن:", reply_markup=gender_keyboard())
-            return ASK_GENDER
+            return await proceed_after_phone(q.message, context, user_id)
     elif action == "new":
         context.user_data.pop("editing_saved_phone_id", None)
         await q.message.reply_text("📱 شماره موبایل جدیدت را با دکمه زیر ارسال کن:", reply_markup=phone_keyboard())
@@ -1242,14 +1301,8 @@ async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_GENDER
 
     context.user_data["gender"] = gender
-    # اگر آدرس ذخیره‌شده داریم، پیام بعدی فقط دکمه شیشه‌ای دارد؛ پس کیبورد مرد/زن
-    # را اینجا جمع می‌کنیم تا روی صفحه نماند.
-    if get_saved_data(update.effective_user.id, "address"):
-        await update.message.reply_text("✅ جنسیت ثبت شد.", reply_markup=ReplyKeyboardRemove())
-        await show_saved_step(update.message, context, "address")
-        return ASK_ADDRESS
-    await update.message.reply_text("آدرس کامل برای ارسال رو بفرست:", reply_markup=address_input_keyboard())
-    return ASK_ADDRESS
+    set_known_gender(update.effective_user.id, context.user_data.get("full_name"), gender)
+    return await go_to_address_step(update.message, context, update.effective_user.id, "✅ جنسیت ثبت شد.")
 
 
 def address_input_keyboard():
@@ -3455,19 +3508,59 @@ async def fetch_weather():
 
 
 def _weather_block(w):
+    """آب‌وهوای کوتاه: یک خط شامل وضعیت، دمای فعلی، کمینه/بیشینه و (در صورت اهمیت) احتمال بارش."""
     emoji, desc = _weather_desc(w["code"])
-    lines = [
-        f"{emoji} <b>آب‌وهوای {escape(WEATHER_CITY)}</b>",
-        f"{desc}",
-        f"🌡 دمای فعلی: {_fa(round(w['temp']))}°",
-        f"🔼 بیشینه {_fa(round(w['tmax']))}°  |  🔽 کمینه {_fa(round(w['tmin']))}°",
-    ]
-    if w.get("rain") is not None:
-        lines.append(f"☔ احتمال بارش: {_fa(round(w['rain']))}٪")
-    if w.get("humidity") is not None:
-        lines.append(f"💧 رطوبت: {_fa(round(w['humidity']))}٪")
-    if w.get("wind") is not None:
-        lines.append(f"🌬 باد: {_fa(round(w['wind']))} کیلومتر بر ساعت")
+    line = (
+        f"{emoji} <b>{escape(WEATHER_CITY)}</b>: {desc}، {_fa(round(w['temp']))}° "
+        f"({_fa(round(w['tmin']))} تا {_fa(round(w['tmax']))})"
+    )
+    if w.get("rain") is not None and w["rain"] >= 20:
+        line += f" | ☔ {_fa(round(w['rain']))}٪"
+    return line
+
+
+# قیمت دلار و طلا (منبع رایگان TGJU از طریق iran-market؛ هر ۳۰ دقیقه به‌روز می‌شود)
+MARKET_URL = "https://iran-market.github.io/data/popular.json"
+
+
+async def fetch_market_prices():
+    """دلار آزاد و طلای ۱۸ عیار به تومان. در هر خطایی None برمی‌گرداند تا پست صبح بدون این بخش ارسال شود."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(MARKET_URL) as resp:
+                if resp.status != 200:
+                    logger.warning("Market API returned HTTP %s", resp.status)
+                    return None
+                payload = await resp.json(content_type=None)
+        items = {i.get("symbol"): i for i in payload.get("data", [])}
+        result = {}
+        for key, symbol in (("usd", "USD_IRR_FREE"), ("gold", "GOLD_18K_IRR")):
+            item = items.get(symbol)
+            if item and not item.get("stale") and item.get("price"):
+                result[key] = item
+        return result or None
+    except Exception as e:
+        logger.warning(f"Market price fetch failed: {e}")
+        return None
+
+
+def _price_line(emoji, title, item):
+    price = _fa(f"{int(item['price']):,}").replace(",", "٬")
+    line = f"{emoji} {title}: {price} تومان"
+    pct = item.get("change_pct")
+    if isinstance(pct, (int, float)) and pct != 0:
+        arrow = "🔺" if pct > 0 else "🔻"
+        pct_txt = _fa(f"{abs(pct):.2f}").replace(".", "٫")
+        line += f" {arrow}{pct_txt}٪"
+    return line
+
+
+def _market_block(prices):
+    lines = []
+    if "usd" in prices:
+        lines.append(_price_line("💵", "دلار", prices["usd"]))
+    if "gold" in prices:
+        lines.append(_price_line("🥇", "طلای ۱۸ عیار (گرم)", prices["gold"]))
     return "\n".join(lines)
 
 
@@ -3480,9 +3573,14 @@ async def channel_build_text(kind, now):
     message = escape(channel_pick_message(kind))
     if kind == "morning":
         parts = ["☀️ <b>صبح بخیر!</b>", f"📅 {channel_date_line(now)}", "", message]
-        weather = await fetch_weather()
+        weather, prices = await asyncio.gather(fetch_weather(), fetch_market_prices())
+        extra = []
         if weather:
-            parts += ["", _weather_block(weather)]
+            extra.append(_weather_block(weather))
+        if prices:
+            extra.append(_market_block(prices))
+        if extra:
+            parts += [""] + extra
         return "\n".join(parts)
     return "\n".join(["🌙 <b>شب بخیر</b>", "", message])
 
@@ -3533,7 +3631,7 @@ async def channel_post(bot, kind, force=False):
                 except Exception:
                     old_ids[k] = None
 
-            msg = await bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+            msg = await bot.send_message(CHANNEL_ID, text, parse_mode="HTML", disable_notification=True)
 
             # پست جدید رفت؛ حالا پست‌های قبلی (همان نوع و نوع دیگر) پاک می‌شوند.
             for k, mid in old_ids.items():
