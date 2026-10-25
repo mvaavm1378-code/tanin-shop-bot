@@ -1,61 +1,80 @@
 
 import os
-import asyncio
 import logging
-import httpx
+from aiohttp import web, ClientSession, ClientTimeout
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+log = logging.getLogger("tanin-bale")
 
 TOKEN = os.environ["BALE_BOT_TOKEN"]
+PUBLIC_URL = os.environ["BALE_PUBLIC_URL"].rstrip("/")
+WEBHOOK_PATH = os.environ["BALE_WEBHOOK_PATH"].strip("/")
+
+if not WEBHOOK_PATH or "/" in WEBHOOK_PATH:
+    raise RuntimeError("BALE_WEBHOOK_PATH must be a non-empty secret path")
+
 API = f"https://tapi.bale.ai/bot{TOKEN}"
+TIMEOUT = ClientTimeout(total=20)
 
-async def main():
-    offset = 0
-    timeout = httpx.Timeout(40.0)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        log.info("Bale bot started")
+async def health(request):
+    return web.json_response({"service": "tanin-bale-bot", "status": "ok"})
 
-        while True:
-            try:
-                response = await client.post(
-                    f"{API}/getUpdates",
-                    json={"offset": offset, "timeout": 30},
-                )
-                response.raise_for_status()
-                data = response.json()
 
-                if not data.get("ok"):
-                    log.error("Bale API returned an error")
-                    await asyncio.sleep(5)
-                    continue
+async def receive_update(request):
+    if request.match_info["secret"] != WEBHOOK_PATH:
+        raise web.HTTPNotFound()
 
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    message = update.get("message", {})
-                    text = message.get("text", "")
-                    chat = message.get("chat", {})
-                    chat_id = chat.get("id")
+    try:
+        update = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON")
 
-                    if not chat_id or not text:
-                        continue
+    message = update.get("message") or {}
+    text = (message.get("text") or "").strip()
+    chat_id = (message.get("chat") or {}).get("id")
 
-                    if text.strip().lower() in ("/start", "start"):
-                        await client.post(
-                            f"{API}/sendMessage",
-                            json={
-                                "chat_id": chat_id,
-                                "text": (
-                                    "سلام! به فروشگاه تنین خوش آمدید.\n"
-                                    "ربات بله با موفقیت راه‌اندازی شده است."
-                                ),
-                            },
-                        )
+    if chat_id and text.split("@")[0].lower() == "/start":
+        async with ClientSession(timeout=TIMEOUT) as session:
+            async with session.post(
+                f"{API}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": (
+                        "سلام! به فروشگاه تنین خوش آمدید.\n"
+                        "ربات بله با موفقیت راه‌اندازی شده است."
+                    ),
+                },
+            ) as response:
+                result = await response.json()
+                if response.status >= 400 or not result.get("ok"):
+                    log.error("Bale sendMessage failed; HTTP %s", response.status)
+                    return web.Response(status=500, text="Send failed")
 
-            except (httpx.HTTPError, ValueError):
-                log.exception("Bale API connection failed")
-                await asyncio.sleep(5)
+    return web.Response(text="OK")
+
+
+async def on_startup(app):
+    url = f"{PUBLIC_URL}/bale/update/{WEBHOOK_PATH}"
+
+    async with ClientSession(timeout=TIMEOUT) as session:
+        async with session.post(
+            f"{API}/setWebhook",
+            json={"url": url},
+        ) as response:
+            result = await response.json()
+            if response.status >= 400 or not result.get("ok"):
+                raise RuntimeError("Bale webhook setup failed")
+
+    log.info("Bale webhook registered")
+
+
+app = web.Application(client_max_size=1024 * 1024)
+app.router.add_get("/health", health)
+app.router.add_post("/bale/update/{secret}", receive_update)
+app.on_startup.append(on_startup)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    port = int(os.environ.get("PORT", "10000"))
+    web.run_app(app, host="0.0.0.0", port=port)
