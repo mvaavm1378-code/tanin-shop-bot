@@ -15,6 +15,7 @@ import psycopg
 from psycopg.rows import dict_row
 import logging
 import json
+import hmac
 import re
 import random
 from html import escape
@@ -2565,45 +2566,119 @@ async def mark_admin_message(q, suffix_html):
 
 
 async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Review a payment exactly once, locking its row until the DB transaction finishes."""
     q = update.callback_query
-    if not is_admin(q.from_user.id):
-        await q.answer("دسترسی نداری.", show_alert=True); return
-    parts = q.data.split(":")
-    pid = int(parts[2]); action = parts[1]
-    conn = get_conn()
-    pending = conn.execute("SELECT * FROM pending_payments WHERE id=%s", (pid,)).fetchone()
-    if not pending:
-        conn.close(); await q.answer("پرداخت پیدا نشد.", show_alert=True); return
-    if pending['payment_status'] not in ('در انتظار بررسی',):
-        conn.close(); await q.answer("این پرداخت قبلاً بررسی شده است.", show_alert=True); return
+    if not q or not q.from_user or not is_admin(q.from_user.id):
+        if q:
+            await q.answer("دسترسی نداری.", show_alert=True)
+        return
+
+    parts = (q.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "payadmin" or parts[1] not in {"approve", "reject"}:
+        await q.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+    try:
+        pid = int(parts[2])
+        if pid <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        await q.answer("شناسه پرداخت نامعتبر است.", show_alert=True)
+        return
+
+    action = parts[1]
     now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
-    if action == 'reject':
-        conn.execute("UPDATE pending_payments SET payment_status='رد شد', reviewed_at=%s, admin_id=%s WHERE id=%s", (now, q.from_user.id, pid))
-        conn.commit(); conn.close()
+    conn = get_conn()
+    pending = None
+    order_id = None
+    try:
+        # Lock the payment row so two administrators cannot approve/reject it concurrently.
+        with conn.transaction():
+            pending = conn.execute(
+                "SELECT * FROM pending_payments WHERE id=%s FOR UPDATE", (pid,)
+            ).fetchone()
+            if not pending:
+                result = "missing"
+            elif pending["payment_status"] != "در انتظار بررسی":
+                result = "already_reviewed"
+            elif action == "reject":
+                conn.execute(
+                    """UPDATE pending_payments
+                       SET payment_status='رد شد', reviewed_at=%s, admin_id=%s
+                       WHERE id=%s AND payment_status='در انتظار بررسی'""",
+                    (now, q.from_user.id, pid),
+                )
+                result = "rejected"
+            else:
+                cur = conn.execute(
+                    """INSERT INTO orders
+                       (user_id, full_name, phone, address, items_summary, total_price,
+                        status, created_at, finalized_at, payment_status, transaction_ref)
+                       VALUES (%s, %s, %s, %s, %s, %s, 'در انتظار بررسی', %s, %s,
+                               'تأیید شده', %s)
+                       RETURNING id""",
+                    (pending["user_id"], pending["full_name"], pending["phone"],
+                     pending["address"], pending["items_summary"], pending["total_price"],
+                     now, now, f"CARD-TRANSFER-{pid}"),
+                )
+                order_id = cur.fetchone()["id"]
+                conn.execute("DELETE FROM cart_items WHERE user_id=%s", (pending["user_id"],))
+                conn.execute(
+                    """UPDATE pending_payments
+                       SET payment_status='تأیید شده', reviewed_at=%s, admin_id=%s, order_id=%s
+                       WHERE id=%s AND payment_status='در انتظار بررسی'""",
+                    (now, q.from_user.id, order_id, pid),
+                )
+                result = "approved"
+    except Exception:
+        logger.exception("Payment review failed for pending payment #%s", pid)
+        await q.answer("خطا در ثبت بررسی پرداخت؛ تغییری تأیید نشده است.", show_alert=True)
+        return
+    finally:
+        conn.close()
+
+    if result == "missing":
+        await q.answer("پرداخت پیدا نشد.", show_alert=True)
+        return
+    if result == "already_reviewed":
+        await q.answer("این پرداخت قبلاً بررسی شده است.", show_alert=True)
+        return
+    if result == "rejected":
         await q.answer("پرداخت رد شد.")
-        try: await context.bot.send_message(pending['user_id'], "❌ رسید پرداخت شما تأیید نشد. سفارش ثبت نشد. لطفاً با پشتیبانی تماس بگیرید.")
-        except Exception: pass
+        try:
+            await context.bot.send_message(
+                pending["user_id"],
+                "❌ رسید پرداخت شما تأیید نشد. سفارش ثبت نشد. لطفاً با پشتیبانی تماس بگیرید.",
+            )
+        except Exception:
+            logger.warning("Could not notify customer after rejecting payment #%s", pid, exc_info=True)
         await mark_admin_message(q, "\n\n❌ <b>پرداخت رد شد</b>")
         return
-    # approve: only here is the real order inserted and cart cleared
-    cur = conn.execute("""INSERT INTO orders
-        (user_id, full_name, phone, address, items_summary, total_price, status, created_at, finalized_at, payment_status, transaction_ref)
-        VALUES (%s, %s, %s, %s, %s, %s, 'در انتظار بررسی', %s, %s, 'تأیید شده', %s)
-        RETURNING id""",
-        (pending['user_id'], pending['full_name'], pending['phone'], pending['address'], pending['items_summary'], pending['total_price'], now, now, f"CARD-TRANSFER-{pid}"))
-    order_id = cur.fetchone()["id"]
-    conn.execute("DELETE FROM cart_items WHERE user_id=%s", (pending['user_id'],))
-    conn.execute("UPDATE pending_payments SET payment_status='تأیید شده', reviewed_at=%s, admin_id=%s, order_id=%s WHERE id=%s", (now, q.from_user.id, order_id, pid))
-    conn.commit(); conn.close()
+
     await q.answer(f"پرداخت تأیید شد؛ سفارش #{order_id} ثبت شد.")
     await mark_admin_message(q, f"\n\n✅ <b>پرداخت تأیید شد — سفارش #{order_id} ثبت شد</b>")
     try:
-        await context.bot.send_message(pending['user_id'], f"✅ پرداخت شما تأیید شد.\n🆔 شماره سفارش: #{order_id}\n💰 مبلغ: {pending['total_price']:,} تومان\nسفارش شما ثبت نهایی شد.")
-    except Exception: pass
+        await context.bot.send_message(
+            pending["user_id"],
+            f"✅ پرداخت شما تأیید شد.\n🆔 شماره سفارش: #{order_id}\n"
+            f"💰 مبلغ: {pending['total_price']:,} تومان\nسفارش شما ثبت نهایی شد.",
+        )
+    except Exception:
+        logger.warning("Could not notify customer after approving payment #%s", pid, exc_info=True)
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(admin_id, f"🔔 <b>سفارش جدید #{order_id}</b>\n👤 {escape(pending['full_name'] or '-')}\n📞 {escape(pending['phone'] or '-')}\n📍 {escape(pending['address'] or '-')}\n\n🛍 {escape(pending['items_summary'] or '-')}\n\n💰 <b>{pending['total_price']:,} تومان</b>", parse_mode="HTML", reply_markup=order_status_keyboard(order_id, 'در انتظار بررسی'))
-        except Exception as e: logger.warning(f"Could not notify admin after payment {admin_id}: {e}")
+            await context.bot.send_message(
+                admin_id,
+                f"🔔 <b>سفارش جدید #{order_id}</b>\n"
+                f"👤 {escape(pending['full_name'] or '-')}\n"
+                f"📞 {escape(pending['phone'] or '-')}\n"
+                f"📍 {escape(pending['address'] or '-')}\n\n"
+                f"🛍 {escape(pending['items_summary'] or '-')}\n\n"
+                f"💰 <b>{pending['total_price']:,} تومان</b>",
+                parse_mode="HTML",
+                reply_markup=order_status_keyboard(order_id, 'در انتظار بررسی'),
+            )
+        except Exception:
+            logger.warning("Could not notify admin %s about order #%s", admin_id, order_id, exc_info=True)
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -4086,7 +4161,10 @@ async def async_main():
     webhook_url = f"https://{hostname}/{webhook_path}"
     webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
     if not webhook_secret:
-        logger.warning("WEBHOOK_SECRET is not set; anyone who knows the webhook URL can send fake updates.")
+        raise RuntimeError(
+            "WEBHOOK_SECRET is required. Set a strong random secret in Render Environment "
+            "before deploying this version; otherwise Telegram webhook requests cannot be authenticated."
+        )
 
     async def health_handler(request):
         return web.Response(text="Bot is running", status=200, content_type="text/plain")
@@ -4095,7 +4173,7 @@ async def async_main():
         # اگر WEBHOOK_SECRET تنظیم شده باشد، Telegram باید همین secret را بفرستد.
         if webhook_secret:
             received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if received != webhook_secret:
+            if not hmac.compare_digest(received, webhook_secret):
                 return web.Response(status=403, text="Forbidden")
 
         try:
