@@ -1,80 +1,104 @@
-
-import os
-import logging
-from aiohttp import web, ClientSession, ClientTimeout
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("tanin-bale")
-
-TOKEN = os.environ["BALE_BOT_TOKEN"]
-PUBLIC_URL = os.environ["BALE_PUBLIC_URL"].rstrip("/")
-WEBHOOK_PATH = os.environ["BALE_WEBHOOK_PATH"].strip("/")
-
-if not WEBHOOK_PATH or "/" in WEBHOOK_PATH:
-    raise RuntimeError("BALE_WEBHOOK_PATH must be a non-empty secret path")
-
-API = f"https://tapi.bale.ai/bot{TOKEN}"
-TIMEOUT = ClientTimeout(total=20)
-
-
-async def health(request):
-    return web.json_response({"service": "tanin-bale-bot", "status": "ok"})
-
-
-async def receive_update(request):
-    if request.match_info["secret"] != WEBHOOK_PATH:
-        raise web.HTTPNotFound()
-
-    try:
-        update = await request.json()
+            prompt += "\nتعداد بسته را انتخاب کن:"
+            await api.send(chat_id, prompt, quantity_keyboard(pid, 1))
+        elif data.startswith("qty:"):
+            _, action, pid_s, qty_s = data.split(":")
+            pid, qty = int(pid_s), max(1, int(qty_s))
+            if action == "plus":
+                qty += 1
+            elif action == "minus":
+                qty = max(1, qty - 1)
+            elif action == "noop":
+                pass
+            elif action == "cancel":
+                await api.answer(cbid, "لغو شد.")
+                try:
+                    await api.call("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+                except Exception:
+                    pass
+                return
+            elif action == "confirm":
+                product = await asyncio.to_thread(db_product, pid)
+                if not product:
+                    await api.answer(cbid, "این محصول دیگر موجود نیست.", True)
+                    return
+                await asyncio.to_thread(db_add_cart, uid, pid, qty)
+                await api.answer(cbid, "به سبد خرید اضافه شد.")
+                await api.send(chat_id,
+                               f"✅ {qty} بسته از «{escape(str(product['name']))}» به سبد خرید اضافه شد.",
+                               main_keyboard())
+                return
+            else:
+                await api.answer(cbid)
+                return
+            await api.answer(cbid)
+            product = await asyncio.to_thread(db_product, pid)
+            if product and mid:
+                await api.edit(chat_id, mid,
+                               f"👕 <b>{escape(str(product['name']))}</b>\n\nتعداد بسته را انتخاب کن:",
+                               quantity_keyboard(pid, qty))
+        elif data.startswith("remove:"):
+            cid = int(data.split(":", 1)[1])
+            await asyncio.to_thread(db_remove_cart, uid, cid)
+            await api.answer(cbid, "از سبد حذف شد.")
+            if mid:
+                try:
+                    await api.edit(chat_id, mid, "🗑 این کالا از سبد خرید حذف شد.")
+                except Exception:
+                    pass
+        else:
+            await api.answer(cbid)
     except Exception:
-        raise web.HTTPBadRequest(text="Invalid JSON")
-
-    message = update.get("message") or {}
-    text = (message.get("text") or "").strip()
-    chat_id = (message.get("chat") or {}).get("id")
-
-    if chat_id and text.split("@")[0].lower() == "/start":
-        async with ClientSession(timeout=TIMEOUT) as session:
-            async with session.post(
-                f"{API}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": (
-                        "سلام! به فروشگاه تنین خوش آمدید.\n"
-                        "ربات بله با موفقیت راه‌اندازی شده است."
-                    ),
-                },
-            ) as response:
-                result = await response.json()
-                if response.status >= 400 or not result.get("ok"):
-                    log.error("Bale sendMessage failed; HTTP %s", response.status)
-                    return web.Response(status=500, text="Send failed")
-
-    return web.Response(text="OK")
+        log.exception("Callback failed: %r", data)
+        await api.answer(cbid, "خطا رخ داد؛ دوباره تلاش کن.", True)
 
 
-async def on_startup(app):
-    url = f"{PUBLIC_URL}/bale/update/{WEBHOOK_PATH}"
+async def main():
+    if not TOKEN:
+        raise RuntimeError("متغیر BALE_BOT_TOKEN تنظیم نشده است.")
+    if not DB_URL:
+        raise RuntimeError("متغیر SUPABASE_DB_URL یا DATABASE_URL تنظیم نشده است.")
+    # Verify database connectivity and required tables without changing schema.
+    def check_db():
+        with get_conn() as conn:
+            for table in ("products", "cart_items"):
+                found = conn.execute(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema='public' AND table_name=%s", (table,)
+                ).fetchone()
+                if not found:
+                    raise RuntimeError(f"جدول public.{table} در دیتابیس پیدا نشد.")
+    await asyncio.to_thread(check_db)
 
-    async with ClientSession(timeout=TIMEOUT) as session:
-        async with session.post(
-            f"{API}/setWebhook",
-            json={"url": url},
-        ) as response:
-            result = await response.json()
-            if response.status >= 400 or not result.get("ok"):
-                raise RuntimeError("Bale webhook setup failed")
-
-    log.info("Bale webhook registered")
-
-
-app = web.Application(client_max_size=1024 * 1024)
-app.router.add_get("/health", health)
-app.router.add_post("/bale/update/{secret}", receive_update)
-app.on_startup.append(on_startup)
+    timeout = aiohttp.ClientTimeout(total=40)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        api = BaleAPI(session)
+        offset = None
+        log.info("Bale catalog bot started.")
+        while True:
+            try:
+                payload = {"timeout": POLL_TIMEOUT,
+                           "allowed_updates": ["message", "callback_query"]}
+                if offset is not None:
+                    payload["offset"] = offset
+                updates = await api.call("getUpdates", payload)
+                for upd in updates or []:
+                    offset = upd["update_id"] + 1
+                    try:
+                        if upd.get("message"):
+                            await on_message(api, upd["message"])
+                        elif upd.get("callback_query"):
+                            await on_callback(api, upd["callback_query"])
+                    except Exception:
+                        log.exception("Update failed: %s", upd.get("update_id"))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Polling error; retrying in 4 seconds")
+                await asyncio.sleep(4)
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    web.run_app(app, host="0.0.0.0", port=port)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Bot stopped.")
