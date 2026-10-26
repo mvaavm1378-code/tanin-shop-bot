@@ -134,11 +134,11 @@ def db_admin_stats():
             except Exception:
                 return 0
         return {
-            "pending": count("SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی'"),
-            "orders": count("SELECT COUNT(*) AS n FROM orders WHERE status='در انتظار بررسی'"),
-            "tickets": count("SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('new','admin_waiting')"),
+            "pending": count("SELECT COUNT(*) AS n FROM pending_payments WHERE user_id < 0 AND payment_status='در انتظار بررسی'"),
+            "orders": count("SELECT COUNT(*) AS n FROM orders WHERE user_id < 0 AND status='در انتظار بررسی'"),
+            "tickets": count("SELECT COUNT(*) AS n FROM support_tickets WHERE user_id < 0 AND status IN ('new','admin_waiting')"),
             "products": count("SELECT COUNT(*) AS n FROM products WHERE active=TRUE"),
-            "customers": count("SELECT COUNT(*) AS n FROM customers"),
+            "customers": count("SELECT COUNT(*) AS n FROM customers WHERE user_id < 0"),
         }
 
 
@@ -159,7 +159,7 @@ async def show_admin_section(api, chat_id, section):
         with get_conn() as conn:
             rows = conn.execute(
                 "SELECT id,full_name,total_price,created_at,payment_status FROM pending_payments "
-                "WHERE payment_status='در انتظار بررسی' ORDER BY id DESC LIMIT 30"
+                "WHERE user_id < 0 AND payment_status='در انتظار بررسی' ORDER BY id DESC LIMIT 30"
             ).fetchall()
         if not rows:
             await api.send(chat_id, "💳 پرداخت‌های در انتظار بررسی\n\nموردی برای بررسی وجود ندارد.", admin_back())
@@ -174,7 +174,7 @@ async def show_admin_section(api, chat_id, section):
     elif section == "orders":
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT id,full_name,total_price,status,created_at FROM orders ORDER BY id DESC LIMIT 30"
+                "SELECT id,full_name,total_price,status,created_at FROM orders WHERE user_id < 0 ORDER BY id DESC LIMIT 30"
             ).fetchall()
         if not rows:
             await api.send(chat_id, "📦 سفارشی ثبت نشده است.", admin_back())
@@ -202,7 +202,7 @@ async def show_admin_section(api, chat_id, section):
     elif section == "customers":
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT user_id,full_name,phone,username FROM customers ORDER BY last_seen DESC NULLS LAST LIMIT 30"
+                "SELECT user_id,full_name,phone,username FROM customers WHERE user_id < 0 ORDER BY last_seen DESC NULLS LAST LIMIT 30"
             ).fetchall()
         lines = ["👥 <b>آخرین مشتریان</b>", ""]
         for r in rows:
@@ -212,13 +212,13 @@ async def show_admin_section(api, chat_id, section):
         with get_conn() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) AS n, COALESCE(SUM(total_price),0) AS total FROM orders "
-                "WHERE payment_status='تأیید شده'"
+                "WHERE user_id < 0 AND payment_status='تأیید شده'"
             ).fetchone()
         await api.send(chat_id, f"📊 <b>آمار فروش</b>\nسفارش‌های پرداخت‌شده: {row['n']}\nجمع مبلغ: {int(row['total'] or 0):,} تومان", admin_back())
     elif section == "tickets":
         try:
             with get_conn() as conn:
-                rows = conn.execute("SELECT id,user_id,topic,status,created_at FROM support_tickets ORDER BY id DESC LIMIT 20").fetchall()
+                rows = conn.execute("SELECT id,user_id,topic,status,created_at FROM support_tickets WHERE user_id < 0 ORDER BY id DESC LIMIT 20").fetchall()
             lines = ["🎫 <b>تیکت‌های پشتیبانی</b>", ""]
             for r in rows:
                 lines.append(f"#{r['id']} · کاربر {r['user_id']} · {escape(str(r['topic'] or '-'))} · {escape(str(r['status'] or '-'))}")
@@ -239,7 +239,7 @@ async def show_admin_section(api, chat_id, section):
 
 async def show_admin_pending_detail(api, chat_id, pid):
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM pending_payments WHERE id=%s", (pid,)).fetchone()
+        row = conn.execute("SELECT * FROM pending_payments WHERE id=%s AND user_id < 0", (pid,)).fetchone()
     if not row:
         await api.send(chat_id, "پرداخت پیدا نشد.", admin_back("pending")); return
     caption = (f"💳 <b>پرداخت #{row['id']}</b>\n"
@@ -310,7 +310,13 @@ def db_product(pid):
         return conn.execute("SELECT id,name,category,size,color,price,photo_url,pack_info FROM products WHERE id=%s AND active=TRUE", (pid,)).fetchone()
 
 
+def db_user_key(uid):
+    """Use negative user IDs for Bale records; Telegram IDs remain positive."""
+    return -abs(int(uid))
+
+
 def db_add_cart(uid, pid, qty):
+    uid = db_user_key(uid)
     with get_conn() as conn:
         item = conn.execute("SELECT id,qty FROM cart_items WHERE user_id=%s AND product_id=%s", (uid, pid)).fetchone()
         if item:
@@ -321,6 +327,7 @@ def db_add_cart(uid, pid, qty):
 
 
 def db_cart(uid):
+    uid = db_user_key(uid)
     with get_conn() as conn:
         return conn.execute("""SELECT ci.id AS cart_id,p.name,p.price,p.pack_info,ci.qty,(p.price*ci.qty) AS line_total
             FROM cart_items ci JOIN products p ON p.id=ci.product_id
@@ -328,14 +335,20 @@ def db_cart(uid):
 
 
 def db_remove_cart(uid, cid):
+    uid = db_user_key(uid)
     with get_conn() as conn:
         conn.execute("DELETE FROM cart_items WHERE id=%s AND user_id=%s", (cid, uid))
         conn.commit()
 
 
 # Prefix Bale IDs in customer_saved_data so they cannot collide with Telegram IDs.
-def saved_user_key(uid):
+def bale_db_user_id(uid):
+    """Store Bale customer-owned rows under a negative key; API/chat IDs stay positive."""
     return -abs(int(uid))
+
+
+def saved_user_key(uid):
+    return bale_db_user_id(uid)
 
 
 def db_saved_data(uid, data_type):
@@ -395,6 +408,7 @@ def saved_keyboard(uid, data_type, step):
 
 def db_create_pending(uid, full_name, phone, gender, address, username):
     """Create/reuse an unpaid payment record; return (payment row, bank account)."""
+    uid = db_user_key(uid)
     with get_conn() as conn:
         now = __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
         conn.execute("""INSERT INTO customers(user_id,username,full_name,phone,gender,first_seen,last_seen)
@@ -426,6 +440,7 @@ def db_create_pending(uid, full_name, phone, gender, address, username):
 
 
 def db_record_receipt(uid, file_id):
+    uid = db_user_key(uid)
     with get_conn() as conn:
         pending = conn.execute("""SELECT * FROM pending_payments WHERE user_id=%s AND payment_status='در انتظار رسید'
             ORDER BY id DESC LIMIT 1""", (uid,)).fetchone()
@@ -443,7 +458,7 @@ def db_review_payment(pid, admin_id, approve):
     with get_conn() as conn:
         now = __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
         with conn.transaction():
-            pending = conn.execute("SELECT * FROM pending_payments WHERE id=%s FOR UPDATE", (pid,)).fetchone()
+            pending = conn.execute("SELECT * FROM pending_payments WHERE id=%s AND user_id < 0 FOR UPDATE", (pid,)).fetchone()
             if not pending or pending["payment_status"] != "در انتظار بررسی":
                 return None, "already"
             if not approve:
@@ -743,7 +758,7 @@ async def on_callback(api, cb):
                 await show_admin_pending_detail(api, chat_id, int(action[2]))
             elif section == "receipt" and len(action) == 3:
                 with get_conn() as conn:
-                    rec = conn.execute("SELECT receipt_file_id FROM pending_payments WHERE id=%s", (int(action[2]),)).fetchone()
+                    rec = conn.execute("SELECT receipt_file_id FROM pending_payments WHERE id=%s AND user_id < 0", (int(action[2]),)).fetchone()
                 if rec and rec["receipt_file_id"]:
                     await api.call("sendPhoto", {"chat_id": chat_id, "photo": rec["receipt_file_id"], "caption": f"رسید پرداخت #{action[2]}"})
                 else:
@@ -758,7 +773,7 @@ async def on_callback(api, cb):
                 await api.send(chat_id, f"وضعیت محصول #{pid} تغییر کرد." if p else "محصول پیدا نشد.", admin_back("products"))
             elif section == "orderdetail" and len(action) == 3:
                 with get_conn() as conn:
-                    o = conn.execute("SELECT * FROM orders WHERE id=%s", (int(action[2]),)).fetchone()
+                    o = conn.execute("SELECT * FROM orders WHERE id=%s AND user_id < 0", (int(action[2]),)).fetchone()
                 if not o:
                     await api.send(chat_id, "سفارش پیدا نشد.", admin_back("orders"))
                 else:
@@ -777,7 +792,7 @@ async def on_callback(api, cb):
                 else:
                     status_text = "تأیید شده" if new_status == "confirmed" else "لغو شده"
                     with get_conn() as conn:
-                        conn.execute("UPDATE orders SET status=%s WHERE id=%s AND status='در انتظار بررسی'", (status_text, oid))
+                        conn.execute("UPDATE orders SET status=%s WHERE id=%s AND user_id < 0 AND status='در انتظار بررسی'", (status_text, oid))
                         conn.commit()
                     await api.send(chat_id, f"وضعیت سفارش #{oid} به «{status_text}» تغییر کرد.", admin_back("orders"))
             else:
@@ -927,7 +942,7 @@ async def on_callback(api, cb):
             else:
                 await api.send(chat_id, f"❌ پرداخت #{pid_s} رد شد.")
                 customer_msg = "❌ رسید پرداخت تأیید نشد. لطفاً با فروشگاه تماس بگیر یا رسید معتبر ارسال کن."
-            try: await api.send(pending["user_id"], customer_msg, main_keyboard())
+            try: await api.send(abs(int(pending["user_id"])), customer_msg, main_keyboard())
             except Exception: log.exception("Could not notify Bale customer after review")
             if mid:
                 status_text = "✅ پرداخت تأیید شد و سفارش ثبت شد." if action == "approve" else "❌ پرداخت رد شد."
