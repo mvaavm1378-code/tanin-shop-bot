@@ -13,6 +13,7 @@ import asyncio
 import logging
 from html import escape
 import aiohttp
+from aiohttp import web
 import psycopg
 from psycopg.rows import dict_row
 
@@ -311,7 +312,7 @@ async def on_callback(api, cb):
 
 async def health(request):
     """Render health endpoint; does not expose secrets or database details."""
-    return aiohttp.web.json_response({"service": "tanin-bale-bot", "status": "ok"})
+    return web.json_response({"service": "tanin-bale-bot", "status": "ok"})
 
 
 async def main():
@@ -344,13 +345,13 @@ async def main():
             # Keep going; the polling log will make any webhook conflict visible.
             log.warning("Could not clear a previous Bale webhook; polling may conflict.", exc_info=True)
 
-        app = aiohttp.web.Application()
+        app = web.Application()
         app.router.add_get("/", health)
         app.router.add_get("/health", health)
-        runner = aiohttp.web.AppRunner(app)
+        runner = web.AppRunner(app)
         await runner.setup()
         port = int(os.environ.get("PORT", "10000"))
-        site = aiohttp.web.TCPSite(runner, "0.0.0.0", port)
+        site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
         log.info("Health server listening on port %s", port)
 
