@@ -1189,9 +1189,10 @@ def set_known_gender(user_id, full_name, gender):
 
 
 async def go_to_address_step(message, context, user_id, ack_text):
-    """رفتن به مرحله آدرس؛ کیبورد قبلی (مرد/زن یا شماره موبایل) هم جمع می‌شود."""
+    """رفتن به مرحله آدرس؛ ابتدا کیبورد قبلی را صریحاً حذف می‌کند."""
+    # Reply keyboards persist unless explicitly removed; remove gender/phone buttons first.
+    await message.reply_text(ack_text, reply_markup=ReplyKeyboardRemove())
     if get_saved_data(user_id, "address"):
-        await message.reply_text(ack_text, reply_markup=ReplyKeyboardRemove())
         await show_saved_step(message, context, "address")
         return ASK_ADDRESS
     await message.reply_text("آدرس کامل برای ارسال رو بفرست:", reply_markup=address_input_keyboard())
@@ -4082,6 +4083,20 @@ async def async_main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    async def clear_selected_inline_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Hide the inline buttons on the message that was just clicked."""
+        query = update.callback_query
+        if not query or not query.message:
+            return
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+        except Exception as exc:
+            # Safe when the clicked message has no inline keyboard/already has none.
+            logger.debug("Could not clear clicked inline keyboard: %s", exc)
+
+    # Run before specific callbacks so old buttons disappear, while the selected
+    # callback handler can still render the next screen's buttons.
+    app.add_handler(CallbackQueryHandler(clear_selected_inline_keyboard), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^🧾 کاتالوگ محصولات$"), show_catalog))
     app.add_handler(MessageHandler(filters.Regex("^🛒 سبد خرید$"), show_cart))
