@@ -499,8 +499,20 @@ async def on_callback(api, cb):
             try: await api.send(pending["user_id"], customer_msg, main_keyboard())
             except Exception: log.exception("Could not notify Bale customer after review")
             if mid:
-                try: await api.edit(chat_id, mid, f"{escape(str((msg.get('caption') or msg.get('text') or 'رسید پرداخت')))}\n\n<b>{'تأیید شد' if action == 'approve' else 'رد شد'}</b>")
-                except Exception: pass
+                status_text = "✅ پرداخت تأیید شد و سفارش ثبت شد." if action == "approve" else "❌ پرداخت رد شد."
+                original_caption = str(msg.get("caption") or msg.get("text") or "رسید پرداخت")
+                try:
+                    if msg.get("photo") or msg.get("document"):
+                        await api.call("editMessageCaption", {
+                            "chat_id": chat_id,
+                            "message_id": mid,
+                            "caption": f"{original_caption}\n\n<b>{status_text}</b>",
+                            "parse_mode": "HTML",
+                        })
+                    else:
+                        await api.edit(chat_id, mid, f"{escape(original_caption)}\n\n<b>{status_text}</b>")
+                except Exception:
+                    log.exception("Could not mark Bale admin receipt as reviewed")
         else:
             await api.answer(cbid)
     except Exception:
