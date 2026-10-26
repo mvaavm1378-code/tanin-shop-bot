@@ -73,6 +73,192 @@ def review_keyboard(pid):
                                 [{"text": "❌ رد پرداخت", "callback_data": f"payadmin:reject:{pid}"}]]}
 
 
+
+# ---------------------------------------------------------------------------
+# پنل مدیریت مخصوص مدیران؛ مدیر وارد جریان خرید و سبد مشتری نمی‌شود.
+# گزینه‌ها با پنل تلگرام هم‌راستا هستند. عملیات خطرناک فقط برای ADMIN_IDS است.
+# ---------------------------------------------------------------------------
+def is_admin(uid):
+    return uid in ADMIN_IDS
+
+
+def admin_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "💳 پرداخت‌های در انتظار", "callback_data": "adm:pending"},
+         {"text": "📦 سفارش‌ها", "callback_data": "adm:orders"}],
+        [{"text": "🛠 مدیریت محصولات", "callback_data": "adm:products"},
+         {"text": "👥 مشتری‌ها", "callback_data": "adm:customers"}],
+        [{"text": "📊 فروش و آمار", "callback_data": "adm:sales"},
+         {"text": "🎫 پشتیبانی", "callback_data": "adm:tickets"}],
+        [{"text": "📢 مدیریت کانال", "callback_data": "adm:channel"},
+         {"text": "💳 تنظیمات پرداخت", "callback_data": "adm:payment"}],
+        [{"text": "🔄 بروزرسانی داشبورد", "callback_data": "adm:home"},
+         {"text": "✕ بستن پنل", "callback_data": "adm:close"}],
+    ]}
+
+
+def admin_back(target="home"):
+    return {"inline_keyboard": [[{"text": "🔙 بازگشت", "callback_data": f"adm:{target}"}]]}
+
+
+def admin_order_buttons(order_id, status):
+    rows = []
+    if status == "در انتظار بررسی":
+        rows.extend([
+            [{"text": "✅ تأیید سفارش", "callback_data": f"adm:orderstatus:{order_id}:confirmed"}],
+            [{"text": "❌ رد سفارش", "callback_data": f"adm:orderstatus:{order_id}:cancelled"}],
+        ])
+    rows.append([{"text": "🔙 لیست سفارش‌ها", "callback_data": "adm:orders"}])
+    return {"inline_keyboard": rows}
+
+
+def admin_home_text(stats):
+    return (
+        "⚙️ <b>پنل مدیریت تنین ایران</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🔔 <b>نیازمند اقدام</b>\n"
+        f"💳 پرداخت‌های در انتظار بررسی: <b>{stats['pending']}</b>\n"
+        f"📦 سفارش‌های در انتظار بررسی: <b>{stats['orders']}</b>\n"
+        f"🎫 تیکت‌های باز: <b>{stats['tickets']}</b>\n\n"
+        "📊 <b>وضعیت فروشگاه</b>\n"
+        f"🛠 محصولات فعال: {stats['products']}  |  👥 مشتریان: {stats['customers']}\n\n"
+        "یک بخش مدیریتی را انتخاب کن:"
+    )
+
+
+def db_admin_stats():
+    with get_conn() as conn:
+        def count(sql):
+            try:
+                return int(conn.execute(sql).fetchone()["n"] or 0)
+            except Exception:
+                return 0
+        return {
+            "pending": count("SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی'"),
+            "orders": count("SELECT COUNT(*) AS n FROM orders WHERE status='در انتظار بررسی'"),
+            "tickets": count("SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('new','admin_waiting')"),
+            "products": count("SELECT COUNT(*) AS n FROM products WHERE active=TRUE"),
+            "customers": count("SELECT COUNT(*) AS n FROM customers"),
+        }
+
+
+async def show_admin_home(api, chat_id):
+    if not ADMIN_IDS:
+        await api.send(chat_id, "⚠️ شناسه مدیر در BALE_ADMIN_IDS تنظیم نشده است.")
+        return
+    try:
+        stats = await asyncio.to_thread(db_admin_stats)
+        await api.send(chat_id, admin_home_text(stats), admin_keyboard())
+    except Exception:
+        log.exception("Admin dashboard failed")
+        await api.send(chat_id, "❌ داشبورد مدیریت بارگذاری نشد. Logs را بررسی کن.", admin_keyboard())
+
+
+async def show_admin_section(api, chat_id, section):
+    if section == "pending":
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id,full_name,total_price,created_at,payment_status FROM pending_payments "
+                "WHERE payment_status='در انتظار بررسی' ORDER BY id DESC LIMIT 30"
+            ).fetchall()
+        if not rows:
+            await api.send(chat_id, "💳 پرداخت‌های در انتظار بررسی\n\nموردی برای بررسی وجود ندارد.", admin_back())
+            return
+        buttons = []
+        for r in rows:
+            label = f"#{r['id']} · {str(r['full_name'] or '-')[:18]} · {int(r['total_price'] or 0):,} تومان"
+            buttons.append([{"text": label[:60], "callback_data": f"adm:pendingdetail:{r['id']}"}])
+        buttons += [[{"text": "🔄 بروزرسانی", "callback_data": "adm:pending"}],
+                    [{"text": "🔙 پنل اصلی", "callback_data": "adm:home"}]]
+        await api.send(chat_id, "💳 <b>پرداخت‌های در انتظار بررسی</b>", {"inline_keyboard": buttons})
+    elif section == "orders":
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id,full_name,total_price,status,created_at FROM orders ORDER BY id DESC LIMIT 30"
+            ).fetchall()
+        if not rows:
+            await api.send(chat_id, "📦 سفارشی ثبت نشده است.", admin_back())
+            return
+        buttons = []
+        for r in rows:
+            label = f"#{r['id']} · {str(r['full_name'] or '-')[:16]} · {int(r['total_price'] or 0):,} · {str(r['status'] or '-')[:12]}"
+            buttons.append([{"text": label[:60], "callback_data": f"adm:orderdetail:{r['id']}"}])
+        buttons += [[{"text": "🔄 بروزرسانی", "callback_data": "adm:orders"}],
+                    [{"text": "🔙 پنل اصلی", "callback_data": "adm:home"}]]
+        await api.send(chat_id, "📦 <b>سفارش‌ها</b>", {"inline_keyboard": buttons})
+    elif section == "products":
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id,name,category,price,active FROM products ORDER BY id DESC LIMIT 40"
+            ).fetchall()
+        buttons = []
+        for r in rows:
+            status = "🟢" if r["active"] else "⚪"
+            label = f"{status} #{r['id']} {str(r['name'])[:24]} · {int(r['price'] or 0):,}"
+            buttons.append([{"text": label[:60], "callback_data": f"adm:producttoggle:{r['id']}"}])
+        buttons += [[{"text": "🔄 بروزرسانی", "callback_data": "adm:products"}],
+                    [{"text": "🔙 پنل اصلی", "callback_data": "adm:home"}]]
+        await api.send(chat_id, "🛠 <b>مدیریت محصولات</b>\nروی محصول بزن تا فعال/غیرفعال شود.", {"inline_keyboard": buttons})
+    elif section == "customers":
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT user_id,full_name,phone,username FROM customers ORDER BY last_seen DESC NULLS LAST LIMIT 30"
+            ).fetchall()
+        lines = ["👥 <b>آخرین مشتریان</b>", ""]
+        for r in rows:
+            lines.append(f"• {escape(str(r['full_name'] or '-'))} | {escape(str(r['phone'] or '-'))} | ID {r['user_id']}")
+        await api.send(chat_id, "\n".join(lines)[:3900] if rows else "👥 هنوز مشتری‌ای ثبت نشده است.", admin_back())
+    elif section == "sales":
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(total_price),0) AS total FROM orders "
+                "WHERE payment_status='تأیید شده'"
+            ).fetchone()
+        await api.send(chat_id, f"📊 <b>آمار فروش</b>\nسفارش‌های پرداخت‌شده: {row['n']}\nجمع مبلغ: {int(row['total'] or 0):,} تومان", admin_back())
+    elif section == "tickets":
+        try:
+            with get_conn() as conn:
+                rows = conn.execute("SELECT id,user_id,topic,status,created_at FROM support_tickets ORDER BY id DESC LIMIT 20").fetchall()
+            lines = ["🎫 <b>تیکت‌های پشتیبانی</b>", ""]
+            for r in rows:
+                lines.append(f"#{r['id']} · کاربر {r['user_id']} · {escape(str(r['topic'] or '-'))} · {escape(str(r['status'] or '-'))}")
+            await api.send(chat_id, "\n".join(lines)[:3900] if rows else "🎫 تیکتی ثبت نشده است.", admin_back())
+        except Exception:
+            log.exception("Tickets view failed")
+            await api.send(chat_id, "🎫 بخش تیکت‌ها هنوز با ساختار فعلی دیتابیس سازگار نشده است.", admin_back())
+    elif section == "payment":
+        with get_conn() as conn:
+            rows = conn.execute("SELECT id,bank_name,owner_name,card_number,active FROM bank_accounts ORDER BY id DESC LIMIT 20").fetchall()
+        lines = ["💳 <b>تنظیمات پرداخت</b>", ""]
+        for r in rows:
+            lines.append(f"#{r['id']} · {escape(str(r['bank_name'] or '-'))} · {escape(str(r['owner_name'] or '-'))} · کارت {escape(str(r['card_number'] or '-'))} · {'فعال' if r['active'] else 'غیرفعال'}")
+        await api.send(chat_id, "\n".join(lines)[:3900] if rows else "حساب بانکی ثبت نشده است.", admin_back())
+    elif section == "channel":
+        await api.send(chat_id, "📢 مدیریت کانال\n\nاین بخش در نسخه بله هنوز به عملیات کانال تلگرام متصل نشده است؛ دکمه را نمایشی نمی‌گذاریم و بعداً باید قابلیت معادل بله برای آن پیاده‌سازی شود.", admin_back())
+
+
+async def show_admin_pending_detail(api, chat_id, pid):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM pending_payments WHERE id=%s", (pid,)).fetchone()
+    if not row:
+        await api.send(chat_id, "پرداخت پیدا نشد.", admin_back("pending")); return
+    caption = (f"💳 <b>پرداخت #{row['id']}</b>\n"
+               f"مشتری: {escape(str(row['full_name'] or '-'))}\n"
+               f"تلفن: {escape(str(row['phone'] or '-'))}\n"
+               f"آدرس: {escape(str(row['address'] or '-'))}\n"
+               f"محصولات: {escape(str(row['items_summary'] or '-'))}\n"
+               f"مبلغ: {int(row['total_price'] or 0):,} تومان\n"
+               f"وضعیت: {escape(str(row['payment_status'] or '-'))}")
+    buttons = []
+    if row["receipt_file_id"]:
+        buttons += [[{"text": "📷 ارسال/نمایش رسید", "callback_data": f"adm:receipt:{pid}"}]]
+    if row["payment_status"] == "در انتظار بررسی":
+        buttons += [[{"text": "✅ تأیید پرداخت", "callback_data": f"payadmin:approve:{pid}"}],
+                    [{"text": "❌ رد پرداخت", "callback_data": f"payadmin:reject:{pid}"}]]
+    buttons += [[{"text": "🔙 پرداخت‌های در انتظار", "callback_data": "adm:pending"}]]
+    await api.send(chat_id, caption, {"inline_keyboard": buttons})
+
+
 class BaleAPI:
     def __init__(self, session):
         self.session = session
@@ -485,12 +671,31 @@ async def on_message(api, msg):
     text = (msg.get("text") or "").strip()
     if chat_id is None or uid is None:
         return
+
+    # مدیر منوی مدیریتی جدا دارد و نباید وارد کاتالوگ/سبد/ثبت سفارش شود.
+    if is_admin(uid):
+        if text.startswith("/start") or text in ("/admin", "⚙️ پنل مدیریت", "پنل مدیریت"):
+            CHECKOUT.pop(uid, None)
+            await show_admin_home(api, chat_id)
+            return
+        if text in ("/cancel", "✕ بستن پنل"):
+            CHECKOUT.pop(uid, None)
+            await api.send(chat_id, "پنل مدیریت بسته شد. برای بازکردن دوباره /admin را بفرست.")
+            return
+        if msg.get("photo") or msg.get("document"):
+            await api.send(chat_id, "این حساب در حالت مدیریت است؛ برای مدیریت رسیدها از پنل مدیریت استفاده کن.", admin_keyboard())
+            return
+        await api.send(chat_id, "برای مدیریت فروشگاه از دکمه‌های پنل استفاده کن یا /admin را بفرست.", admin_keyboard())
+        return
+
     if text.startswith("/start"):
         CHECKOUT.pop(uid, None)
         await api.send(chat_id, "🌸 به «تولیدی تنین ایران» خوش آمدی.\nبرای دیدن محصولات یا ثبت سفارش از منوی زیر استفاده کن.", main_keyboard())
     elif text == "/cancel":
         CHECKOUT.pop(uid, None)
         await api.send(chat_id, "عملیات جاری لغو شد.", main_keyboard())
+    elif text in ("/admin", "⚙️ پنل مدیریت", "پنل مدیریت"):
+        await api.send(chat_id, "دسترسی مدیر لازم است.", main_keyboard())
     elif text.startswith("/") and text not in ("/catalog", "/cart", "/checkout"):
         await api.send(chat_id, "از دکمه‌های منو استفاده کن.", main_keyboard())
     elif await handle_checkout_text(api, msg, uid, chat_id, text):
@@ -518,6 +723,72 @@ async def on_callback(api, cb):
         await api.answer(cbid)
         return
     try:
+        # پنل مدیریت فقط برای شناسه‌های موجود در BALE_ADMIN_IDS مجاز است.
+        if data.startswith("adm:"):
+            if not is_admin(uid):
+                await api.answer(cbid, "دسترسی مدیر لازم است.", True)
+                return
+            action = data.split(":")
+            section = action[1] if len(action) > 1 else "home"
+            await api.answer(cbid)
+            if section == "home":
+                await show_admin_home(api, chat_id)
+            elif section == "close":
+                if mid:
+                    try: await api.call("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": "پنل مدیریت بسته شد."})
+                    except Exception: await api.send(chat_id, "پنل مدیریت بسته شد.")
+            elif section in ("pending", "orders", "products", "customers", "sales", "tickets", "channel", "payment"):
+                await show_admin_section(api, chat_id, section)
+            elif section == "pendingdetail" and len(action) == 3:
+                await show_admin_pending_detail(api, chat_id, int(action[2]))
+            elif section == "receipt" and len(action) == 3:
+                with get_conn() as conn:
+                    rec = conn.execute("SELECT receipt_file_id FROM pending_payments WHERE id=%s", (int(action[2]),)).fetchone()
+                if rec and rec["receipt_file_id"]:
+                    await api.call("sendPhoto", {"chat_id": chat_id, "photo": rec["receipt_file_id"], "caption": f"رسید پرداخت #{action[2]}"})
+                else:
+                    await api.send(chat_id, "رسید برای این پرداخت ثبت نشده است.", admin_back("pending"))
+            elif section == "producttoggle" and len(action) == 3:
+                pid = int(action[2])
+                with get_conn() as conn:
+                    p = conn.execute("SELECT active,name FROM products WHERE id=%s", (pid,)).fetchone()
+                    if p:
+                        conn.execute("UPDATE products SET active=%s WHERE id=%s", (not bool(p["active"]), pid))
+                        conn.commit()
+                await api.send(chat_id, f"وضعیت محصول #{pid} تغییر کرد." if p else "محصول پیدا نشد.", admin_back("products"))
+            elif section == "orderdetail" and len(action) == 3:
+                with get_conn() as conn:
+                    o = conn.execute("SELECT * FROM orders WHERE id=%s", (int(action[2]),)).fetchone()
+                if not o:
+                    await api.send(chat_id, "سفارش پیدا نشد.", admin_back("orders"))
+                else:
+                    text = (f"📦 <b>سفارش #{o['id']}</b>\n"
+                            f"مشتری: {escape(str(o['full_name'] or '-'))}\n"
+                            f"تلفن: {escape(str(o['phone'] or '-'))}\n"
+                            f"آدرس: {escape(str(o['address'] or '-'))}\n"
+                            f"محصولات: {escape(str(o['items_summary'] or '-'))}\n"
+                            f"مبلغ: {int(o['total_price'] or 0):,} تومان\n"
+                            f"وضعیت: {escape(str(o['status'] or '-'))}")
+                    await api.send(chat_id, text, admin_order_buttons(o["id"], o["status"]))
+            elif section == "orderstatus" and len(action) == 4:
+                oid, new_status = int(action[2]), action[3]
+                if new_status not in ("confirmed", "cancelled"):
+                    await api.send(chat_id, "وضعیت نامعتبر است.", admin_back("orders"))
+                else:
+                    status_text = "تأیید شده" if new_status == "confirmed" else "لغو شده"
+                    with get_conn() as conn:
+                        conn.execute("UPDATE orders SET status=%s WHERE id=%s AND status='در انتظار بررسی'", (status_text, oid))
+                        conn.commit()
+                    await api.send(chat_id, f"وضعیت سفارش #{oid} به «{status_text}» تغییر کرد.", admin_back("orders"))
+            else:
+                await api.send(chat_id, "این عملیات مدیریتی هنوز پیاده‌سازی نشده است.", admin_keyboard())
+            return
+
+        # مدیر نباید بتواند از callbackهای مشتری برای ساخت سبد یا سفارش استفاده کند.
+        if is_admin(uid) and (data.startswith(("cat:", "add:", "qty:", "remove:", "checkout:", "saved:"))):
+            await api.answer(cbid, "این حساب فقط برای مدیریت فروشگاه است.", True)
+            return
+
         if data.startswith("cat:"):
             await api.answer(cbid)
             category = data.split(":", 1)[1]
