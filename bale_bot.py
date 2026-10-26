@@ -628,6 +628,19 @@ class BaleAPI:
             p["reply_markup"] = markup
         return await self.call("editMessageText", p)
 
+    async def remove_inline_keyboard(self, chat_id, message_id):
+        """Remove buttons from a clicked inline-keyboard message, leaving its content intact."""
+        if chat_id is None or message_id is None:
+            return
+        try:
+            await self.call("editMessageReplyMarkup", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": {"inline_keyboard": []},
+            })
+        except Exception as exc:
+            log.debug("Could not clear clicked Bale inline keyboard: %s", exc)
+
 
 def db_products(category):
     with get_conn() as conn:
@@ -947,6 +960,9 @@ async def handle_checkout_text(api, msg, uid, chat_id, text):
             return True
         state["gender"] = text
         state["step"] = "address"
+        # Bale reply keyboards persist until explicitly removed, so remove the gender
+        # keyboard before asking for the address.
+        await api.send(chat_id, "✅ جنسیت ثبت شد.", {"remove_keyboard": True})
         saved = await asyncio.to_thread(db_saved_data, uid, "address")
         if saved:
             await api.send(chat_id, "📍 آدرس ارسال را انتخاب کن یا آدرس جدید وارد کن:", await asyncio.to_thread(saved_keyboard, uid, "address", "address"))
@@ -1076,6 +1092,9 @@ async def on_callback(api, cb):
     if chat_id is None or uid is None:
         await api.answer(cbid)
         return
+    # Hide the old inline keyboard as soon as a button is selected; later callback
+    # logic may display a new keyboard for the next screen.
+    await api.remove_inline_keyboard(chat_id, mid)
     try:
         # پنل مدیریت فقط برای شناسه‌های موجود در BALE_ADMIN_IDS مجاز است.
         if data.startswith("adm:"):
