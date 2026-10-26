@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Bale shop bot: shared Supabase catalog/cart + checkout and card-transfer receipt review.
+"""Bale shop bot: shared Supabase catalog/cart + checkout, persistent customer saved data, and card-transfer receipt review.
 Run on Render as a Web Service: python bale_bot.py
 Required env: BALE_BOT_TOKEN, SUPABASE_DB_URL (or DATABASE_URL)
 Optional env: BALE_ADMIN_IDS (comma-separated Bale user IDs for receipt review)
@@ -147,6 +147,66 @@ def db_remove_cart(uid, cid):
         conn.commit()
 
 
+# Prefix Bale IDs in customer_saved_data so they cannot collide with Telegram IDs.
+def saved_user_key(uid):
+    return -abs(int(uid))
+
+
+def db_saved_data(uid, data_type):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT id,value FROM customer_saved_data WHERE user_id=%s AND data_type=%s ORDER BY id DESC",
+            (saved_user_key(uid), data_type),
+        ).fetchall()
+
+
+def db_save_data(uid, data_type, value):
+    value = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not value:
+        return
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM customer_saved_data WHERE user_id=%s AND data_type=%s AND value=%s LIMIT 1",
+            (saved_user_key(uid), data_type, value),
+        ).fetchone()
+        now = __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
+        if row:
+            conn.execute("UPDATE customer_saved_data SET updated_at=%s WHERE id=%s", (now, row["id"]))
+        else:
+            conn.execute("INSERT INTO customer_saved_data(user_id,data_type,value,created_at,updated_at) VALUES(%s,%s,%s,%s,%s)",
+                         (saved_user_key(uid), data_type, value, now, now))
+        conn.commit()
+
+
+def db_update_saved(uid, data_id, data_type, value):
+    value = re.sub(r"\s+", " ", str(value or "")).strip()
+    now = __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
+    with get_conn() as conn:
+        conn.execute("UPDATE customer_saved_data SET value=%s,updated_at=%s WHERE id=%s AND user_id=%s AND data_type=%s",
+                     (value, now, data_id, saved_user_key(uid), data_type))
+        conn.commit()
+
+
+def db_delete_saved(uid, data_id, data_type):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM customer_saved_data WHERE id=%s AND user_id=%s AND data_type=%s",
+                     (data_id, saved_user_key(uid), data_type))
+        conn.commit()
+
+
+def saved_keyboard(uid, data_type, step):
+    rows = db_saved_data(uid, data_type)
+    buttons = []
+    for row in rows[:8]:
+        val = str(row["value"])
+        label = val if len(val) <= 34 else val[:31] + "..."
+        buttons.append([{"text": "استفاده: " + label, "callback_data": f"saved:use:{step}:{row['id']}"}])
+    buttons.append([{"text": "➕ وارد کردن اطلاعات جدید", "callback_data": f"saved:new:{step}"}])
+    if rows:
+        buttons.append([{"text": "✏️ ویرایش / 🗑 حذف اطلاعات ذخیره‌شده", "callback_data": f"saved:manage:{data_type}"}])
+    return {"inline_keyboard": buttons}
+
+
 def db_create_pending(uid, full_name, phone, gender, address, username):
     """Create/reuse an unpaid payment record; return (payment row, bank account)."""
     with get_conn() as conn:
@@ -276,7 +336,11 @@ async def start_checkout(api, chat_id, uid):
         await api.send(chat_id, "🛒 سبد خرید خالی است؛ اول محصولی اضافه کن.", main_keyboard())
         return
     CHECKOUT[uid] = {"step": "name"}
-    await api.send(chat_id, "👤 برای ثبت سفارش، نام و نام خانوادگی را وارد کن.\nمثال: محمد احمدی\nبرای لغو بنویس /cancel")
+    saved = await asyncio.to_thread(db_saved_data, uid, "name")
+    if saved:
+        await api.send(chat_id, "👤 نام و نام خانوادگی را انتخاب کن یا اطلاعات جدید وارد کن:", await asyncio.to_thread(saved_keyboard, uid, "name", "name"))
+    else:
+        await api.send(chat_id, "👤 برای ثبت سفارش، نام و نام خانوادگی را وارد کن.\nمثال: محمد احمدی\nبرای لغو بنویس /cancel")
 
 
 async def send_payment_instructions(api, chat_id, pending, bank):
@@ -295,6 +359,23 @@ async def send_payment_instructions(api, chat_id, pending, bank):
 async def handle_checkout_text(api, msg, uid, chat_id, text):
     state = CHECKOUT.get(uid, {})
     step = state.get("step")
+    if step == "edit_saved":
+        data_type, data_id = state.get("edit_type"), state.get("edit_id")
+        value = re.sub(r"\s+", " ", text).strip()
+        if not value:
+            await api.send(chat_id, "مقدار خالی قابل ذخیره نیست؛ دوباره وارد کن."); return True
+        if data_type == "phone":
+            digits = value.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+            value = re.sub(r"[\s\-()]+", "", digits)
+            if value.startswith("+98"): value = "0" + value[3:]
+            elif value.startswith("0098"): value = "0" + value[4:]
+            elif value.startswith("98"): value = "0" + value[2:]
+            if len(value) != 11 or not value.startswith("09") or not value.isdigit():
+                await api.send(chat_id, "شماره معتبر نیست؛ نمونه: 09123456789"); return True
+        await asyncio.to_thread(db_update_saved, uid, data_id, data_type, value)
+        CHECKOUT.pop(uid, None)
+        await api.send(chat_id, "✅ اطلاعات ذخیره‌شده ویرایش شد.", main_keyboard())
+        return True
     if text == "🔙 لغو ثبت سفارش" or text == "/cancel":
         CHECKOUT.pop(uid, None)
         await api.send(chat_id, "ثبت سفارش لغو شد.", main_keyboard())
@@ -305,8 +386,13 @@ async def handle_checkout_text(api, msg, uid, chat_id, text):
             await api.send(chat_id, "❌ نام و نام خانوادگی را کامل وارد کن. مثال: محمد احمدی")
             return True
         state["full_name"] = name
+        await asyncio.to_thread(db_save_data, uid, "name", name)
         state["step"] = "phone"
-        await api.send(chat_id, "📱 شماره موبایل ایرانی را وارد کن (مثال: 09123456789).")
+        saved = await asyncio.to_thread(db_saved_data, uid, "phone")
+        if saved:
+            await api.send(chat_id, "📱 شماره موبایل را انتخاب کن یا شماره جدید وارد کن:", await asyncio.to_thread(saved_keyboard, uid, "phone", "phone"))
+        else:
+            await api.send(chat_id, "📱 شماره موبایل ایرانی را وارد کن (مثال: 09123456789).")
         return True
     if step == "phone":
         digits = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
@@ -321,6 +407,7 @@ async def handle_checkout_text(api, msg, uid, chat_id, text):
             await api.send(chat_id, "❌ شماره معتبر نیست. شماره را به شکل 09123456789 وارد کن.")
             return True
         state["phone"] = phone
+        await asyncio.to_thread(db_save_data, uid, "phone", phone)
         state["step"] = "gender"
         await api.send(chat_id, "جنسیت را انتخاب کن:", {"keyboard": [[{"text": "مرد"}, {"text": "زن"}], [{"text": "/cancel"}]], "resize_keyboard": True})
         return True
@@ -330,7 +417,11 @@ async def handle_checkout_text(api, msg, uid, chat_id, text):
             return True
         state["gender"] = text
         state["step"] = "address"
-        await api.send(chat_id, "📍 آدرس کامل پستی، شهر و کدپستی را وارد کن.")
+        saved = await asyncio.to_thread(db_saved_data, uid, "address")
+        if saved:
+            await api.send(chat_id, "📍 آدرس ارسال را انتخاب کن یا آدرس جدید وارد کن:", await asyncio.to_thread(saved_keyboard, uid, "address", "address"))
+        else:
+            await api.send(chat_id, "📍 آدرس کامل پستی، شهر و کدپستی را وارد کن.")
         return True
     if step == "address":
         address = re.sub(r"\s+", " ", text).strip()
@@ -338,6 +429,7 @@ async def handle_checkout_text(api, msg, uid, chat_id, text):
             await api.send(chat_id, "❌ آدرس خیلی کوتاه است. لطفاً آدرس کامل‌تری وارد کن.")
             return True
         state["address"] = address
+        await asyncio.to_thread(db_save_data, uid, "address", address)
         try:
             pending, bank = await asyncio.to_thread(db_create_pending, uid, state["full_name"], state["phone"], state["gender"], address, (msg.get("from") or {}).get("username", ""))
         except Exception:
@@ -479,6 +571,74 @@ async def on_callback(api, cb):
         elif data == "checkout:start":
             await api.answer(cbid)
             await start_checkout(api, chat_id, uid)
+        elif data.startswith("saved:"):
+            parts = data.split(":")
+            action = parts[1]
+            if action == "use":
+                _, _, step, row_id = parts
+                data_type = step
+                rows = await asyncio.to_thread(db_saved_data, uid, data_type)
+                row = next((r for r in rows if int(r["id"]) == int(row_id)), None)
+                if not row or uid not in CHECKOUT:
+                    await api.answer(cbid, "اطلاعات پیدا نشد یا مرحله سفارش منقضی شده است.", True); return
+                state = CHECKOUT[uid]
+                value = str(row["value"])
+                if step == "name":
+                    state["full_name"] = value; state["step"] = "phone"
+                    saved = await asyncio.to_thread(db_saved_data, uid, "phone")
+                    await api.answer(cbid, "نام انتخاب شد.")
+                    if saved: await api.send(chat_id, "📱 شماره موبایل را انتخاب کن یا شماره جدید وارد کن:", await asyncio.to_thread(saved_keyboard, uid, "phone", "phone"))
+                    else: await api.send(chat_id, "📱 شماره موبایل ایرانی را وارد کن (مثال: 09123456789).")
+                elif step == "phone":
+                    state["phone"] = value; state["step"] = "gender"
+                    await api.answer(cbid, "شماره انتخاب شد.")
+                    await api.send(chat_id, "جنسیت را انتخاب کن:", {"keyboard": [[{"text": "مرد"}, {"text": "زن"}], [{"text": "/cancel"}]], "resize_keyboard": True})
+                elif step == "address":
+                    state["address"] = value
+                    await api.answer(cbid, "آدرس انتخاب شد.")
+                    try:
+                        pending, bank = await asyncio.to_thread(db_create_pending, uid, state["full_name"], state["phone"], state["gender"], value, (msg.get("from") or {}).get("username", ""))
+                    except Exception:
+                        log.exception("Could not create pending payment for Bale user %s", uid)
+                        await api.send(chat_id, "⚠️ ثبت سفارش انجام نشد؛ لطفاً کمی بعد دوباره تلاش کن.", main_keyboard()); CHECKOUT.pop(uid, None); return
+                    CHECKOUT.pop(uid, None)
+                    await api.send(chat_id, "اطلاعات ذخیره‌شده استفاده شد.")
+                    await send_payment_instructions(api, chat_id, pending, bank)
+            elif action == "new":
+                step = parts[2]
+                if uid not in CHECKOUT:
+                    await api.answer(cbid, "مرحله سفارش منقضی شده است. دوباره ثبت سفارش را بزن.", True); return
+                CHECKOUT[uid]["step"] = step
+                await api.answer(cbid)
+                prompts = {"name":"👤 نام و نام خانوادگی را وارد کن:", "phone":"📱 شماره موبایل را وارد کن (مثال: 09123456789):", "address":"📍 آدرس کامل پستی، شهر و کدپستی را وارد کن:"}
+                await api.send(chat_id, prompts.get(step, "اطلاعات جدید را وارد کن:"))
+            elif action == "manage":
+                data_type = parts[2]
+                rows = await asyncio.to_thread(db_saved_data, uid, data_type)
+                buttons=[]
+                for row in rows[:8]:
+                    label=str(row["value"]); label=label if len(label)<=25 else label[:22]+"..."
+                    buttons.append([{"text":"✏️ "+label,"callback_data":f"saved:edit:{data_type}:{row['id']}"}, {"text":"🗑","callback_data":f"saved:delete:{data_type}:{row['id']}"}])
+                buttons.append([{"text":"بازگشت","callback_data":f"saved:back:{data_type}"}])
+                await api.answer(cbid)
+                await api.send(chat_id, "برای ویرایش یا حذف، گزینه مربوط را انتخاب کن:", {"inline_keyboard":buttons})
+            elif action == "delete":
+                data_type, row_id = parts[2], int(parts[3])
+                await asyncio.to_thread(db_delete_saved, uid, row_id, data_type)
+                await api.answer(cbid, "اطلاعات حذف شد.")
+                await api.send(chat_id, "اطلاعات ذخیره‌شده به‌روزرسانی شد.", main_keyboard())
+            elif action == "edit":
+                data_type, row_id = parts[2], int(parts[3])
+                CHECKOUT[uid] = {"step": "edit_saved", "edit_type": data_type, "edit_id": row_id}
+                await api.answer(cbid)
+                labels={"name":"نام و نام خانوادگی جدید را وارد کن:","phone":"شماره موبایل جدید را وارد کن:","address":"آدرس جدید را وارد کن:"}
+                await api.send(chat_id, labels.get(data_type,"مقدار جدید را وارد کن:"))
+            elif action == "back":
+                data_type=parts[2]
+                await api.answer(cbid)
+                await api.send(chat_id, "اطلاعات ذخیره‌شده:", await asyncio.to_thread(saved_keyboard, uid, data_type, data_type))
+            else:
+                await api.answer(cbid)
         elif data.startswith("pay:receipt:"):
             await api.answer(cbid)
             await api.send(chat_id, "📤 لطفاً عکس رسید بانکی را به‌صورت عکس در همین گفتگو ارسال کن. بهتر است شماره پیگیری و مبلغ خوانا باشند.")
