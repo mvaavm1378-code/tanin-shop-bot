@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Bale catalog/cart bot using the same Supabase PostgreSQL database as the Telegram shop bot.
+Runs long polling plus a small HTTP health endpoint for Render Web Service.
 
 Install: pip install aiohttp "psycopg[binary]"
 Environment: BALE_BOT_TOKEN and SUPABASE_DB_URL (or DATABASE_URL)
@@ -308,6 +309,11 @@ async def on_callback(api, cb):
         await api.answer(cbid, "خطا رخ داد؛ دوباره تلاش کن.", True)
 
 
+async def health(request):
+    """Render health endpoint; does not expose secrets or database details."""
+    return aiohttp.web.json_response({"service": "tanin-bale-bot", "status": "ok"})
+
+
 async def main():
     if not TOKEN:
         raise RuntimeError("متغیر BALE_BOT_TOKEN تنظیم نشده است.")
@@ -328,29 +334,52 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=40)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         api = BaleAPI(session)
+
+        # This version uses long polling (getUpdates), not a webhook.
+        # Remove a webhook left by an earlier deployment so polling can work.
+        try:
+            await api.call("deleteWebhook", {"drop_pending_updates": False})
+            log.info("Bale webhook cleared for polling.")
+        except Exception:
+            # Keep going; the polling log will make any webhook conflict visible.
+            log.warning("Could not clear a previous Bale webhook; polling may conflict.", exc_info=True)
+
+        app = aiohttp.web.Application()
+        app.router.add_get("/", health)
+        app.router.add_get("/health", health)
+        runner = aiohttp.web.AppRunner(app)
+        await runner.setup()
+        port = int(os.environ.get("PORT", "10000"))
+        site = aiohttp.web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        log.info("Health server listening on port %s", port)
+
         offset = None
         log.info("Bale catalog bot started.")
-        while True:
-            try:
-                payload = {"timeout": POLL_TIMEOUT,
-                           "allowed_updates": ["message", "callback_query"]}
-                if offset is not None:
-                    payload["offset"] = offset
-                updates = await api.call("getUpdates", payload)
-                for upd in updates or []:
-                    offset = upd["update_id"] + 1
-                    try:
-                        if upd.get("message"):
-                            await on_message(api, upd["message"])
-                        elif upd.get("callback_query"):
-                            await on_callback(api, upd["callback_query"])
-                    except Exception:
-                        log.exception("Update failed: %s", upd.get("update_id"))
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Polling error; retrying in 4 seconds")
-                await asyncio.sleep(4)
+        try:
+            while True:
+                try:
+                    payload = {"timeout": POLL_TIMEOUT,
+                               "allowed_updates": ["message", "callback_query"]}
+                    if offset is not None:
+                        payload["offset"] = offset
+                    updates = await api.call("getUpdates", payload)
+                    for upd in updates or []:
+                        offset = upd["update_id"] + 1
+                        try:
+                            if upd.get("message"):
+                                await on_message(api, upd["message"])
+                            elif upd.get("callback_query"):
+                                await on_callback(api, upd["callback_query"])
+                        except Exception:
+                            log.exception("Update failed: %s", upd.get("update_id"))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Polling error; retrying in 4 seconds")
+                    await asyncio.sleep(4)
+        finally:
+            await runner.cleanup()
 
 
 if __name__ == "__main__":
