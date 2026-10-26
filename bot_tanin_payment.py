@@ -301,7 +301,7 @@ def admin_menu_counts():
             "SELECT COUNT(*) AS n FROM products WHERE active=TRUE"
         ).fetchone()["n"]
         tickets = conn.execute(
-            "SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('new','admin_waiting')"
+            "SELECT COUNT(*) AS n FROM support_tickets WHERE user_id > 0 AND status IN ('new','admin_waiting')"
         ).fetchone()["n"]
         return {"orders": orders or 0, "payments": payments or 0,
                 "products": products or 0, "tickets": tickets or 0}
@@ -1813,7 +1813,7 @@ async def support_ticket_detail(q, ticket_id, is_admin_view=False):
         t=conn.execute("""SELECT t.*, c.full_name, c.username
                            FROM support_tickets t
                            LEFT JOIN customers c ON c.user_id=t.user_id
-                           WHERE t.id=%s""", (ticket_id,)).fetchone()
+                           WHERE t.id=%s AND t.user_id > 0""", (ticket_id,)).fetchone()
     else:
         t=conn.execute("SELECT * FROM support_tickets WHERE id=%s AND user_id=%s", (ticket_id,q.from_user.id)).fetchone()
     msgs=conn.execute("SELECT * FROM support_ticket_messages WHERE ticket_id=%s ORDER BY id ASC", (ticket_id,)).fetchall() if t else []
@@ -1887,19 +1887,19 @@ async def admin_dashboard_stats():
     conn = get_conn()
     try:
         pending = conn.execute(
-            "SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی'"
+            "SELECT COUNT(*) AS n FROM pending_payments WHERE user_id > 0 AND payment_status='در انتظار بررسی'"
         ).fetchone()["n"]
         orders = conn.execute(
-            "SELECT COUNT(*) AS n FROM orders WHERE status='در انتظار بررسی'"
+            "SELECT COUNT(*) AS n FROM orders WHERE user_id > 0 AND status='در انتظار بررسی'"
         ).fetchone()["n"]
         tickets = conn.execute(
-            "SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('new','admin_waiting')"
+            "SELECT COUNT(*) AS n FROM support_tickets WHERE user_id > 0 AND status IN ('new','admin_waiting')"
         ).fetchone()["n"]
         products = conn.execute(
             "SELECT COUNT(*) AS n FROM products WHERE active=TRUE"
         ).fetchone()["n"]
         customers = conn.execute(
-            "SELECT COUNT(*) AS n FROM customers"
+            "SELECT COUNT(*) AS n FROM customers WHERE user_id > 0"
         ).fetchone()["n"]
         return {
             "pending": pending or 0,
@@ -2042,10 +2042,10 @@ def products_keyboard(rows):
 async def admin_tickets_view(q, status_filter="all"):
     conn=get_conn()
     if status_filter=="all":
-        rows=conn.execute("SELECT t.*, c.username, c.full_name FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id ORDER BY t.id DESC LIMIT 50").fetchall()
+        rows=conn.execute("SELECT t.*, c.username, c.full_name FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id WHERE t.user_id > 0 ORDER BY t.id DESC LIMIT 50").fetchall()
     else:
-        rows=conn.execute("SELECT t.*, c.username, c.full_name FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id WHERE t.status=%s ORDER BY t.id DESC LIMIT 50",(status_filter,)).fetchall()
-    counts=conn.execute("SELECT status, COUNT(*) AS n FROM support_tickets GROUP BY status").fetchall()
+        rows=conn.execute("SELECT t.*, c.username, c.full_name FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id WHERE t.user_id > 0 AND t.status=%s ORDER BY t.id DESC LIMIT 50",(status_filter,)).fetchall()
+    counts=conn.execute("SELECT status, COUNT(*) AS n FROM support_tickets WHERE user_id > 0 GROUP BY status").fetchall()
     conn.close()
     count={r['status']:r['n'] for r in counts}
     buttons=[]
@@ -2111,7 +2111,7 @@ async def admin_pending_payments_view(q):
     conn = get_conn()
     rows = conn.execute(
         """SELECT * FROM pending_payments
-           WHERE payment_status='در انتظار بررسی'
+           WHERE user_id > 0 AND payment_status='در انتظار بررسی'
            ORDER BY id DESC LIMIT 50"""
     ).fetchall()
     conn.close()
@@ -2152,7 +2152,7 @@ async def admin_pending_payments_view(q):
 async def admin_pending_payment_detail(q, pending_id):
     conn = get_conn()
     pending = conn.execute(
-        "SELECT * FROM pending_payments WHERE id=%s", (pending_id,)
+        "SELECT * FROM pending_payments WHERE id=%s AND user_id > 0", (pending_id,)
     ).fetchone()
     conn.close()
 
@@ -2189,7 +2189,7 @@ async def admin_pending_payment_detail(q, pending_id):
 async def admin_pending_payment_receipt(q, context, pending_id):
     conn = get_conn()
     pending = conn.execute(
-        "SELECT * FROM pending_payments WHERE id=%s", (pending_id,)
+        "SELECT * FROM pending_payments WHERE id=%s AND user_id > 0", (pending_id,)
     ).fetchone()
     conn.close()
 
@@ -2240,15 +2240,15 @@ async def admin_orders_view(q, mode="all"):
     conn = get_conn()
     if mode == "new":
         rows = conn.execute(
-            "SELECT * FROM orders WHERE status='در انتظار بررسی' ORDER BY id DESC LIMIT 30"
+            "SELECT * FROM orders WHERE user_id > 0 AND status='در انتظار بررسی' ORDER BY id DESC LIMIT 30"
         ).fetchall()
     elif mode == "active":
         rows = conn.execute(
-            "SELECT * FROM orders WHERE status!='رد شد' ORDER BY id DESC LIMIT 30"
+            "SELECT * FROM orders WHERE user_id > 0 AND status!='رد شد' ORDER BY id DESC LIMIT 30"
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM orders ORDER BY id DESC LIMIT 30"
+            "SELECT * FROM orders WHERE user_id > 0 ORDER BY id DESC LIMIT 30"
         ).fetchall()
     conn.close()
 
@@ -2284,17 +2284,17 @@ async def admin_orders_view(q, mode="all"):
 
 async def admin_sales_view(q):
     conn = get_conn()
-    total_orders = conn.execute("SELECT COUNT(*) AS value FROM orders").fetchone()["value"]
+    total_orders = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE user_id > 0").fetchone()["value"]
     valid_revenue = conn.execute(
-        "SELECT COALESCE(SUM(total_price),0) AS value FROM orders WHERE status!='رد شد'"
+        "SELECT COALESCE(SUM(total_price),0) AS value FROM orders WHERE user_id > 0 AND status!='رد شد'"
     ).fetchone()["value"]
     confirmed_revenue = conn.execute(
-        "SELECT COALESCE(SUM(total_price),0) AS value FROM orders WHERE status='تأیید شد'"
+        "SELECT COALESCE(SUM(total_price),0) AS value FROM orders WHERE user_id > 0 AND status='تأیید شد'"
     ).fetchone()["value"]
-    pending = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE status='در انتظار بررسی'").fetchone()["value"]
-    confirmed = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE status='تأیید شد'").fetchone()["value"]
-    cancelled = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE status='رد شد'").fetchone()["value"]
-    customers = conn.execute("SELECT COUNT(*) AS value FROM customers").fetchone()["value"]
+    pending = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE user_id > 0 AND status='در انتظار بررسی'").fetchone()["value"]
+    confirmed = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE user_id > 0 AND status='تأیید شد'").fetchone()["value"]
+    cancelled = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE user_id > 0 AND status='رد شد'").fetchone()["value"]
+    customers = conn.execute("SELECT COUNT(*) AS value FROM customers WHERE user_id > 0").fetchone()["value"]
     products = conn.execute("SELECT COUNT(*) AS value FROM products WHERE active=TRUE").fetchone()["value"]
     conn.close()
 
@@ -2323,7 +2323,8 @@ async def admin_customers_view(q):
                   COUNT(o.id) AS orders_count,
                   COALESCE(SUM(CASE WHEN o.status!='رد شد' THEN o.total_price ELSE 0 END),0) AS spent
            FROM customers c
-           LEFT JOIN orders o ON o.user_id=c.user_id
+           LEFT JOIN orders o ON o.user_id=c.user_id AND o.user_id > 0
+           WHERE c.user_id > 0
            GROUP BY c.user_id
            ORDER BY orders_count DESC, c.last_seen DESC
            LIMIT 30"""
@@ -2354,9 +2355,9 @@ async def admin_customers_view(q):
 
 async def admin_customer_detail(q, user_id):
     conn = get_conn()
-    c = conn.execute("SELECT * FROM customers WHERE user_id=%s", (user_id,)).fetchone()
+    c = conn.execute("SELECT * FROM customers WHERE user_id=%s AND user_id > 0", (user_id,)).fetchone()
     orders = conn.execute(
-        "SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 10", (user_id,)
+        "SELECT * FROM orders WHERE user_id=%s AND user_id > 0 ORDER BY id DESC LIMIT 10", (user_id,)
     ).fetchall()
     conn.close()
     if not c:
@@ -2594,7 +2595,7 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
         # Lock the payment row so two administrators cannot approve/reject it concurrently.
         with conn.transaction():
             pending = conn.execute(
-                "SELECT * FROM pending_payments WHERE id=%s FOR UPDATE", (pid,)
+                "SELECT * FROM pending_payments WHERE id=%s AND user_id > 0 FOR UPDATE", (pid,)
             ).fetchone()
             if not pending:
                 result = "missing"
@@ -2735,7 +2736,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "ticket_close":
         ticket_id=int(parts[2]); now=iran_now_naive().strftime("%Y-%m-%d %H:%M")
-        conn=get_conn(); t=conn.execute("SELECT user_id FROM support_tickets WHERE id=%s",(ticket_id,)).fetchone(); conn.execute("UPDATE support_tickets SET status='closed', closed_at=%s, updated_at=%s WHERE id=%s",(now,now,ticket_id)); conn.commit(); conn.close()
+        conn=get_conn(); t=conn.execute("SELECT user_id FROM support_tickets WHERE id=%s AND user_id > 0",(ticket_id,)).fetchone()
+        if t:
+            conn.execute("UPDATE support_tickets SET status='closed', closed_at=%s, updated_at=%s WHERE id=%s AND user_id > 0",(now,now,ticket_id)); conn.commit()
+        conn.close()
         if t:
             try: await context.bot.send_message(t['user_id'],f"🟢 تیکت پشتیبانی #{ticket_id} بسته شد. اگر دوباره نیاز به کمک داشتی، می‌تونی درخواست جدید ثبت کنی.")
             except Exception: pass
@@ -2977,7 +2981,7 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ticket_id = int(support_flow["ticket_id"])
             sender_type = "admin" if support_flow["type"] == "admin_reply" else "customer"
             conn = get_conn()
-            t = conn.execute("SELECT * FROM support_tickets WHERE id=%s", (ticket_id,)).fetchone()
+            t = conn.execute("SELECT * FROM support_tickets WHERE id=%s AND user_id > 0", (ticket_id,)).fetchone()
             if not t or (sender_type == "customer" and t["user_id"] != user_id) or t["status"] == "closed":
                 conn.close()
                 context.user_data.pop("support_flow", None)
@@ -2990,7 +2994,7 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             new_status = "customer_waiting" if sender_type == "admin" else "admin_waiting"
             conn.execute(
-                "UPDATE support_tickets SET status=%s,updated_at=%s WHERE id=%s",
+                "UPDATE support_tickets SET status=%s,updated_at=%s WHERE id=%s AND user_id > 0",
                 (new_status, now, ticket_id),
             )
             conn.commit()
@@ -3233,7 +3237,7 @@ async def order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_id = int(parts[2])
 
     conn = get_conn()
-    order = conn.execute("SELECT * FROM orders WHERE id=%s", (order_id,)).fetchone()
+    order = conn.execute("SELECT * FROM orders WHERE id=%s AND user_id > 0", (order_id,)).fetchone()
     if not order:
         conn.close()
         await q.answer("سفارش پیدا نشد.", show_alert=True)
@@ -3259,9 +3263,9 @@ async def order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     old_status = order["status"]
-    conn.execute("UPDATE orders SET status=%s WHERE id=%s", (new_status, order_id))
+    conn.execute("UPDATE orders SET status=%s WHERE id=%s AND user_id > 0", (new_status, order_id))
     conn.commit()
-    order = conn.execute("SELECT * FROM orders WHERE id=%s", (order_id,)).fetchone()
+    order = conn.execute("SELECT * FROM orders WHERE id=%s AND user_id > 0", (order_id,)).fetchone()
     conn.close()
 
     await q.answer(f"وضعیت سفارش #{order_id}: {new_status}")
