@@ -15,7 +15,6 @@ import psycopg
 from psycopg.rows import dict_row
 import logging
 import json
-import hmac
 import re
 import random
 from html import escape
@@ -301,7 +300,7 @@ def admin_menu_counts():
             "SELECT COUNT(*) AS n FROM products WHERE active=TRUE"
         ).fetchone()["n"]
         tickets = conn.execute(
-            "SELECT COUNT(*) AS n FROM support_tickets WHERE user_id > 0 AND status IN ('new','admin_waiting')"
+            "SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('new','admin_waiting')"
         ).fetchone()["n"]
         return {"orders": orders or 0, "payments": payments or 0,
                 "products": products or 0, "tickets": tickets or 0}
@@ -1189,10 +1188,9 @@ def set_known_gender(user_id, full_name, gender):
 
 
 async def go_to_address_step(message, context, user_id, ack_text):
-    """رفتن به مرحله آدرس؛ ابتدا کیبورد قبلی را صریحاً حذف می‌کند."""
-    # Reply keyboards persist unless explicitly removed; remove gender/phone buttons first.
-    await message.reply_text(ack_text, reply_markup=ReplyKeyboardRemove())
+    """رفتن به مرحله آدرس؛ کیبورد قبلی (مرد/زن یا شماره موبایل) هم جمع می‌شود."""
     if get_saved_data(user_id, "address"):
+        await message.reply_text(ack_text, reply_markup=ReplyKeyboardRemove())
         await show_saved_step(message, context, "address")
         return ASK_ADDRESS
     await message.reply_text("آدرس کامل برای ارسال رو بفرست:", reply_markup=address_input_keyboard())
@@ -1488,6 +1486,54 @@ async def send_order_sms_to_admin(pending_id, full_name, phone, total_price, ite
         return False
 
 
+def _order_sms_marker_key(pending_id):
+    return f"order_sms_sent:{int(pending_id)}"
+
+
+def _order_sms_was_sent(pending_id):
+    """Read a shared app_meta marker so Telegram and Bale don't alert twice."""
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM app_meta WHERE key=%s",
+                (_order_sms_marker_key(pending_id),),
+            ).fetchone()
+        return row is not None
+    except Exception:
+        # SMS should still be attempted if the marker lookup fails.
+        logger.exception("Could not check SMS marker for pending payment #%s", pending_id)
+        return False
+
+
+def _mark_order_sms_sent(pending_id, platform):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO app_meta(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING",
+            (_order_sms_marker_key(pending_id), f"{platform}:{datetime.now(IRAN_TZ).isoformat()}"),
+        )
+        conn.commit()
+
+
+async def send_order_sms_once(pending_id, full_name, phone, total_price, items_summary, platform="telegram"):
+    """Send one admin SMS per pending-payment row; retry if a previous attempt failed."""
+    if await asyncio.to_thread(_order_sms_was_sent, pending_id):
+        logger.info("ORDER SMS SKIPPED for #%s: already marked sent", pending_id)
+        return True
+    sent = await send_order_sms_to_admin(
+        pending_id=pending_id,
+        full_name=full_name,
+        phone=phone,
+        total_price=total_price,
+        items_summary=items_summary,
+    )
+    if sent:
+        try:
+            await asyncio.to_thread(_mark_order_sms_sent, pending_id, platform)
+        except Exception:
+            logger.exception("SMS was accepted but marker write failed for #%s", pending_id)
+    return sent
+
+
 async def create_pending_payment(message, context, user=None):
     user_id = message.chat_id
     username = (user.username if user is not None else message.from_user.username) or ""
@@ -1536,6 +1582,16 @@ async def create_pending_payment(message, context, user=None):
             pending = dict(pending)
             pending["total_price"] = total
         conn.close()
+        # If this pending payment was created before SMS configuration was fixed,
+        # retry the admin alert. app_meta prevents repeated SMS after success.
+        await send_order_sms_once(
+            pending_id=pending["id"],
+            full_name=full_name,
+            phone=phone,
+            total_price=total,
+            items_summary=summary,
+            platform="telegram",
+        )
         for key in ("full_name", "phone", "address", "gender"):
             context.user_data.pop(key, None)
         await show_payment_instructions(message, pending)
@@ -1553,12 +1609,13 @@ async def create_pending_payment(message, context, user=None):
     conn.close()
 
     # اطلاع‌رسانی پیامکی به مدیر؛ در صورت خطا، ثبت سفارش ادامه پیدا می‌کند.
-    await send_order_sms_to_admin(
+    await send_order_sms_once(
         pending_id=pending_id,
         full_name=full_name,
         phone=phone,
         total_price=total,
         items_summary=summary,
+        platform="telegram",
     )
 
     context.user_data.pop("full_name", None)
@@ -1814,7 +1871,7 @@ async def support_ticket_detail(q, ticket_id, is_admin_view=False):
         t=conn.execute("""SELECT t.*, c.full_name, c.username
                            FROM support_tickets t
                            LEFT JOIN customers c ON c.user_id=t.user_id
-                           WHERE t.id=%s AND t.user_id > 0""", (ticket_id,)).fetchone()
+                           WHERE t.id=%s""", (ticket_id,)).fetchone()
     else:
         t=conn.execute("SELECT * FROM support_tickets WHERE id=%s AND user_id=%s", (ticket_id,q.from_user.id)).fetchone()
     msgs=conn.execute("SELECT * FROM support_ticket_messages WHERE ticket_id=%s ORDER BY id ASC", (ticket_id,)).fetchall() if t else []
@@ -1888,19 +1945,19 @@ async def admin_dashboard_stats():
     conn = get_conn()
     try:
         pending = conn.execute(
-            "SELECT COUNT(*) AS n FROM pending_payments WHERE user_id > 0 AND payment_status='در انتظار بررسی'"
+            "SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی'"
         ).fetchone()["n"]
         orders = conn.execute(
-            "SELECT COUNT(*) AS n FROM orders WHERE user_id > 0 AND status='در انتظار بررسی'"
+            "SELECT COUNT(*) AS n FROM orders WHERE status='در انتظار بررسی'"
         ).fetchone()["n"]
         tickets = conn.execute(
-            "SELECT COUNT(*) AS n FROM support_tickets WHERE user_id > 0 AND status IN ('new','admin_waiting')"
+            "SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('new','admin_waiting')"
         ).fetchone()["n"]
         products = conn.execute(
             "SELECT COUNT(*) AS n FROM products WHERE active=TRUE"
         ).fetchone()["n"]
         customers = conn.execute(
-            "SELECT COUNT(*) AS n FROM customers WHERE user_id > 0"
+            "SELECT COUNT(*) AS n FROM customers"
         ).fetchone()["n"]
         return {
             "pending": pending or 0,
@@ -2043,10 +2100,10 @@ def products_keyboard(rows):
 async def admin_tickets_view(q, status_filter="all"):
     conn=get_conn()
     if status_filter=="all":
-        rows=conn.execute("SELECT t.*, c.username, c.full_name FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id WHERE t.user_id > 0 ORDER BY t.id DESC LIMIT 50").fetchall()
+        rows=conn.execute("SELECT t.*, c.username, c.full_name FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id ORDER BY t.id DESC LIMIT 50").fetchall()
     else:
-        rows=conn.execute("SELECT t.*, c.username, c.full_name FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id WHERE t.user_id > 0 AND t.status=%s ORDER BY t.id DESC LIMIT 50",(status_filter,)).fetchall()
-    counts=conn.execute("SELECT status, COUNT(*) AS n FROM support_tickets WHERE user_id > 0 GROUP BY status").fetchall()
+        rows=conn.execute("SELECT t.*, c.username, c.full_name FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id WHERE t.status=%s ORDER BY t.id DESC LIMIT 50",(status_filter,)).fetchall()
+    counts=conn.execute("SELECT status, COUNT(*) AS n FROM support_tickets GROUP BY status").fetchall()
     conn.close()
     count={r['status']:r['n'] for r in counts}
     buttons=[]
@@ -2112,7 +2169,7 @@ async def admin_pending_payments_view(q):
     conn = get_conn()
     rows = conn.execute(
         """SELECT * FROM pending_payments
-           WHERE user_id > 0 AND payment_status='در انتظار بررسی'
+           WHERE payment_status='در انتظار بررسی'
            ORDER BY id DESC LIMIT 50"""
     ).fetchall()
     conn.close()
@@ -2153,7 +2210,7 @@ async def admin_pending_payments_view(q):
 async def admin_pending_payment_detail(q, pending_id):
     conn = get_conn()
     pending = conn.execute(
-        "SELECT * FROM pending_payments WHERE id=%s AND user_id > 0", (pending_id,)
+        "SELECT * FROM pending_payments WHERE id=%s", (pending_id,)
     ).fetchone()
     conn.close()
 
@@ -2190,7 +2247,7 @@ async def admin_pending_payment_detail(q, pending_id):
 async def admin_pending_payment_receipt(q, context, pending_id):
     conn = get_conn()
     pending = conn.execute(
-        "SELECT * FROM pending_payments WHERE id=%s AND user_id > 0", (pending_id,)
+        "SELECT * FROM pending_payments WHERE id=%s", (pending_id,)
     ).fetchone()
     conn.close()
 
@@ -2241,15 +2298,15 @@ async def admin_orders_view(q, mode="all"):
     conn = get_conn()
     if mode == "new":
         rows = conn.execute(
-            "SELECT * FROM orders WHERE user_id > 0 AND status='در انتظار بررسی' ORDER BY id DESC LIMIT 30"
+            "SELECT * FROM orders WHERE status='در انتظار بررسی' ORDER BY id DESC LIMIT 30"
         ).fetchall()
     elif mode == "active":
         rows = conn.execute(
-            "SELECT * FROM orders WHERE user_id > 0 AND status!='رد شد' ORDER BY id DESC LIMIT 30"
+            "SELECT * FROM orders WHERE status!='رد شد' ORDER BY id DESC LIMIT 30"
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM orders WHERE user_id > 0 ORDER BY id DESC LIMIT 30"
+            "SELECT * FROM orders ORDER BY id DESC LIMIT 30"
         ).fetchall()
     conn.close()
 
@@ -2285,17 +2342,17 @@ async def admin_orders_view(q, mode="all"):
 
 async def admin_sales_view(q):
     conn = get_conn()
-    total_orders = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE user_id > 0").fetchone()["value"]
+    total_orders = conn.execute("SELECT COUNT(*) AS value FROM orders").fetchone()["value"]
     valid_revenue = conn.execute(
-        "SELECT COALESCE(SUM(total_price),0) AS value FROM orders WHERE user_id > 0 AND status!='رد شد'"
+        "SELECT COALESCE(SUM(total_price),0) AS value FROM orders WHERE status!='رد شد'"
     ).fetchone()["value"]
     confirmed_revenue = conn.execute(
-        "SELECT COALESCE(SUM(total_price),0) AS value FROM orders WHERE user_id > 0 AND status='تأیید شد'"
+        "SELECT COALESCE(SUM(total_price),0) AS value FROM orders WHERE status='تأیید شد'"
     ).fetchone()["value"]
-    pending = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE user_id > 0 AND status='در انتظار بررسی'").fetchone()["value"]
-    confirmed = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE user_id > 0 AND status='تأیید شد'").fetchone()["value"]
-    cancelled = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE user_id > 0 AND status='رد شد'").fetchone()["value"]
-    customers = conn.execute("SELECT COUNT(*) AS value FROM customers WHERE user_id > 0").fetchone()["value"]
+    pending = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE status='در انتظار بررسی'").fetchone()["value"]
+    confirmed = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE status='تأیید شد'").fetchone()["value"]
+    cancelled = conn.execute("SELECT COUNT(*) AS value FROM orders WHERE status='رد شد'").fetchone()["value"]
+    customers = conn.execute("SELECT COUNT(*) AS value FROM customers").fetchone()["value"]
     products = conn.execute("SELECT COUNT(*) AS value FROM products WHERE active=TRUE").fetchone()["value"]
     conn.close()
 
@@ -2324,8 +2381,7 @@ async def admin_customers_view(q):
                   COUNT(o.id) AS orders_count,
                   COALESCE(SUM(CASE WHEN o.status!='رد شد' THEN o.total_price ELSE 0 END),0) AS spent
            FROM customers c
-           LEFT JOIN orders o ON o.user_id=c.user_id AND o.user_id > 0
-           WHERE c.user_id > 0
+           LEFT JOIN orders o ON o.user_id=c.user_id
            GROUP BY c.user_id
            ORDER BY orders_count DESC, c.last_seen DESC
            LIMIT 30"""
@@ -2356,9 +2412,9 @@ async def admin_customers_view(q):
 
 async def admin_customer_detail(q, user_id):
     conn = get_conn()
-    c = conn.execute("SELECT * FROM customers WHERE user_id=%s AND user_id > 0", (user_id,)).fetchone()
+    c = conn.execute("SELECT * FROM customers WHERE user_id=%s", (user_id,)).fetchone()
     orders = conn.execute(
-        "SELECT * FROM orders WHERE user_id=%s AND user_id > 0 ORDER BY id DESC LIMIT 10", (user_id,)
+        "SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 10", (user_id,)
     ).fetchall()
     conn.close()
     if not c:
@@ -2568,119 +2624,45 @@ async def mark_admin_message(q, suffix_html):
 
 
 async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Review a payment exactly once, locking its row until the DB transaction finishes."""
     q = update.callback_query
-    if not q or not q.from_user or not is_admin(q.from_user.id):
-        if q:
-            await q.answer("دسترسی نداری.", show_alert=True)
-        return
-
-    parts = (q.data or "").split(":")
-    if len(parts) != 3 or parts[0] != "payadmin" or parts[1] not in {"approve", "reject"}:
-        await q.answer("درخواست نامعتبر است.", show_alert=True)
-        return
-    try:
-        pid = int(parts[2])
-        if pid <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        await q.answer("شناسه پرداخت نامعتبر است.", show_alert=True)
-        return
-
-    action = parts[1]
-    now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
+    if not is_admin(q.from_user.id):
+        await q.answer("دسترسی نداری.", show_alert=True); return
+    parts = q.data.split(":")
+    pid = int(parts[2]); action = parts[1]
     conn = get_conn()
-    pending = None
-    order_id = None
-    try:
-        # Lock the payment row so two administrators cannot approve/reject it concurrently.
-        with conn.transaction():
-            pending = conn.execute(
-                "SELECT * FROM pending_payments WHERE id=%s AND user_id > 0 FOR UPDATE", (pid,)
-            ).fetchone()
-            if not pending:
-                result = "missing"
-            elif pending["payment_status"] != "در انتظار بررسی":
-                result = "already_reviewed"
-            elif action == "reject":
-                conn.execute(
-                    """UPDATE pending_payments
-                       SET payment_status='رد شد', reviewed_at=%s, admin_id=%s
-                       WHERE id=%s AND payment_status='در انتظار بررسی'""",
-                    (now, q.from_user.id, pid),
-                )
-                result = "rejected"
-            else:
-                cur = conn.execute(
-                    """INSERT INTO orders
-                       (user_id, full_name, phone, address, items_summary, total_price,
-                        status, created_at, finalized_at, payment_status, transaction_ref)
-                       VALUES (%s, %s, %s, %s, %s, %s, 'در انتظار بررسی', %s, %s,
-                               'تأیید شده', %s)
-                       RETURNING id""",
-                    (pending["user_id"], pending["full_name"], pending["phone"],
-                     pending["address"], pending["items_summary"], pending["total_price"],
-                     now, now, f"CARD-TRANSFER-{pid}"),
-                )
-                order_id = cur.fetchone()["id"]
-                conn.execute("DELETE FROM cart_items WHERE user_id=%s", (pending["user_id"],))
-                conn.execute(
-                    """UPDATE pending_payments
-                       SET payment_status='تأیید شده', reviewed_at=%s, admin_id=%s, order_id=%s
-                       WHERE id=%s AND payment_status='در انتظار بررسی'""",
-                    (now, q.from_user.id, order_id, pid),
-                )
-                result = "approved"
-    except Exception:
-        logger.exception("Payment review failed for pending payment #%s", pid)
-        await q.answer("خطا در ثبت بررسی پرداخت؛ تغییری تأیید نشده است.", show_alert=True)
-        return
-    finally:
-        conn.close()
-
-    if result == "missing":
-        await q.answer("پرداخت پیدا نشد.", show_alert=True)
-        return
-    if result == "already_reviewed":
-        await q.answer("این پرداخت قبلاً بررسی شده است.", show_alert=True)
-        return
-    if result == "rejected":
+    pending = conn.execute("SELECT * FROM pending_payments WHERE id=%s", (pid,)).fetchone()
+    if not pending:
+        conn.close(); await q.answer("پرداخت پیدا نشد.", show_alert=True); return
+    if pending['payment_status'] not in ('در انتظار بررسی',):
+        conn.close(); await q.answer("این پرداخت قبلاً بررسی شده است.", show_alert=True); return
+    now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
+    if action == 'reject':
+        conn.execute("UPDATE pending_payments SET payment_status='رد شد', reviewed_at=%s, admin_id=%s WHERE id=%s", (now, q.from_user.id, pid))
+        conn.commit(); conn.close()
         await q.answer("پرداخت رد شد.")
-        try:
-            await context.bot.send_message(
-                pending["user_id"],
-                "❌ رسید پرداخت شما تأیید نشد. سفارش ثبت نشد. لطفاً با پشتیبانی تماس بگیرید.",
-            )
-        except Exception:
-            logger.warning("Could not notify customer after rejecting payment #%s", pid, exc_info=True)
+        try: await context.bot.send_message(pending['user_id'], "❌ رسید پرداخت شما تأیید نشد. سفارش ثبت نشد. لطفاً با پشتیبانی تماس بگیرید.")
+        except Exception: pass
         await mark_admin_message(q, "\n\n❌ <b>پرداخت رد شد</b>")
         return
-
+    # approve: only here is the real order inserted and cart cleared
+    cur = conn.execute("""INSERT INTO orders
+        (user_id, full_name, phone, address, items_summary, total_price, status, created_at, finalized_at, payment_status, transaction_ref)
+        VALUES (%s, %s, %s, %s, %s, %s, 'در انتظار بررسی', %s, %s, 'تأیید شده', %s)
+        RETURNING id""",
+        (pending['user_id'], pending['full_name'], pending['phone'], pending['address'], pending['items_summary'], pending['total_price'], now, now, f"CARD-TRANSFER-{pid}"))
+    order_id = cur.fetchone()["id"]
+    conn.execute("DELETE FROM cart_items WHERE user_id=%s", (pending['user_id'],))
+    conn.execute("UPDATE pending_payments SET payment_status='تأیید شده', reviewed_at=%s, admin_id=%s, order_id=%s WHERE id=%s", (now, q.from_user.id, order_id, pid))
+    conn.commit(); conn.close()
     await q.answer(f"پرداخت تأیید شد؛ سفارش #{order_id} ثبت شد.")
     await mark_admin_message(q, f"\n\n✅ <b>پرداخت تأیید شد — سفارش #{order_id} ثبت شد</b>")
     try:
-        await context.bot.send_message(
-            pending["user_id"],
-            f"✅ پرداخت شما تأیید شد.\n🆔 شماره سفارش: #{order_id}\n"
-            f"💰 مبلغ: {pending['total_price']:,} تومان\nسفارش شما ثبت نهایی شد.",
-        )
-    except Exception:
-        logger.warning("Could not notify customer after approving payment #%s", pid, exc_info=True)
+        await context.bot.send_message(pending['user_id'], f"✅ پرداخت شما تأیید شد.\n🆔 شماره سفارش: #{order_id}\n💰 مبلغ: {pending['total_price']:,} تومان\nسفارش شما ثبت نهایی شد.")
+    except Exception: pass
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(
-                admin_id,
-                f"🔔 <b>سفارش جدید #{order_id}</b>\n"
-                f"👤 {escape(pending['full_name'] or '-')}\n"
-                f"📞 {escape(pending['phone'] or '-')}\n"
-                f"📍 {escape(pending['address'] or '-')}\n\n"
-                f"🛍 {escape(pending['items_summary'] or '-')}\n\n"
-                f"💰 <b>{pending['total_price']:,} تومان</b>",
-                parse_mode="HTML",
-                reply_markup=order_status_keyboard(order_id, 'در انتظار بررسی'),
-            )
-        except Exception:
-            logger.warning("Could not notify admin %s about order #%s", admin_id, order_id, exc_info=True)
+            await context.bot.send_message(admin_id, f"🔔 <b>سفارش جدید #{order_id}</b>\n👤 {escape(pending['full_name'] or '-')}\n📞 {escape(pending['phone'] or '-')}\n📍 {escape(pending['address'] or '-')}\n\n🛍 {escape(pending['items_summary'] or '-')}\n\n💰 <b>{pending['total_price']:,} تومان</b>", parse_mode="HTML", reply_markup=order_status_keyboard(order_id, 'در انتظار بررسی'))
+        except Exception as e: logger.warning(f"Could not notify admin after payment {admin_id}: {e}")
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2737,10 +2719,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "ticket_close":
         ticket_id=int(parts[2]); now=iran_now_naive().strftime("%Y-%m-%d %H:%M")
-        conn=get_conn(); t=conn.execute("SELECT user_id FROM support_tickets WHERE id=%s AND user_id > 0",(ticket_id,)).fetchone()
-        if t:
-            conn.execute("UPDATE support_tickets SET status='closed', closed_at=%s, updated_at=%s WHERE id=%s AND user_id > 0",(now,now,ticket_id)); conn.commit()
-        conn.close()
+        conn=get_conn(); t=conn.execute("SELECT user_id FROM support_tickets WHERE id=%s",(ticket_id,)).fetchone(); conn.execute("UPDATE support_tickets SET status='closed', closed_at=%s, updated_at=%s WHERE id=%s",(now,now,ticket_id)); conn.commit(); conn.close()
         if t:
             try: await context.bot.send_message(t['user_id'],f"🟢 تیکت پشتیبانی #{ticket_id} بسته شد. اگر دوباره نیاز به کمک داشتی، می‌تونی درخواست جدید ثبت کنی.")
             except Exception: pass
@@ -2982,7 +2961,7 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ticket_id = int(support_flow["ticket_id"])
             sender_type = "admin" if support_flow["type"] == "admin_reply" else "customer"
             conn = get_conn()
-            t = conn.execute("SELECT * FROM support_tickets WHERE id=%s AND user_id > 0", (ticket_id,)).fetchone()
+            t = conn.execute("SELECT * FROM support_tickets WHERE id=%s", (ticket_id,)).fetchone()
             if not t or (sender_type == "customer" and t["user_id"] != user_id) or t["status"] == "closed":
                 conn.close()
                 context.user_data.pop("support_flow", None)
@@ -2995,7 +2974,7 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             new_status = "customer_waiting" if sender_type == "admin" else "admin_waiting"
             conn.execute(
-                "UPDATE support_tickets SET status=%s,updated_at=%s WHERE id=%s AND user_id > 0",
+                "UPDATE support_tickets SET status=%s,updated_at=%s WHERE id=%s",
                 (new_status, now, ticket_id),
             )
             conn.commit()
@@ -3238,7 +3217,7 @@ async def order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_id = int(parts[2])
 
     conn = get_conn()
-    order = conn.execute("SELECT * FROM orders WHERE id=%s AND user_id > 0", (order_id,)).fetchone()
+    order = conn.execute("SELECT * FROM orders WHERE id=%s", (order_id,)).fetchone()
     if not order:
         conn.close()
         await q.answer("سفارش پیدا نشد.", show_alert=True)
@@ -3264,9 +3243,9 @@ async def order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     old_status = order["status"]
-    conn.execute("UPDATE orders SET status=%s WHERE id=%s AND user_id > 0", (new_status, order_id))
+    conn.execute("UPDATE orders SET status=%s WHERE id=%s", (new_status, order_id))
     conn.commit()
-    order = conn.execute("SELECT * FROM orders WHERE id=%s AND user_id > 0", (order_id,)).fetchone()
+    order = conn.execute("SELECT * FROM orders WHERE id=%s", (order_id,)).fetchone()
     conn.close()
 
     await q.answer(f"وضعیت سفارش #{order_id}: {new_status}")
@@ -4083,20 +4062,6 @@ async def async_main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    async def clear_selected_inline_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Hide the inline buttons on the message that was just clicked."""
-        query = update.callback_query
-        if not query or not query.message:
-            return
-        try:
-            await query.message.edit_reply_markup(reply_markup=None)
-        except Exception as exc:
-            # Safe when the clicked message has no inline keyboard/already has none.
-            logger.debug("Could not clear clicked inline keyboard: %s", exc)
-
-    # Run before specific callbacks so old buttons disappear, while the selected
-    # callback handler can still render the next screen's buttons.
-    app.add_handler(CallbackQueryHandler(clear_selected_inline_keyboard), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^🧾 کاتالوگ محصولات$"), show_catalog))
     app.add_handler(MessageHandler(filters.Regex("^🛒 سبد خرید$"), show_cart))
@@ -4180,10 +4145,7 @@ async def async_main():
     webhook_url = f"https://{hostname}/{webhook_path}"
     webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
     if not webhook_secret:
-        raise RuntimeError(
-            "WEBHOOK_SECRET is required. Set a strong random secret in Render Environment "
-            "before deploying this version; otherwise Telegram webhook requests cannot be authenticated."
-        )
+        logger.warning("WEBHOOK_SECRET is not set; anyone who knows the webhook URL can send fake updates.")
 
     async def health_handler(request):
         return web.Response(text="Bot is running", status=200, content_type="text/plain")
@@ -4192,7 +4154,7 @@ async def async_main():
         # اگر WEBHOOK_SECRET تنظیم شده باشد، Telegram باید همین secret را بفرستد.
         if webhook_secret:
             received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if not hmac.compare_digest(received, webhook_secret):
+            if received != webhook_secret:
                 return web.Response(status=403, text="Forbidden")
 
         try:
