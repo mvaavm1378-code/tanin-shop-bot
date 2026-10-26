@@ -427,6 +427,69 @@ def _mark_order_sms_sent(pending_id, platform):
         conn.commit()
 
 
+def _sms_norm_phone(value):
+    """Normalize an Iranian mobile number to 09xxxxxxxxx (digits only)."""
+    digits = str(value or "").translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+    digits = re.sub(r"\D+", "", digits)
+    if digits.startswith("0098"):
+        digits = "0" + digits[4:]
+    elif digits.startswith("98") and len(digits) == 12:
+        digits = "0" + digits[2:]
+    elif len(digits) == 10 and digits.startswith("9"):
+        digits = "0" + digits
+    return digits
+
+
+def _sms_clean(value, limit=None):
+    """Make text safe for SMS: no emoji/control/zero-width chars, single-line, optional length cap."""
+    text = str(value or "")
+    text = text.replace("×", "x").replace("\u200c", " ").replace("\n", "، ").replace("\r", " ")
+    text = re.sub(r"[\u200b\u200d\u200e\u200f\u202a-\u202e\ufeff]", "", text)
+    text = "".join(ch for ch in text if ord(ch) <= 0xFFFF and (ch.isprintable() or ch == " "))
+    text = re.sub(r"[\U00010000-\U0010ffff]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"(،\s*){2,}", "، ", text)
+    if limit and len(text) > limit:
+        text = text[:limit - 1].rstrip() + "…"
+    return text
+
+
+async def _melipayamak_post(pending_id, to_phone, from_line, text):
+    """POST one SMS. Returns (ok, ret_status, ret_text)."""
+    payload = {
+        "username": MELIPAYAMAK_USERNAME,
+        "password": MELIPAYAMAK_API_KEY,
+        "to": to_phone,
+        "from": from_line,
+        "text": text,
+        "isFlash": "false",
+    }
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(MELIPAYAMAK_URL, data=payload,
+                                headers={"Accept": "application/json, text/plain, */*"}) as response:
+            body = (await response.text()).strip()
+            log.info("Melipayamak Bale order #%s response: HTTP=%s BODY=%s",
+                     pending_id, response.status, body[:600])
+            if response.status >= 400:
+                return False, None, f"HTTP {response.status}"
+            try:
+                result = json.loads(body)
+            except (json.JSONDecodeError, TypeError):
+                return False, None, "invalid API response"
+            if not isinstance(result, dict):
+                return False, None, "unexpected API response"
+            ret_status = result.get("RetStatus", result.get("retStatus"))
+            try:
+                ret_status = int(ret_status)
+            except (TypeError, ValueError):
+                ret_status = -1
+            detail = "RetStatus=%s StrRetStatus=%s Value=%s" % (
+                ret_status, result.get("StrRetStatus", result.get("strRetStatus", "")),
+                result.get("Value", result.get("value", "")))
+            return ret_status == 1, ret_status, detail
+
+
 async def send_order_sms_to_admin(pending_id, full_name, phone, total_price, items_summary):
     """Send new Bale order SMS to the configured admin number via Melipayamak."""
     missing = []
@@ -438,56 +501,37 @@ async def send_order_sms_to_admin(pending_id, full_name, phone, total_price, ite
         log.error("BALE ORDER SMS SKIPPED for #%s: missing %s", pending_id, ", ".join(missing))
         return False
 
-    clean_items = re.sub(r"\s+", " ", str(items_summary or "-")).strip()
-    if len(clean_items) > 150:
-        clean_items = clean_items[:147] + "..."
-    sms_text = (
+    to_phone = _sms_norm_phone(SMS_ADMIN_PHONE)
+    from_line = re.sub(r"\s+", "", MELIPAYAMAK_SENDER)
+    if len(to_phone) != 11 or not to_phone.startswith("09"):
+        log.error("BALE ORDER SMS SKIPPED for #%s: SMS_ADMIN_PHONE is not a valid mobile number (got %r)",
+                  pending_id, SMS_ADMIN_PHONE)
+        return False
+
+    items = _sms_clean(items_summary or "-", 110)
+    name = _sms_clean(full_name or "-", 40)
+    cust_phone = _sms_norm_phone(phone) or "-"
+    full_text = (
         f"تنین ایران | سفارش جدید بله #{pending_id}\n"
-        f"مشتری: {full_name or '-'}\n"
-        f"موبایل: {phone or '-'}\n"
+        f"مشتری: {name}\n"
+        f"موبایل: {cust_phone}\n"
         f"مبلغ: {int(total_price or 0):,} تومان\n"
-        f"محصولات: {clean_items}"
+        f"محصولات: {items}"
     )
-    payload = {
-        "username": MELIPAYAMAK_USERNAME,
-        "password": MELIPAYAMAK_API_KEY,
-        "to": SMS_ADMIN_PHONE,
-        "from": MELIPAYAMAK_SENDER,
-        "text": sms_text,
-        "isFlash": False,
-    }
+    # Fallback: very short and plain, used only if the full text is rejected as InvalidData.
+    short_text = f"سفارش جدید بله #{pending_id} - {int(total_price or 0):,} تومان - موبایل {cust_phone}"
+
+    log.info("SMS debug #%s: to=%r from=%r len=%s text=%r", pending_id, to_phone, from_line, len(full_text), full_text)
     try:
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(MELIPAYAMAK_URL, data=payload,
-                                    headers={"Accept": "application/json, text/plain, */*"}) as response:
-                body = (await response.text()).strip()
-                log.info("Melipayamak Bale order #%s response: HTTP=%s BODY=%s",
-                         pending_id, response.status, body[:600])
-                if response.status >= 400:
-                    log.error("BALE ORDER SMS FAILED for #%s: HTTP %s", pending_id, response.status)
-                    return False
-                try:
-                    result = json.loads(body)
-                except (json.JSONDecodeError, TypeError):
-                    log.error("BALE ORDER SMS FAILED for #%s: invalid API response", pending_id)
-                    return False
-                if not isinstance(result, dict):
-                    log.error("BALE ORDER SMS FAILED for #%s: unexpected API response", pending_id)
-                    return False
-                ret_status = result.get("RetStatus", result.get("retStatus"))
-                try:
-                    ret_status = int(ret_status)
-                except (TypeError, ValueError):
-                    ret_status = -1
-                if ret_status != 1:
-                    log.error("BALE ORDER SMS REJECTED for #%s: RetStatus=%s StrRetStatus=%s Value=%s",
-                              pending_id, ret_status,
-                              result.get("StrRetStatus", result.get("strRetStatus", "")),
-                              result.get("Value", result.get("value", "")))
-                    return False
-                log.info("BALE ORDER SMS ACCEPTED for #%s", pending_id)
-                return True
+        ok, status, detail = await _melipayamak_post(pending_id, to_phone, from_line, full_text)
+        if not ok and status == 35:
+            log.warning("BALE ORDER SMS #%s rejected as InvalidData; retrying with short text (%s)", pending_id, detail)
+            ok, status, detail = await _melipayamak_post(pending_id, to_phone, from_line, short_text)
+        if not ok:
+            log.error("BALE ORDER SMS REJECTED for #%s: %s", pending_id, detail)
+            return False
+        log.info("BALE ORDER SMS ACCEPTED for #%s", pending_id)
+        return True
     except asyncio.TimeoutError:
         log.error("BALE ORDER SMS TIMEOUT for #%s", pending_id)
         return False
