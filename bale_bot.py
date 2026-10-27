@@ -9,6 +9,8 @@ import asyncio
 import logging
 import re
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from html import escape
 import aiohttp
 from aiohttp import web
@@ -31,8 +33,168 @@ MELIPAYAMAK_API_KEY = (os.getenv("MELIPAYAMAK_API_KEY", "").strip()
 MELIPAYAMAK_SENDER = os.getenv("MELIPAYAMAK_SENDER", "").strip()
 SMS_ADMIN_PHONE = os.getenv("SMS_ADMIN_PHONE", "").strip()
 MELIPAYAMAK_URL = "https://rest.payamak-panel.com/api/SendSMS/SendSMS"
-# Checkout conversation state is kept in memory. If Render restarts, the customer can send /checkout again.
-CHECKOUT = {}
+# Checkout and support/admin conversations are persisted in app_meta, so a Render restart
+# does not silently discard an in-progress flow. Existing table schema is not altered.
+IRAN_TZ = ZoneInfo("Asia/Tehran")
+
+
+def _persist_checkout(uid, state):
+    try:
+        key = f"bale_checkout_state:{int(uid)}"
+        with get_conn() as conn:
+            if state:
+                conn.execute("INSERT INTO app_meta(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                             (key, json.dumps(dict(state), ensure_ascii=False)))
+            else:
+                conn.execute("DELETE FROM app_meta WHERE key=%s", (key,))
+            conn.commit()
+    except Exception:
+        log.exception("Could not persist checkout state for Bale user %s", uid)
+
+
+class PersistentState(dict):
+    def __init__(self, uid, initial=None):
+        self.uid = int(uid)
+        super().__init__(initial or {})
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        _persist_checkout(self.uid, self)
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        _persist_checkout(self.uid, self)
+
+
+class CheckoutStore(dict):
+    def __setitem__(self, uid, value):
+        state = value if isinstance(value, PersistentState) else PersistentState(uid, value)
+        super().__setitem__(int(uid), state)
+        _persist_checkout(uid, state)
+
+    def pop(self, uid, *args):
+        value = super().pop(int(uid), *args)
+        _persist_checkout(uid, None)
+        return value
+
+
+CHECKOUT = CheckoutStore()
+
+
+def restore_checkout(uid):
+    if uid in CHECKOUT:
+        return CHECKOUT[uid]
+    try:
+        with get_conn() as conn:
+            row = conn.execute("SELECT value FROM app_meta WHERE key=%s", (f"bale_checkout_state:{int(uid)}",)).fetchone()
+        if row and row.get("value"):
+            state = json.loads(row["value"])
+            CHECKOUT[uid] = state
+            return CHECKOUT[uid]
+    except Exception:
+        log.exception("Could not restore checkout state for Bale user %s", uid)
+    return {}
+
+
+def iran_now_text():
+    return datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def _to_iran_datetime(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value).strip()
+        if not raw or raw == "-":
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            dt = None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                try:
+                    dt = datetime.strptime(raw, fmt)
+                    break
+                except ValueError:
+                    pass
+            if dt is None:
+                return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IRAN_TZ)
+    return dt.astimezone(IRAN_TZ)
+
+
+def gregorian_to_jalali(gy, gm, gd):
+    g_days = [31,28,31,30,31,30,31,31,30,31,30,31]
+    j_days = [31,31,31,31,31,31,30,30,30,30,30,29]
+    gy2, gm2, gd2 = gy - 1600, gm - 1, gd - 1
+    gdn = 365*gy2 + (gy2+3)//4 - (gy2+99)//100 + (gy2+399)//400
+    for i in range(gm2): gdn += g_days[i]
+    if gm2 > 1 and ((gy % 4 == 0 and gy % 100 != 0) or gy % 400 == 0): gdn += 1
+    gdn += gd2
+    jdn = gdn - 79
+    jnp = jdn // 12053
+    jdn %= 12053
+    jy = 979 + 33*jnp + 4*(jdn//1461)
+    jdn %= 1461
+    if jdn >= 366:
+        jy += (jdn-1)//365
+        jdn = (jdn-1)%365
+    for i in range(11):
+        if jdn < j_days[i]: return jy, i+1, jdn+1
+        jdn -= j_days[i]
+    return jy, 12, jdn+1
+
+
+def format_iran_jalali(value, include_time=True):
+    dt = _to_iran_datetime(value)
+    if not dt: return "-"
+    jy,jm,jd = gregorian_to_jalali(dt.year,dt.month,dt.day)
+    out=f"{jy:04d}/{jm:02d}/{jd:02d}"
+    if include_time: out += f" - {dt.hour:02d}:{dt.minute:02d}"
+    return out
+
+
+def format_iran_jalali_fa(value, include_time=True):
+    return format_iran_jalali(value, include_time).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+
+
+def normalize_phone(value):
+    digits = str(value or "").translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+    digits = re.sub(r"[^0-9+]", "", digits)
+    if digits.startswith("+98"): digits = "0" + digits[3:]
+    elif digits.startswith("0098"): digits = "0" + digits[4:]
+    elif digits.startswith("98") and len(digits) == 12: digits = "0" + digits[2:]
+    elif len(digits) == 10 and digits.startswith("9"): digits = "0" + digits
+    return digits
+
+
+def normalize_name(value):
+    return re.sub(r"\s+", " ", str(value or "").replace("ي", "ی").replace("ك", "ک").replace("‌", " ")).strip()
+
+
+def gender_meta_key(uid, full_name):
+    return f"bale_gender:{int(uid)}:{normalize_name(full_name)}"
+
+
+def get_known_gender(uid, full_name):
+    try:
+        with get_conn() as conn:
+            row=conn.execute("SELECT value FROM app_meta WHERE key=%s", (gender_meta_key(uid, full_name),)).fetchone()
+        return row["value"] if row and row.get("value") in ("مرد", "زن") else None
+    except Exception:
+        log.exception("Could not load saved gender")
+        return None
+
+
+def set_known_gender(uid, full_name, gender):
+    if gender not in ("مرد", "زن") or not normalize_name(full_name): return
+    with get_conn() as conn:
+        conn.execute("INSERT INTO app_meta(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (gender_meta_key(uid, full_name), gender))
+        conn.commit()
 
 
 def get_conn():
@@ -41,9 +203,22 @@ def get_conn():
     return psycopg.connect(DB_URL, row_factory=dict_row, prepare_threshold=None, connect_timeout=15)
 
 
-def main_keyboard():
+def main_keyboard(uid=None):
+    if uid is not None and is_admin(uid):
+        try:
+            counts = db_admin_stats()
+            pending, orders, products, tickets = counts["pending"], counts["orders"], counts["products"], counts["tickets"]
+        except Exception:
+            pending = orders = products = tickets = 0
+        def badge(label, n): return f"{label} ({n})" if n else label
+        return {"keyboard": [[{"text": "⚙️ پنل مدیریت"}],
+                             [{"text": badge("📦 سفارش‌ها", orders)}, {"text": badge("💳 پرداخت‌های در انتظار", pending)}],
+                             [{"text": badge("🛠 مدیریت محصولات", products)}, {"text": badge("🎫 پشتیبانی", tickets)}],
+                             [{"text": "👥 مشتری‌ها"}, {"text": "📊 فروش و آمار"}],
+                             [{"text": "📢 مدیریت کانال"}, {"text": "💳 تنظیمات پرداخت"}]], "resize_keyboard": True}
     return {"keyboard": [[{"text": "🧾 کاتالوگ محصولات"}],
-                         [{"text": "🛒 سبد خرید"}, {"text": "🛍️ ادامه ثبت سفارش"}]], "resize_keyboard": True}
+                         [{"text": "🛒 سبد خرید"}, {"text": "📦 سفارش‌های من"}],
+                         [{"text": "💬 مرکز پشتیبانی"}]], "resize_keyboard": True}
 
 
 def category_keyboard():
@@ -72,8 +247,12 @@ def checkout_keyboard():
     return {"inline_keyboard": [[{"text": "✅ ادامه ثبت سفارش", "callback_data": "checkout:start"}]]}
 
 
-def payment_keyboard(pid):
-    return {"inline_keyboard": [[{"text": "📤 راهنمای ارسال رسید", "callback_data": f"pay:receipt:{pid}"}]]}
+def payment_keyboard(pid, card_number=None):
+    rows = []
+    if card_number:
+        rows.append([{"text": "📋 نمایش شماره کارت برای کپی", "callback_data": f"pay:card:{pid}"}])
+    rows.append([{"text": "📤 راهنمای ارسال رسید", "callback_data": f"pay:receipt:{pid}"}])
+    return {"inline_keyboard": rows}
 
 
 def review_keyboard(pid):
@@ -212,10 +391,12 @@ async def show_admin_section(api, chat_id, section):
             rows = conn.execute(
                 "SELECT user_id,full_name,phone,username FROM customers ORDER BY last_seen DESC NULLS LAST LIMIT 30"
             ).fetchall()
-        lines = ["👥 <b>آخرین مشتریان</b>", ""]
+        buttons=[]
         for r in rows:
-            lines.append(f"• {escape(str(r['full_name'] or '-'))} | {escape(str(r['phone'] or '-'))} | ID {r['user_id']}")
-        await api.send(chat_id, "\n".join(lines)[:3900] if rows else "👥 هنوز مشتری‌ای ثبت نشده است.", admin_back())
+            label=f"👤 {str(r['full_name'] or r['username'] or r['user_id'])[:25]} · {str(r['phone'] or '-')[:14]}"
+            buttons.append([{"text":label[:60],"callback_data":f"adm:customer:{r['user_id']}"}])
+        buttons += [[{"text":"🔄 بروزرسانی","callback_data":"adm:customers"}],[{"text":"🔙 پنل اصلی","callback_data":"adm:home"}]]
+        await api.send(chat_id,"👥 <b>آخرین مشتریان</b>\n\nبرای دیدن سفارش‌ها و اطلاعات هر مشتری، نام او را انتخاب کن." if rows else "👥 هنوز مشتری‌ای ثبت نشده است.", {"inline_keyboard":buttons} if rows else admin_back())
     elif section == "sales":
         with get_conn() as conn:
             row = conn.execute(
@@ -242,7 +423,7 @@ async def show_admin_section(api, chat_id, section):
             lines.append(f"#{r['id']} · {escape(str(r['bank_name'] or '-'))} · {escape(str(r['owner_name'] or '-'))} · کارت {escape(str(r['card_number'] or '-'))} · {'فعال' if r['active'] else 'غیرفعال'}")
         await api.send(chat_id, "\n".join(lines)[:3900] if rows else "حساب بانکی ثبت نشده است.", admin_back())
     elif section == "channel":
-        await api.send(chat_id, "📢 مدیریت کانال\n\nاین بخش در نسخه بله هنوز به عملیات کانال تلگرام متصل نشده است؛ دکمه را نمایشی نمی‌گذاریم و بعداً باید قابلیت معادل بله برای آن پیاده‌سازی شود.", admin_back())
+        await show_admin_channel(api, chat_id)
 
 
 async def show_admin_pending_detail(api, chat_id, pid):
@@ -685,12 +866,8 @@ async def start_checkout(api, chat_id, uid):
     if not items:
         await api.send(chat_id, "🛒 سبد خرید خالی است؛ اول محصولی اضافه کن.", main_keyboard())
         return
-    CHECKOUT[uid] = {"step": "name"}
-    saved = await asyncio.to_thread(db_saved_data, uid, "name")
-    if saved:
-        await api.send(chat_id, "👤 نام و نام خانوادگی را انتخاب کن یا اطلاعات جدید وارد کن:", await asyncio.to_thread(saved_keyboard, uid, "name", "name"))
-    else:
-        await api.send(chat_id, "👤 برای ثبت سفارش، نام و نام خانوادگی را وارد کن.\nمثال: محمد احمدی\nبرای لغو بنویس /cancel")
+    CHECKOUT[uid] = {"step": "review_quantities"}
+    await show_checkout_quantities(api, chat_id, uid)
 
 
 async def send_payment_instructions(api, chat_id, pending, bank):
@@ -703,7 +880,44 @@ async def send_payment_instructions(api, chat_id, pending, bank):
             f"🏦 بانک: <b>{val('bank_name')}</b>\n👤 به نام: <b>{val('owner_name')}</b>\n"
             f"💳 شماره کارت: <code>{val('card_number')}</code>\n🏦 شماره حساب: <code>{val('account_number')}</code>\n🔹 شبا: <code>{val('iban')}</code>\n\n"
             "پس از واریز، عکس رسید را همین‌جا ارسال کن. تا تأیید مدیر، سفارش نهایی نمی‌شود.")
-    await api.send(chat_id, text, payment_keyboard(pending["id"]))
+    await api.send(chat_id, text, payment_keyboard(pending["id"], bank.get("card_number")))
+
+
+async def ask_bale_address(api, chat_id, uid):
+    saved = await asyncio.to_thread(db_saved_data, uid, "address")
+    if saved:
+        await api.send(chat_id, "📍 آدرس ارسال را انتخاب کن یا آدرس جدید وارد کن:", await asyncio.to_thread(saved_keyboard, uid, "address", "address"))
+    else:
+        await api.send(chat_id, "📍 آدرس کامل پستی، شهر و کدپستی را وارد کن.")
+
+
+async def handle_customer_support_text(api, msg, uid, chat_id, text):
+    state=restore_checkout(uid)
+    step=state.get("step")
+    if step=="support_new_message":
+        body=text.strip()
+        if len(body)<3:
+            await api.send(chat_id,"متن درخواست خیلی کوتاه است؛ لطفاً جزئیات بیشتری بنویس."); return True
+        tid=await create_support_ticket(uid,body,state.get("support_topic","سایر"),state.get("support_order_id"))
+        CHECKOUT.pop(uid,None)
+        await api.send(chat_id,f"✅ درخواست پشتیبانی ثبت شد.\nشماره تیکت: #{tid}\nاز بخش «درخواست‌های من» می‌توانی پاسخ‌ها را پیگیری کنی.",main_keyboard(uid))
+        for aid in ADMIN_IDS:
+            try: await api.send(aid,f"🎫 <b>تیکت جدید #{tid}</b>\nموضوع: {escape(state.get('support_topic','سایر'))}\nمشتری: <code>{uid}</code>\n\n{escape(body)}",{"inline_keyboard":[[{"text":"مشاهده و پاسخ","callback_data":f"adm:ticket:{tid}"}]]})
+            except Exception: log.exception("Could not notify admin about support ticket %s",tid)
+        return True
+    if step=="support_reply":
+        tid=int(state.get("ticket_id",0)); body=text.strip()
+        if len(body)<1: await api.send(chat_id,"پیام خالی قابل ارسال نیست."); return True
+        ok=await add_ticket_message(tid,uid,"customer",body)
+        CHECKOUT.pop(uid,None)
+        if ok:
+            await api.send(chat_id,f"✅ پاسخ شما به تیکت #{tid} ثبت شد.",main_keyboard(uid))
+            for aid in ADMIN_IDS:
+                try: await api.send(aid,f"💬 پاسخ جدید مشتری در تیکت #{tid}\nمشتری: <code>{uid}</code>\n\n{escape(body)}",{"inline_keyboard":[[{"text":"مشاهده تیکت","callback_data":f"adm:ticket:{tid}"}]]})
+                except Exception: log.exception("Could not notify admin about ticket reply")
+        else: await api.send(chat_id,"این تیکت بسته شده یا دیگر قابل پاسخ نیست.",main_keyboard(uid))
+        return True
+    return False
 
 
 async def handle_checkout_text(api, msg, uid, chat_id, text):
@@ -731,41 +945,37 @@ async def handle_checkout_text(api, msg, uid, chat_id, text):
         await api.send(chat_id, "ثبت سفارش لغو شد.", main_keyboard())
         return True
     if step == "name":
-        name = re.sub(r"\s+", " ", text).strip()
+        name = normalize_name(text)
         if len(name.split()) < 2 or len(name) < 5:
             await api.send(chat_id, "❌ نام و نام خانوادگی را کامل وارد کن. مثال: محمد احمدی")
             return True
         state["full_name"] = name
+        state["step"] = "confirm_name"
         await asyncio.to_thread(db_save_data, uid, "name", name)
-        state["step"] = "phone"
-        saved = await asyncio.to_thread(db_saved_data, uid, "phone")
-        if saved:
-            await api.send(chat_id, "📱 شماره موبایل را انتخاب کن یا شماره جدید وارد کن:", await asyncio.to_thread(saved_keyboard, uid, "phone", "phone"))
-        else:
-            await api.send(chat_id, "📱 شماره موبایل ایرانی را وارد کن (مثال: 09123456789).")
+        await api.send(chat_id, f"👤 نام ثبت سفارش: <b>{escape(name)}</b>\n\nآیا این نام درست است؟", {"inline_keyboard":[[{"text":"✅ تأیید نام","callback_data":"nameconfirm:yes"},{"text":"✏️ ویرایش نام","callback_data":"nameconfirm:edit"}]]})
         return True
     if step == "phone":
-        digits = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
-        phone = re.sub(r"[\s\-()]+", "", digits)
-        if phone.startswith("+98"):
-            phone = "0" + phone[3:]
-        elif phone.startswith("0098"):
-            phone = "0" + phone[4:]
-        elif phone.startswith("98"):
-            phone = "0" + phone[2:]
+        phone = normalize_phone(text)
         if len(phone) != 11 or not phone.startswith("09") or not phone.isdigit():
             await api.send(chat_id, "❌ شماره معتبر نیست. شماره را به شکل 09123456789 وارد کن.")
             return True
         state["phone"] = phone
         await asyncio.to_thread(db_save_data, uid, "phone", phone)
-        state["step"] = "gender"
-        await api.send(chat_id, "جنسیت را انتخاب کن:", {"keyboard": [[{"text": "مرد"}, {"text": "زن"}], [{"text": "/cancel"}]], "resize_keyboard": True})
+        known = await asyncio.to_thread(get_known_gender, uid, state.get("full_name", ""))
+        if known:
+            state["gender"] = known
+            state["step"] = "address"
+            await ask_bale_address(api, chat_id, uid)
+        else:
+            state["step"] = "gender"
+            await api.send(chat_id, "جنسیت را انتخاب کن:", {"inline_keyboard":[[{"text":"مرد","callback_data":"checkoutgender:مرد"},{"text":"زن","callback_data":"checkoutgender:زن"}]]})
         return True
     if step == "gender":
         if text not in ("مرد", "زن"):
             await api.send(chat_id, "لطفاً یکی از گزینه‌های «مرد» یا «زن» را انتخاب کن.")
             return True
         state["gender"] = text
+        await asyncio.to_thread(set_known_gender, uid, state.get("full_name", ""), text)
         state["step"] = "address"
         saved = await asyncio.to_thread(db_saved_data, uid, "address")
         if saved:
@@ -836,6 +1046,492 @@ async def handle_receipt(api, msg, uid, chat_id):
     return True
 
 
+# ---------------------------------------------------------------------------
+# Telegram-parity customer flows: orders, support tickets, editable checkout
+# ---------------------------------------------------------------------------
+def db_register_customer(uid, username=""):
+    now = iran_now_text()
+    with get_conn() as conn:
+        conn.execute("""INSERT INTO customers(user_id,username,first_seen,last_seen)
+            VALUES(%s,%s,%s,%s) ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,last_seen=excluded.last_seen""",
+            (int(uid), username or "", now, now))
+        conn.commit()
+
+
+def checkout_quantity_keyboard(rows):
+    buttons=[]
+    for row in rows:
+        buttons.append([
+            {"text":"➖", "callback_data":f"checkoutqty:minus:{row['cart_id']}"},
+            {"text":f"{str(row['name'])[:20]} × {row['qty']}", "callback_data":f"checkoutqty:noop:{row['cart_id']}"},
+            {"text":"➕", "callback_data":f"checkoutqty:plus:{row['cart_id']}"},
+        ])
+    buttons.append([{"text":"🗑 حذف یک محصول", "callback_data":"checkoutqty:delete_menu"}])
+    buttons.append([{"text":"✅ ادامه ثبت سفارش", "callback_data":"checkoutqty:continue"}])
+    buttons.append([{"text":"🔙 بازگشت به سبد خرید", "callback_data":"checkoutqty:back"}])
+    return {"inline_keyboard":buttons}
+
+
+def checkout_quantity_text(rows):
+    total=sum(int(r["price"] or 0)*int(r["qty"] or 0) for r in rows)
+    lines=["🛒 <b>بازبینی سبد خرید</b>","","تعداد بسته‌ها را پیش از ثبت سفارش بررسی کن:",""]
+    for r in rows:
+        lines.append(f"• {escape(str(r['name']))} — {int(r['qty'])} × {int(r['price']):,} = {int(r['qty'])*int(r['price']):,} تومان")
+    lines += ["",f"💰 <b>جمع کل: {total:,} تومان</b>"]
+    return "\n".join(lines)
+
+
+async def show_checkout_quantities(api, chat_id, uid, mid=None):
+    rows=await asyncio.to_thread(db_cart,uid)
+    if not rows:
+        await api.send(chat_id,"🛒 سبد خرید خالی است؛ ابتدا محصولی انتخاب کن.",main_keyboard(uid)); return
+    text=checkout_quantity_text(rows)
+    markup=checkout_quantity_keyboard(rows)
+    if mid:
+        try: await api.edit(chat_id,mid,text,markup); return
+        except Exception: log.debug("Checkout quantity edit unsupported; sending a new message",exc_info=True)
+    await api.send(chat_id,text,markup)
+
+
+def customer_order_keyboard(rows):
+    buttons=[]
+    for o in rows:
+        buttons.append([{"text":f"📦 سفارش #{o['id']} | {format_iran_jalali_fa(o.get('created_at'),False)}", "callback_data":f"customer_order:view:{o['id']}"}])
+    buttons.append([{"text":"🔙 بستن", "callback_data":"customer_order:close"}])
+    return {"inline_keyboard":buttons}
+
+
+async def show_my_orders(api, chat_id, uid, mid=None):
+    with get_conn() as conn:
+        rows=conn.execute("SELECT id,created_at FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 30",(uid,)).fetchall()
+    if not rows:
+        await api.send(chat_id,"📦 هنوز سفارشی برای این حساب ثبت نشده است.",main_keyboard(uid)); return
+    text="📦 <b>سفارش‌های من</b>\n\nبرای مشاهده جزئیات، یک سفارش را انتخاب کن:"
+    if mid:
+        try: await api.edit(chat_id,mid,text,customer_order_keyboard(rows)); return
+        except Exception: pass
+    await api.send(chat_id,text,customer_order_keyboard(rows))
+
+
+def support_home_keyboard():
+    return {"inline_keyboard":[
+        [{"text":"📦 پیگیری سفارش", "callback_data":"support:orders"}],
+        [{"text":"💳 مشکل پرداخت", "callback_data":"support:topic:پرداخت"},{"text":"🛍 سؤال محصول", "callback_data":"support:topic:محصول"}],
+        [{"text":"🚚 ارسال", "callback_data":"support:topic:ارسال"},{"text":"🔄 تعویض / مرجوعی", "callback_data":"support:topic:تعویض"}],
+        [{"text":"📝 ثبت درخواست پشتیبانی", "callback_data":"support:new"}],
+        [{"text":"🎫 درخواست‌های من", "callback_data":"support:mine"}],
+        [{"text":"❓ سؤالات متداول", "callback_data":"support:faq"}],
+        [{"text":"📞 تماس با پشتیبانی", "callback_data":"support:phone"}],
+    ]}
+
+
+def support_status_fa(status):
+    return {"new":"🔴 جدید","admin_waiting":"🟡 در انتظار پاسخ مدیر","customer_waiting":"🔵 در انتظار پاسخ مشتری","closed":"🟢 بسته‌شده"}.get(status,status or "-")
+
+
+async def show_support_tickets(api, chat_id, uid, mid=None, admin=False, status_filter="all"):
+    with get_conn() as conn:
+        if admin:
+            if status_filter=="all":
+                rows=conn.execute("SELECT t.*,c.full_name,c.username FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id ORDER BY t.id DESC LIMIT 40").fetchall()
+            else:
+                rows=conn.execute("SELECT t.*,c.full_name,c.username FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id WHERE t.status=%s ORDER BY t.id DESC LIMIT 40",(status_filter,)).fetchall()
+        else:
+            rows=conn.execute("SELECT * FROM support_tickets WHERE user_id=%s ORDER BY id DESC LIMIT 30",(uid,)).fetchall()
+    buttons=[]
+    for t in rows:
+        if admin:
+            label=f"🎫 #{t['id']} · {str(t.get('full_name') or t.get('username') or t['user_id'])[:14]} · {str(t['topic'])[:12]} · {support_status_fa(t['status'])}"
+            buttons.append([{"text":label[:60],"callback_data":f"adm:ticket:{t['id']}"}])
+        else:
+            label=f"🎫 #{t['id']} · {str(t['topic'])[:16]} · {support_status_fa(t['status'])}"
+            buttons.append([{"text":label[:60],"callback_data":f"support:view:{t['id']}"}])
+    if admin:
+        buttons += [[{"text":"🔴 جدید", "callback_data":"adm:tickets:new"},{"text":"🟡 منتظر مدیر", "callback_data":"adm:tickets:admin_waiting"}],
+                    [{"text":"🔵 منتظر مشتری", "callback_data":"adm:tickets:customer_waiting"},{"text":"🟢 بسته", "callback_data":"adm:tickets:closed"}],
+                    [{"text":"➕ همه", "callback_data":"adm:tickets:all"}],
+                    [{"text":"🔙 پنل اصلی", "callback_data":"adm:home"}]]
+        text="🎫 <b>تیکت‌های پشتیبانی</b>"
+    else:
+        buttons += [[{"text":"📝 ثبت درخواست جدید", "callback_data":"support:new"}], [{"text":"🔙 مرکز پشتیبانی", "callback_data":"support:home"}]]
+        text="🎫 <b>درخواست‌های پشتیبانی من</b>"
+    markup={"inline_keyboard":buttons}
+    if mid:
+        try: await api.edit(chat_id,mid,text,markup); return
+        except Exception: pass
+    await api.send(chat_id,text,markup)
+
+
+async def show_ticket_detail(api, chat_id, uid, ticket_id, mid=None, admin=False):
+    with get_conn() as conn:
+        if admin:
+            ticket=conn.execute("SELECT t.*,c.full_name,c.username FROM support_tickets t LEFT JOIN customers c ON c.user_id=t.user_id WHERE t.id=%s",(ticket_id,)).fetchone()
+        else:
+            ticket=conn.execute("SELECT * FROM support_tickets WHERE id=%s AND user_id=%s",(ticket_id,uid)).fetchone()
+        messages=conn.execute("SELECT * FROM support_ticket_messages WHERE ticket_id=%s ORDER BY id ASC",(ticket_id,)).fetchall() if ticket else []
+    if not ticket:
+        await api.send(chat_id,"تیکت پیدا نشد یا اجازه مشاهده آن را نداری."); return
+    lines=[f"🎫 <b>تیکت #{ticket_id}</b>",f"🏷 موضوع: {escape(str(ticket['topic']))}",f"📌 وضعیت: {support_status_fa(ticket['status'])}",f"📅 ثبت: {format_iran_jalali_fa(ticket.get('created_at'),True)}"]
+    if admin:
+        lines += [f"👤 مشتری: {escape(str(ticket.get('full_name') or '-'))}",f"🆔 شناسه مشتری: <code>{ticket['user_id']}</code>"]
+        if ticket.get("order_id"): lines.append(f"📦 سفارش: #{ticket['order_id']}")
+    lines += ["","<b>💬 گفتگو:</b>"]
+    for m in messages[-12:]:
+        who="مشتری" if m["sender_type"]=="customer" else "مدیر"
+        lines.append(f"<b>{who}:</b> {escape(str(m['message']))}")
+    buttons=[]
+    if ticket["status"]!="closed":
+        buttons.append([{"text":"💬 پاسخ دادن", "callback_data":(f"adm:ticket_reply:{ticket_id}" if admin else f"support:reply:{ticket_id}")}])
+    if admin and ticket["status"]!="closed": buttons.append([{"text":"🟢 بستن تیکت", "callback_data":f"adm:ticket_close:{ticket_id}"}])
+    buttons.append([{"text":"🔙 بازگشت", "callback_data":"adm:tickets" if admin else "support:mine"}])
+    text="\n".join(lines)
+    if mid:
+        try: await api.edit(chat_id,mid,text,{"inline_keyboard":buttons}); return
+        except Exception: pass
+    await api.send(chat_id,text,{"inline_keyboard":buttons})
+
+
+async def create_support_ticket(uid, text, topic="سایر", order_id=None):
+    now=iran_now_text()
+    with get_conn() as conn:
+        cur=conn.execute("INSERT INTO support_tickets(user_id,order_id,topic,status,created_at,updated_at) VALUES(%s,%s,%s,'new',%s,%s) RETURNING id",(uid,order_id,topic,now,now))
+        tid=cur.fetchone()["id"]
+        conn.execute("INSERT INTO support_ticket_messages(ticket_id,sender_id,sender_type,message,created_at) VALUES(%s,%s,'customer',%s,%s)",(tid,uid,text,now))
+        conn.commit()
+    return tid
+
+
+async def add_ticket_message(ticket_id, sender_id, sender_type, message):
+    now=iran_now_text()
+    with get_conn() as conn:
+        t=conn.execute("SELECT id,status FROM support_tickets WHERE id=%s",(ticket_id,)).fetchone()
+        if not t or t["status"]=="closed": return False
+        conn.execute("INSERT INTO support_ticket_messages(ticket_id,sender_id,sender_type,message,created_at) VALUES(%s,%s,%s,%s,%s)",(ticket_id,sender_id,sender_type,message,now))
+        status="customer_waiting" if sender_type=="admin" else "admin_waiting"
+        conn.execute("UPDATE support_tickets SET status=%s,updated_at=%s WHERE id=%s",(status,now,ticket_id))
+        conn.commit()
+    return True
+
+
+async def handle_admin_text(api, msg, uid, chat_id, text):
+    state=restore_checkout(uid)
+    flow=state.get("admin_flow")
+    if not flow: return False
+    step=flow.get("step")
+    if flow.get("type")=="add_product":
+        if step=="name":
+            if not text.strip(): await api.send(chat_id,"نام محصول خالی است؛ دوباره وارد کن."); return True
+            state.update({"step":"category","name":text.strip()}); await api.send(chat_id,"دسته محصول را وارد کن: بچگانه یا زنانه."); return True
+        if step=="category":
+            if text not in ("بچگانه","زنانه"): await api.send(chat_id,"فقط «بچگانه» یا «زنانه» وارد کن."); return True
+            state.update({"step":"size","category":text}); await api.send(chat_id,"سایز را وارد کن:"); return True
+        if step=="size": state.update({"step":"color","size":text}); await api.send(chat_id,"رنگ‌بندی را وارد کن (یا -):"); return True
+        if step=="color": state.update({"step":"pack_info","color":"" if text.strip()=="-" else text.strip()}); await api.send(chat_id,"اطلاعات پک را وارد کن؛ اگر ندارد «ندارد» بنویس:"); return True
+        if step=="pack_info": state.update({"step":"price","pack_info":"" if text.lower().strip() in ("ندارد","ندارم","-","no") else text.strip()}); await api.send(chat_id,"قیمت را به تومان و فقط به عدد وارد کن:"); return True
+        if step=="price":
+            try: price=int(text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹","0123456789")).replace(",","")); assert price>=0
+            except Exception: await api.send(chat_id,"قیمت نامعتبر است؛ یک عدد صفر یا بزرگ‌تر وارد کن."); return True
+            state.update({"step":"photo_url","price":price}); await api.send(chat_id,"لینک مستقیم عکس محصول را بفرست؛ در صورت نداشتن عکس «ندارد» بنویس:"); return True
+        if step=="photo_url":
+            url="" if text.lower().strip() in ("ندارد","ندارم","-","no") else text.strip()
+            if url and not url.startswith(("https://","http://")): await api.send(chat_id,"لینک عکس باید با http:// یا https:// شروع شود."); return True
+            with get_conn() as conn:
+                row=conn.execute("INSERT INTO products(name,category,size,color,price,photo_url,active,pack_info) VALUES(%s,%s,%s,%s,%s,%s,TRUE,%s) RETURNING id",(state["name"],state["category"],state["size"],state.get("color",""),state["price"],url,state.get("pack_info",""))).fetchone(); conn.commit()
+            CHECKOUT.pop(uid,None); await api.send(chat_id,f"✅ محصول «{escape(state['name'])}» با شناسه #{row['id']} اضافه شد.",admin_keyboard()); return True
+    if flow.get("type")=="product_field":
+        pid=int(flow["product_id"]); field=flow["field"]
+        allowed={"name","category","size","color","pack_info","price","photo_url"}
+        if field not in allowed: CHECKOUT.pop(uid,None); return True
+        value=text.strip()
+        if field=="category" and value not in ("بچگانه","زنانه"): await api.send(chat_id,"دسته باید بچگانه یا زنانه باشد."); return True
+        if field=="price":
+            try: value=int(value.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹","0123456789")).replace(",","")); assert value>=0
+            except Exception: await api.send(chat_id,"قیمت نامعتبر است؛ دوباره به تومان وارد کن."); return True
+        if field=="pack_info" and value.lower() in ("ندارد","ندارم","-","no"): value=""
+        if field=="photo_url" and value.lower() in ("ندارد","ندارم","-","no"): value=""
+        with get_conn() as conn:
+            conn.execute(f"UPDATE products SET {field}=%s WHERE id=%s",(value,pid)); conn.commit()
+        CHECKOUT.pop(uid,None); await api.send(chat_id,f"✅ فیلد {field} برای محصول #{pid} به‌روزرسانی شد.",admin_keyboard()); return True
+    if flow.get("type")=="bank_add" or flow.get("type")=="bank_edit":
+        keys=["bank_name","owner_name","card_number","account_number","iban"]
+        idx=int(flow.get("index",0)); mode=flow["type"]
+        if idx>=len(keys): CHECKOUT.pop(uid,None); return True
+        key=keys[idx]; value=text.strip()
+        if key in ("bank_name","owner_name","card_number") and not value:
+            await api.send(chat_id,"این فیلد نمی‌تواند خالی باشد؛ دوباره وارد کن."); return True
+        data=dict(flow.get("data") or {}); data[key]=value
+        idx+=1
+        if idx<len(keys):
+            state.update({"index":idx,"data":data})
+            prompts={"owner_name":"نام صاحب حساب:","card_number":"شماره کارت ۱۶ رقمی:","account_number":"شماره حساب (در صورت نداشتن -):","iban":"شماره شبا (در صورت نداشتن -):"}
+            await api.send(chat_id,prompts.get(keys[idx],"اطلاعات حساب را وارد کن:")); return True
+        now=iran_now_text()
+        data={k:("" if data.get(k)=="-" else data.get(k,"")) for k in keys}
+        with get_conn() as conn:
+            if mode=="bank_add":
+                conn.execute("UPDATE bank_accounts SET active=FALSE,updated_at=%s WHERE active=TRUE",(now,))
+                conn.execute("INSERT INTO bank_accounts(bank_name,owner_name,card_number,account_number,iban,active,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,TRUE,%s,%s)",(data["bank_name"],data["owner_name"],data["card_number"],data["account_number"],data["iban"],now,now))
+            else:
+                aid=int(flow["account_id"])
+                conn.execute("UPDATE bank_accounts SET bank_name=%s,owner_name=%s,card_number=%s,account_number=%s,iban=%s,updated_at=%s WHERE id=%s",(data["bank_name"],data["owner_name"],data["card_number"],data["account_number"],data["iban"],now,aid))
+            conn.commit()
+        CHECKOUT.pop(uid,None); await api.send(chat_id,"✅ اطلاعات حساب بانکی ذخیره شد.",admin_keyboard()); return True
+    if flow.get("type")=="channel_time":
+        value=text.strip()
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d",value):
+            await api.send(chat_id,"فرمت ساعت نامعتبر است؛ مانند 08:15 وارد کن."); return True
+        meta_set(f"bale_channel_time_{flow['kind']}",value)
+        CHECKOUT.pop(uid,None); await api.send(chat_id,f"✅ ساعت پست {'صبح' if flow['kind']=='morning' else 'شب'} روی {value} تنظیم شد.",admin_keyboard()); return True
+    if flow.get("type")=="channel_message":
+        if not text.strip(): await api.send(chat_id,"متن پست خالی است؛ دوباره ارسال کن."); return True
+        meta_set(f"bale_channel_message_{flow['kind']}",text.strip())
+        CHECKOUT.pop(uid,None); await api.send(chat_id,"✅ متن پست کانال ذخیره شد.",admin_keyboard()); return True
+    if flow.get("type")=="ticket_reply":
+        tid=int(flow["ticket_id"])
+        with get_conn() as conn:
+            ticket=conn.execute("SELECT user_id FROM support_tickets WHERE id=%s",(tid,)).fetchone()
+        if not ticket: CHECKOUT.pop(uid,None); await api.send(chat_id,"تیکت پیدا نشد."); return True
+        ok=await add_ticket_message(tid,uid,"admin",text)
+        CHECKOUT.pop(uid,None)
+        if ok:
+            try: await api.send(int(ticket["user_id"]),f"💬 پاسخ جدید پشتیبانی برای تیکت #{tid} دریافت شد. برای مشاهده، «مرکز پشتیبانی» را باز کن.",main_keyboard(int(ticket["user_id"])))
+            except Exception: log.exception("Could not notify ticket owner")
+            await api.send(chat_id,"✅ پاسخ برای مشتری ثبت شد.",admin_keyboard())
+        else: await api.send(chat_id,"این تیکت بسته شده یا دیگر قابل پاسخ نیست.",admin_keyboard())
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Admin product/bank/customer/ticket management parity
+# ---------------------------------------------------------------------------
+def admin_products_keyboard(rows):
+    buttons=[[{"text":"➕ افزودن محصول","callback_data":"adm:add_product"}]]
+    for r in rows:
+        state="🟢" if r["active"] else "⚪"
+        buttons.append([{"text":f"{state} #{r['id']} · {str(r['name'])[:35]}","callback_data":f"adm:product:{r['id']}"}])
+    buttons += [[{"text":"🔄 بروزرسانی","callback_data":"adm:products"}], [{"text":"🔙 پنل اصلی","callback_data":"adm:home"}]]
+    return {"inline_keyboard":buttons}
+
+
+async def show_admin_products(api, chat_id, mid=None):
+    with get_conn() as conn: rows=conn.execute("SELECT id,name,price,active FROM products ORDER BY id DESC LIMIT 45").fetchall()
+    text=f"🛠 <b>مدیریت محصولات</b>\n\nتعداد محصولات: {len(rows)}\nبرای ویرایش قیمت، نام، سایز، رنگ، پک یا وضعیت، محصول را انتخاب کن."
+    markup=admin_products_keyboard(rows)
+    if mid:
+        try: await api.edit(chat_id,mid,text,markup); return
+        except Exception: pass
+    await api.send(chat_id,text,markup)
+
+
+async def show_admin_product(api, chat_id, pid, mid=None, quick=False, price_quick=False):
+    with get_conn() as conn: p=conn.execute("SELECT * FROM products WHERE id=%s",(pid,)).fetchone()
+    if not p: await api.send(chat_id,"محصول پیدا نشد.",admin_back("products")); return
+    text=(f"🛍 <b>{escape(str(p['name']))}</b>\nشناسه: #{pid}\nدسته: {escape(str(p['category'] or '-'))}\n"
+          f"سایز: {escape(str(p['size'] or '-'))}\nرنگ‌بندی: {escape(str(p.get('color') or '-'))}\n"
+          f"پک: {escape(str(p.get('pack_info') or '-'))}\nقیمت: <b>{int(p['price'] or 0):,} تومان</b>\n"
+          f"وضعیت: {'فعال 🟢' if p['active'] else 'غیرفعال ⚪'}")
+    buttons=[[{"text":"✏️ ویرایش نام","callback_data":f"adm:product_field:{pid}:name"},{"text":"💰 تغییر قیمت","callback_data":f"adm:price_set:{pid}"}],
+             [{"text":"📂 دسته","callback_data":f"adm:product_field:{pid}:category"},{"text":"📏 سایز","callback_data":f"adm:product_field:{pid}:size"}],
+             [{"text":"🎨 رنگ","callback_data":f"adm:product_field:{pid}:color"},{"text":"📦 اطلاعات پک","callback_data":f"adm:product_field:{pid}:pack_info"}],
+             [{"text":"🖼 لینک عکس","callback_data":f"adm:product_field:{pid}:photo_url"}],
+             [{"text":"➖ ۵۰ هزار","callback_data":f"adm:price_adjust:{pid}:-50000"},{"text":"➕ ۵۰ هزار","callback_data":f"adm:price_adjust:{pid}:50000"}],
+             [{"text":"➖ ۱۰۰ هزار","callback_data":f"adm:price_adjust:{pid}:-100000"},{"text":"➕ ۱۰۰ هزار","callback_data":f"adm:price_adjust:{pid}:100000"}],
+             [{"text":("⛔ غیرفعال کردن" if p['active'] else "🟢 فعال کردن"),"callback_data":f"adm:toggle_product:{pid}"}],
+             [{"text":"🗑 حذف امن (غیرفعال‌سازی)","callback_data":f"adm:delete_product:{pid}"}],
+             [{"text":"🔙 فهرست محصولات","callback_data":"adm:products"}]]
+    markup={"inline_keyboard":buttons}
+    if mid:
+        try: await api.edit(chat_id,mid,text,markup); return
+        except Exception: pass
+    await api.send(chat_id,text,markup)
+
+
+async def show_admin_banks(api, chat_id, mid=None):
+    with get_conn() as conn: rows=conn.execute("SELECT * FROM bank_accounts ORDER BY active DESC,id DESC LIMIT 30").fetchall()
+    lines=["💳 <b>مدیریت حساب‌های بانکی</b>",""]
+    buttons=[[{"text":"➕ افزودن حساب بانکی","callback_data":"adm:bank_add"}]]
+    for r in rows:
+        lines.append(f"#{r['id']} · {escape(str(r['bank_name'] or '-'))} · {'🟢 فعال' if r['active'] else '⚪ غیرفعال'}")
+        buttons.append([{"text":f"#{r['id']} · {str(r['bank_name'] or '-')[:25]} {'🟢' if r['active'] else '⚪'}","callback_data":f"adm:bank:{r['id']}"}])
+    if not rows: lines.append("حساب بانکی ثبت نشده است.")
+    buttons.append([{"text":"🔙 پنل اصلی","callback_data":"adm:home"}])
+    if mid:
+        try: await api.edit(chat_id,mid,"\n".join(lines),{"inline_keyboard":buttons}); return
+        except Exception: pass
+    await api.send(chat_id,"\n".join(lines),{"inline_keyboard":buttons})
+
+
+async def show_admin_bank(api, chat_id, aid, mid=None):
+    with get_conn() as conn: a=conn.execute("SELECT * FROM bank_accounts WHERE id=%s",(aid,)).fetchone()
+    if not a: await api.send(chat_id,"حساب بانکی پیدا نشد.",admin_back("payment")); return
+    text=(f"🏦 <b>حساب بانکی #{aid}</b>\n\nبانک: {escape(str(a.get('bank_name') or '-'))}\n"
+          f"صاحب حساب: {escape(str(a.get('owner_name') or '-'))}\nکارت: <code>{escape(str(a.get('card_number') or '-'))}</code>\n"
+          f"حساب: <code>{escape(str(a.get('account_number') or '-'))}</code>\nشبا: <code>{escape(str(a.get('iban') or '-'))}</code>\n"
+          f"وضعیت: {'فعال 🟢' if a['active'] else 'غیرفعال ⚪'}\nآخرین تغییر: {format_iran_jalali_fa(a.get('updated_at'),True)}")
+    buttons=[[{"text":"✏️ ویرایش همه اطلاعات","callback_data":f"adm:bank_edit:{aid}"}],
+             [{"text":"🟢 فعال‌کردن (حساب‌های دیگر غیرفعال می‌شوند)" if not a['active'] else "🔴 غیرفعال‌کردن","callback_data":f"adm:bank_toggle:{aid}"}],
+             [{"text":"🗑 حذف حساب غیرفعال","callback_data":f"adm:bank_delete:{aid}"}],
+             [{"text":"🔙 حساب‌های بانکی","callback_data":"adm:payment"}]]
+    if mid:
+        try: await api.edit(chat_id,mid,text,{"inline_keyboard":buttons}); return
+        except Exception: pass
+    await api.send(chat_id,text,{"inline_keyboard":buttons})
+
+
+async def show_admin_customer(api, chat_id, customer_id, mid=None):
+    with get_conn() as conn:
+        c=conn.execute("SELECT * FROM customers WHERE user_id=%s",(customer_id,)).fetchone()
+        orders=conn.execute("SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 10",(customer_id,)).fetchall()
+        tickets=conn.execute("SELECT id,topic,status FROM support_tickets WHERE user_id=%s ORDER BY id DESC LIMIT 5",(customer_id,)).fetchall()
+    if not c: await api.send(chat_id,"مشتری پیدا نشد.",admin_back("customers")); return
+    saved_name=await asyncio.to_thread(db_saved_data,customer_id,"name")
+    saved_phone=await asyncio.to_thread(db_saved_data,customer_id,"phone")
+    saved_address=await asyncio.to_thread(db_saved_data,customer_id,"address")
+    name=saved_name[0]["value"] if saved_name else c.get("full_name") or "-"
+    phone=saved_phone[0]["value"] if saved_phone else c.get("phone") or "-"
+    address=saved_address[0]["value"] if saved_address else "-"
+    total=sum(int(o.get("total_price") or 0) for o in orders if o.get("status") not in ("رد شد","لغو شده"))
+    lines=["👤 <b>جزئیات مشتری</b>",f"نام: {escape(str(name))}",f"شناسه: <code>{customer_id}</code>",f"نام کاربری: @{escape(str(c.get('username') or '-'))}",f"تلفن: {escape(str(phone))}",f"آدرس ذخیره‌شده: {escape(str(address))}",f"جنسیت: {escape(str(c.get('gender') or '-'))}",f"اولین ورود: {format_iran_jalali_fa(c.get('first_seen'),True)}",f"آخرین فعالیت: {format_iran_jalali_fa(c.get('last_seen'),True)}",f"تعداد سفارش‌های اخیر: {len(orders)}",f"مجموع سفارش‌های غیرلغوشده: {total:,} تومان"]
+    buttons=[]
+    for o in orders: buttons.append([{"text":f"📦 سفارش #{o['id']} · {str(o['status'])[:15]}","callback_data":f"adm:orderdetail:{o['id']}"}])
+    for t in tickets: buttons.append([{"text":f"🎫 تیکت #{t['id']} · {str(t['topic'])[:15]}","callback_data":f"adm:ticket:{t['id']}"}])
+    buttons.append([{"text":"🔙 مشتری‌ها","callback_data":"adm:customers"}])
+    if mid:
+        try: await api.edit(chat_id,mid,"\n".join(lines),{"inline_keyboard":buttons}); return
+        except Exception: pass
+    await api.send(chat_id,"\n".join(lines),{"inline_keyboard":buttons})
+
+
+# ---------------------------------------------------------------------------
+# Bale channel management. Sending is enabled only when BALE_CHANNEL_ID is set
+# and the bot has permission to post in that channel.
+# ---------------------------------------------------------------------------
+BALE_CHANNEL_ID = os.getenv("BALE_CHANNEL_ID", "").strip()
+BALE_WEATHER_CITY = os.getenv("WEATHER_CITY_NAME", "مشهد").strip() or "مشهد"
+BALE_WEATHER_LAT = os.getenv("WEATHER_LAT", "36.2605").strip()
+BALE_WEATHER_LON = os.getenv("WEATHER_LON", "59.6168").strip()
+BALE_MARKET_URL = "https://iran-market.github.io/data/popular.json"
+CHANNEL_DEFAULTS = {
+    "morning": "🌸 روز خوبی را با انرژی و لبخند شروع کنیم. از همراهی شما با تنین ایران سپاسگزاریم.",
+    "night": "🌙 شبتان آرام و پر از حال خوب. ممنون که همراه تنین ایران هستید.",
+}
+
+
+def meta_get(key):
+    with get_conn() as conn:
+        row=conn.execute("SELECT value FROM app_meta WHERE key=%s",(key,)).fetchone()
+    return row["value"] if row else None
+
+
+def meta_set(key,value):
+    with get_conn() as conn:
+        conn.execute("INSERT INTO app_meta(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,str(value)))
+        conn.commit()
+
+
+def channel_enabled():
+    return str(meta_get("bale_channel_enabled") or "1").lower() not in ("0","false","off","no")
+
+
+def channel_time(kind):
+    fallback="08:00" if kind=="morning" else "21:00"
+    value=meta_get(f"bale_channel_time_{kind}") or fallback
+    return value if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d",value) else fallback
+
+
+def channel_keyboard():
+    return {"inline_keyboard":[
+        [{"text":"▶️ فعال‌سازی خودکار","callback_data":"adm:chresume"},{"text":"⏸ توقف خودکار","callback_data":"adm:chpause"}],
+        [{"text":"⏰ ساعت پست صبح","callback_data":"adm:chtime:morning"},{"text":"⏰ ساعت پست شب","callback_data":"adm:chtime:night"}],
+        [{"text":"➕ ویرایش پیام صبح","callback_data":"adm:chadd:morning"},{"text":"➕ ویرایش پیام شب","callback_data":"adm:chadd:night"}],
+        [{"text":"📤 ارسال پست صبح","callback_data":"adm:chpost:morning"},{"text":"📤 ارسال پست شب","callback_data":"adm:chpost:night"}],
+        [{"text":"🧪 تست دسترسی کانال","callback_data":"adm:chtest"},{"text":"📋 مشاهده پیام‌ها","callback_data":"adm:chlist"}],
+        [{"text":"🧹 حذف آخرین پست‌های ربات","callback_data":"adm:chclear"}],
+        [{"text":"🔄 بروزرسانی","callback_data":"adm:channel"},{"text":"🔙 پنل اصلی","callback_data":"adm:home"}],
+    ]}
+
+
+async def show_admin_channel(api,chat_id,mid=None):
+    channel=BALE_CHANNEL_ID or "تنظیم نشده (متغیر BALE_CHANNEL_ID)"
+    try: enabled=channel_enabled()
+    except Exception: enabled=False
+    text=("📢 <b>مدیریت کانال بله</b>\n\n"
+          f"شناسه کانال: <code>{escape(str(channel))}</code>\n"
+          f"ارسال خودکار: {'فعال 🟢' if enabled else 'متوقف ⏸'}\n"
+          f"☀️ ساعت صبح: {channel_time('morning')}\n🌙 ساعت شب: {channel_time('night')}\n\n"
+          "برای ارسال، ربات باید در کانال دسترسی ارسال پیام داشته باشد. آب‌وهوا و قیمت‌های بازار در صورت دسترس بودن API به پست صبح افزوده می‌شوند.")
+    if mid:
+        try: await api.edit(chat_id,mid,text,channel_keyboard()); return
+        except Exception: pass
+    await api.send(chat_id,text,channel_keyboard())
+
+
+async def channel_build_text(kind):
+    now=datetime.now(IRAN_TZ)
+    saved=meta_get(f"bale_channel_message_{kind}") or CHANNEL_DEFAULTS[kind]
+    if kind=="night": return f"🌙 <b>شب بخیر</b>\n📅 {format_iran_jalali_fa(now,False)}\n\n{escape(saved)}"
+    text=["☀️ <b>صبح بخیر!</b>",f"📅 {format_iran_jalali_fa(now,False)}","",escape(saved)]
+    try:
+        url=("https://api.open-meteo.com/v1/forecast?latitude="+BALE_WEATHER_LAT+"&longitude="+BALE_WEATHER_LON+
+             "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=Asia%2FTehran&forecast_days=1")
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with session.get(url) as resp:
+                if resp.status==200:
+                    data=await resp.json(); cur=data.get("current",{}); daily=data.get("daily",{})
+                    if cur.get("temperature_2m") is not None:
+                        text += ["",f"🌤 <b>{escape(BALE_WEATHER_CITY)}</b>: {round(cur['temperature_2m'])}°؛ کمینه {round((daily.get('temperature_2m_min') or [0])[0])}° و بیشینه {round((daily.get('temperature_2m_max') or [0])[0])}°"]
+    except Exception: log.warning("Bale channel weather block unavailable",exc_info=True)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with session.get(BALE_MARKET_URL) as resp:
+                if resp.status==200:
+                    payload=await resp.json(content_type=None); items={i.get("symbol"):i for i in payload.get("data",[])}; prices=[]
+                    for symbol,label in (("USD_IRR_FREE","💵 دلار"),("GOLD_18K_IRR","🥇 طلای ۱۸ عیار")):
+                        item=items.get(symbol)
+                        if item and item.get("price") and not item.get("stale"):
+                            prices.append(f"{label}: {int(item['price']):,} تومان")
+                    if prices: text += [""]+prices
+    except Exception: log.warning("Bale channel market block unavailable",exc_info=True)
+    return "\n".join(text)
+
+
+async def channel_post(api,kind,chat_id=None):
+    if kind not in ("morning","night"): return False,"نوع پست نامعتبر است."
+    if not BALE_CHANNEL_ID: return False,"متغیر BALE_CHANNEL_ID تنظیم نشده است."
+    text=await channel_build_text(kind)
+    try:
+        result=await api.call("sendMessage",{"chat_id":BALE_CHANNEL_ID,"text":text,"parse_mode":"HTML","disable_notification":True})
+        mid=(result or {}).get("message_id") if isinstance(result,dict) else None
+        now=datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M")
+        meta_set(f"bale_channel_last_{kind}",now)
+        if mid: meta_set(f"bale_channel_post_id_{kind}",mid)
+        return True,f"پست {'صبح' if kind=='morning' else 'شب'} با موفقیت ارسال شد."
+    except Exception as e:
+        log.exception("Bale channel post failed")
+        return False,f"ارسال پست انجام نشد: {str(e)[:250]}"
+
+
+async def channel_scheduler(api):
+    last_minute=None
+    while True:
+        try:
+            now=datetime.now(IRAN_TZ); minute=now.strftime("%Y-%m-%d %H:%M")
+            if minute!=last_minute and channel_enabled() and BALE_CHANNEL_ID:
+                for kind in ("morning","night"):
+                    if now.strftime("%H:%M")==channel_time(kind):
+                        marker=f"bale_channel_sent_date_{kind}"
+                        if meta_get(marker)!=now.strftime("%Y-%m-%d"):
+                            ok,note=await channel_post(api,kind)
+                            if ok: meta_set(marker,now.strftime("%Y-%m-%d"))
+                            else: log.error("Scheduled Bale channel post failed: %s",note)
+                last_minute=minute
+        except asyncio.CancelledError: raise
+        except Exception: log.exception("Bale channel scheduler iteration failed")
+        await asyncio.sleep(20)
+
+
 async def on_message(api, msg):
     chat_id = (msg.get("chat") or {}).get("id")
     user = msg.get("from") or {}
@@ -844,33 +1540,49 @@ async def on_message(api, msg):
     if chat_id is None or uid is None:
         return
 
-    # مدیر منوی مدیریتی جدا دارد و نباید وارد کاتالوگ/سبد/ثبت سفارش شود.
+    restore_checkout(uid)
+    # مدیر منوی مدیریتی جدا دارد؛ جریان‌های ورودی مدیریتی قبل از پیام راهنما بررسی می‌شوند.
     if is_admin(uid):
         if text.startswith("/start") or text in ("/admin", "⚙️ پنل مدیریت", "پنل مدیریت"):
-            CHECKOUT.pop(uid, None)
             await show_admin_home(api, chat_id)
             return
         if text in ("/cancel", "✕ بستن پنل"):
             CHECKOUT.pop(uid, None)
-            await api.send(chat_id, "پنل مدیریت بسته شد. برای بازکردن دوباره /admin را بفرست.")
+            await api.send(chat_id, "عملیات جاری لغو شد. برای بازکردن پنل /admin را بفرست.", admin_keyboard())
+            return
+        if text and await handle_admin_text(api, msg, uid, chat_id, text):
+            return
+        clean_admin_text = re.sub(r"\s+\(\d+\)$", "", text)
+        if clean_admin_text in ("📦 سفارش‌ها", "💳 پرداخت‌های در انتظار", "🛠 مدیریت محصولات", "🎫 پشتیبانی", "👥 مشتری‌ها", "📊 فروش و آمار", "💳 تنظیمات پرداخت", "📢 مدیریت کانال"):
+            section_map={"📦 سفارش‌ها":"orders","💳 پرداخت‌های در انتظار":"pending","🛠 مدیریت محصولات":"products","🎫 پشتیبانی":"tickets","👥 مشتری‌ها":"customers","📊 فروش و آمار":"sales","💳 تنظیمات پرداخت":"payment","📢 مدیریت کانال":"channel"}
+            section=section_map[clean_admin_text]
+            if section=="products": await show_admin_products(api,chat_id)
+            elif section=="payment": await show_admin_banks(api,chat_id)
+            elif section=="tickets": await show_support_tickets(api,chat_id,uid,None,True)
+            elif section=="channel": await show_admin_channel(api,chat_id)
+            else: await show_admin_section(api,chat_id,section)
             return
         if msg.get("photo") or msg.get("document"):
-            await api.send(chat_id, "این حساب در حالت مدیریت است؛ برای مدیریت رسیدها از پنل مدیریت استفاده کن.", admin_keyboard())
+            await api.send(chat_id, "برای بررسی رسیدها از پنل مدیریت استفاده کن.", admin_keyboard())
             return
         await api.send(chat_id, "برای مدیریت فروشگاه از دکمه‌های پنل استفاده کن یا /admin را بفرست.", admin_keyboard())
         return
 
     if text.startswith("/start"):
         CHECKOUT.pop(uid, None)
-        await api.send(chat_id, "🌸 به «تولیدی تنین ایران» خوش آمدی.\nبرای دیدن محصولات یا ثبت سفارش از منوی زیر استفاده کن.", main_keyboard())
+        try: await asyncio.to_thread(db_register_customer, uid, user.get("username", ""))
+        except Exception: log.exception("Could not register Bale customer on /start")
+        await api.send(chat_id, "🌸 به «تولیدی تنین ایران» خوش آمدی.\n\nاز کاتالوگ محصولات دیدن کن، سبد خریدت را مدیریت کن، سفارش‌هایت را پیگیری کن یا از مرکز پشتیبانی کمک بگیر.", main_keyboard(uid))
     elif text == "/cancel":
         CHECKOUT.pop(uid, None)
         await api.send(chat_id, "عملیات جاری لغو شد.", main_keyboard())
     elif text in ("/admin", "⚙️ پنل مدیریت", "پنل مدیریت"):
         await api.send(chat_id, "دسترسی مدیر لازم است.", main_keyboard())
-    elif text.startswith("/") and text not in ("/catalog", "/cart", "/checkout"):
+    elif text.startswith("/") and text not in ("/catalog", "/cart", "/checkout", "/orders", "/support"):
         await api.send(chat_id, "از دکمه‌های منو استفاده کن.", main_keyboard())
     elif await handle_checkout_text(api, msg, uid, chat_id, text):
+        return
+    elif await handle_customer_support_text(api, msg, uid, chat_id, text):
         return
     elif msg.get("photo") or (msg.get("document") and str((msg.get("document") or {}).get("mime_type", "")).startswith("image/")):
         await handle_receipt(api, msg, uid, chat_id)
@@ -880,6 +1592,10 @@ async def on_message(api, msg):
         await show_cart(api, chat_id, uid)
     elif text in ("/checkout", "🛍️ ادامه ثبت سفارش", "🛍 ادامه ثبت سفارش"):
         await start_checkout(api, chat_id, uid)
+    elif text in ("📦 سفارش‌های من", "/orders"):
+        await show_my_orders(api, chat_id, uid)
+    elif text in ("💬 مرکز پشتیبانی", "/support"):
+        await api.send(chat_id,"💬 <b>مرکز پشتیبانی تنین ایران</b>\n\nبرای پیگیری سفارش یا ثبت درخواست، یکی از گزینه‌ها را انتخاب کن:",support_home_keyboard())
     elif text in ("مرد", "زن") and uid in CHECKOUT and CHECKOUT[uid].get("step") == "gender":
         await handle_checkout_text(api, msg, uid, chat_id, text)
 
@@ -895,6 +1611,7 @@ async def on_callback(api, cb):
         await api.answer(cbid)
         return
     try:
+        restore_checkout(uid)
         # پنل مدیریت فقط برای شناسه‌های موجود در BALE_ADMIN_IDS مجاز است.
         if data.startswith("adm:"):
             if not is_admin(uid):
@@ -910,7 +1627,12 @@ async def on_callback(api, cb):
                     try: await api.call("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": "پنل مدیریت بسته شد."})
                     except Exception: await api.send(chat_id, "پنل مدیریت بسته شد.")
             elif section in ("pending", "orders", "products", "customers", "sales", "tickets", "channel", "payment"):
-                await show_admin_section(api, chat_id, section)
+                if section == "products": await show_admin_products(api, chat_id, mid)
+                elif section == "payment": await show_admin_banks(api, chat_id, mid)
+                elif section == "tickets": await show_support_tickets(api, chat_id, uid, mid, True, action[2] if len(action)>2 else "all")
+                elif section == "channel": await show_admin_channel(api,chat_id,mid)
+                elif section == "customers": await show_admin_section(api, chat_id, section)
+                else: await show_admin_section(api, chat_id, section)
             elif section == "pendingdetail" and len(action) == 3:
                 await show_admin_pending_detail(api, chat_id, int(action[2]))
             elif section == "receipt" and len(action) == 3:
@@ -949,18 +1671,250 @@ async def on_callback(api, cb):
                 else:
                     status_text = "تأیید شده" if new_status == "confirmed" else "لغو شده"
                     with get_conn() as conn:
-                        conn.execute("UPDATE orders SET status=%s WHERE id=%s AND status='در انتظار بررسی'", (status_text, oid))
+                        changed = conn.execute("UPDATE orders SET status=%s WHERE id=%s AND status='در انتظار بررسی' RETURNING user_id,total_price", (status_text, oid)).fetchone()
                         conn.commit()
                     await api.send(chat_id, f"وضعیت سفارش #{oid} به «{status_text}» تغییر کرد.", admin_back("orders"))
+                    if changed:
+                        customer_text = (f"✅ وضعیت سفارش #{oid} تغییر کرد: {status_text}" if new_status == "confirmed" else f"❌ سفارش #{oid} لغو شد. برای پیگیری با پشتیبانی تماس بگیر.")
+                        try: await api.send(int(changed["user_id"]), customer_text, main_keyboard(int(changed["user_id"])))
+                        except Exception: log.exception("Could not notify customer for order status change %s", oid)
+            elif section == "add_product":
+                CHECKOUT[uid] = {"admin_flow":{"type":"add_product","step":"name"}}
+                await api.send(chat_id,"➕ افزودن محصول\nنام محصول را وارد کن:")
+            elif section == "product" and len(action)==3:
+                await show_admin_product(api,chat_id,int(action[2]),mid)
+            elif section == "product_field" and len(action)==4:
+                pid=int(action[2]); field=action[3]
+                if field not in {"name","category","size","color","pack_info","price","photo_url"}: await api.send(chat_id,"فیلد نامعتبر است."); return
+                CHECKOUT[uid]={"admin_flow":{"type":"product_field","product_id":pid,"field":field}}
+                labels={"name":"نام جدید را وارد کن:","category":"دسته جدید را وارد کن: بچگانه یا زنانه","size":"سایز جدید را وارد کن:","color":"رنگ‌بندی جدید را وارد کن:","pack_info":"اطلاعات پک جدید را وارد کن (یا ندارد):","price":"قیمت جدید را به تومان وارد کن:","photo_url":"لینک عکس جدید را وارد کن (یا ندارد):"}
+                await api.send(chat_id,labels[field])
+            elif section == "price_adjust" and len(action)==4:
+                pid=int(action[2]); delta=int(action[3])
+                with get_conn() as conn:
+                    p=conn.execute("SELECT price FROM products WHERE id=%s",(pid,)).fetchone()
+                    if p:
+                        new_price=max(0,int(p["price"] or 0)+delta)
+                        conn.execute("UPDATE products SET price=%s WHERE id=%s",(new_price,pid)); conn.commit()
+                await api.send(chat_id,(f"قیمت محصول #{pid} به {new_price:,} تومان تغییر کرد." if p else "محصول پیدا نشد."),admin_back("products"))
+            elif section == "price_set" and len(action)==3:
+                pid=int(action[2]); CHECKOUT[uid]={"admin_flow":{"type":"product_field","product_id":pid,"field":"price"}}
+                await api.send(chat_id,"قیمت جدید را به تومان وارد کن:")
+            elif section == "toggle_product" and len(action)==3:
+                pid=int(action[2])
+                with get_conn() as conn:
+                    product=conn.execute("SELECT active FROM products WHERE id=%s",(pid,)).fetchone()
+                    if product: conn.execute("UPDATE products SET active=%s WHERE id=%s",(not bool(product["active"]),pid)); conn.commit()
+                await show_admin_product(api,chat_id,pid)
+            elif section == "delete_product" and len(action)==3:
+                pid=int(action[2])
+                # Keep historical order lines intact: deletion is a safe soft-disable.
+                with get_conn() as conn: conn.execute("UPDATE products SET active=FALSE WHERE id=%s",(pid,)); conn.commit()
+                await api.send(chat_id,"محصول غیرفعال شد؛ سابقه سفارش‌ها حفظ شده است.",admin_back("products"))
+            elif section == "bank_add":
+                CHECKOUT[uid]={"admin_flow":{"type":"bank_add","index":0,"data":{}}}
+                await api.send(chat_id,"➕ افزودن حساب بانکی\nنام بانک را وارد کن:")
+            elif section == "bank_edit" and len(action)==3:
+                aid=int(action[2])
+                with get_conn() as conn: bank=conn.execute("SELECT * FROM bank_accounts WHERE id=%s",(aid,)).fetchone()
+                if not bank: await api.send(chat_id,"حساب پیدا نشد."); return
+                CHECKOUT[uid]={"admin_flow":{"type":"bank_edit","account_id":aid,"index":0,"data":{}}}
+                await api.send(chat_id,f"ویرایش حساب #{aid} — نام بانک جدید را وارد کن:")
+            elif section == "bank" and len(action)==3: await show_admin_bank(api,chat_id,int(action[2]),mid)
+            elif section == "bank_toggle" and len(action)==3:
+                aid=int(action[2]); now=iran_now_text()
+                with get_conn() as conn:
+                    bank=conn.execute("SELECT active FROM bank_accounts WHERE id=%s",(aid,)).fetchone()
+                    if bank and not bank["active"]:
+                        conn.execute("UPDATE bank_accounts SET active=FALSE,updated_at=%s",(now,))
+                        conn.execute("UPDATE bank_accounts SET active=TRUE,updated_at=%s WHERE id=%s",(now,aid)); conn.commit(); note="حساب فعال شد و حساب‌های دیگر غیرفعال شدند."
+                    elif bank:
+                        other=conn.execute("SELECT id FROM bank_accounts WHERE id<>%s AND active=TRUE LIMIT 1",(aid,)).fetchone()
+                        if other: conn.execute("UPDATE bank_accounts SET active=FALSE,updated_at=%s WHERE id=%s",(now,aid)); conn.commit(); note="حساب غیرفعال شد."
+                        else: note="این تنها حساب فعال است؛ ابتدا حساب دیگری اضافه و فعال کن."
+                    else: note="حساب پیدا نشد."
+                await api.send(chat_id,note,admin_back("payment"))
+            elif section == "bank_delete" and len(action)==3:
+                aid=int(action[2]); now=iran_now_text()
+                with get_conn() as conn:
+                    bank=conn.execute("SELECT active FROM bank_accounts WHERE id=%s",(aid,)).fetchone()
+                    if not bank: note="حساب پیدا نشد."
+                    elif bank["active"]: note="حساب فعال را نمی‌توان حذف کرد؛ ابتدا حساب دیگری را فعال کن."
+                    else: conn.execute("DELETE FROM bank_accounts WHERE id=%s",(aid,)); conn.commit(); note="حساب غیرفعال حذف شد."
+                await api.send(chat_id,note,admin_back("payment"))
+            elif section == "chpause":
+                meta_set("bale_channel_enabled","0"); await show_admin_channel(api,chat_id)
+            elif section == "chresume":
+                meta_set("bale_channel_enabled","1"); await show_admin_channel(api,chat_id)
+            elif section == "chtime" and len(action)==3 and action[2] in ("morning","night"):
+                CHECKOUT[uid]={"admin_flow":{"type":"channel_time","kind":action[2]}}
+                await api.send(chat_id,f"ساعت پست {'صبح' if action[2]=='morning' else 'شب'} را به شکل HH:MM وارد کن (مثال 08:15):")
+            elif section == "chadd" and len(action)==3 and action[2] in ("morning","night"):
+                CHECKOUT[uid]={"admin_flow":{"type":"channel_message","kind":action[2]}}
+                await api.send(chat_id,"متن جدید پست را ارسال کن:")
+            elif section == "chpost" and len(action)==3 and action[2] in ("morning","night"):
+                ok,note=await channel_post(api,action[2]); await api.send(chat_id,("✅ " if ok else "❌ ")+note,admin_back("channel"))
+            elif section == "chtest":
+                if not BALE_CHANNEL_ID: await api.send(chat_id,"❌ متغیر BALE_CHANNEL_ID تنظیم نشده است.",admin_back("channel"))
+                else:
+                    try:
+                        await api.call("sendMessage",{"chat_id":BALE_CHANNEL_ID,"text":"🧪 تست دسترسی ربات تنین ایران به کانال بله","disable_notification":True})
+                        await api.send(chat_id,"✅ پیام آزمایشی ارسال شد. دسترسی ارسال پیام تأیید شد.",admin_back("channel"))
+                    except Exception as e: await api.send(chat_id,f"❌ ارسال آزمایشی ناموفق بود: {escape(str(e)[:250])}",admin_back("channel"))
+            elif section == "chclear":
+                deleted=0; errors=0
+                for kind in ("morning","night"):
+                    key=f"bale_channel_post_id_{kind}"; saved_id=meta_get(key)
+                    if saved_id and BALE_CHANNEL_ID:
+                        try:
+                            await api.call("deleteMessage",{"chat_id":BALE_CHANNEL_ID,"message_id":int(saved_id)})
+                            deleted+=1
+                        except Exception: errors+=1
+                        try:
+                            with get_conn() as conn: conn.execute("DELETE FROM app_meta WHERE key=%s",(key,)); conn.commit()
+                        except Exception: log.exception("Could not clear channel post marker")
+                await api.send(chat_id,f"🧹 حذف آخرین پست‌ها تمام شد. حذف‌شده: {deleted}، خطا: {errors}.",admin_back("channel"))
+            elif section == "chlist":
+                morning=meta_get("bale_channel_message_morning") or CHANNEL_DEFAULTS["morning"]
+                night=meta_get("bale_channel_message_night") or CHANNEL_DEFAULTS["night"]
+                await api.send(chat_id,"📋 <b>متن‌های کانال</b>\n\n☀️ <b>صبح:</b>\n"+escape(morning)+"\n\n🌙 <b>شب:</b>\n"+escape(night),admin_back("channel"))
+            elif section == "ticket" and len(action)==3: await show_ticket_detail(api,chat_id,uid,int(action[2]),mid,True)
+            elif section == "ticket_reply" and len(action)==3:
+                tid=int(action[2])
+                CHECKOUT[uid]={"admin_flow":{"type":"ticket_reply","ticket_id":tid}}
+                await api.send(chat_id,f"💬 پاسخ خود را برای تیکت #{tid} بنویس:")
+            elif section == "ticket_close" and len(action)==3:
+                tid=int(action[2]); now=iran_now_text()
+                with get_conn() as conn:
+                    t=conn.execute("SELECT user_id FROM support_tickets WHERE id=%s AND status<>'closed'",(tid,)).fetchone()
+                    if t: conn.execute("UPDATE support_tickets SET status='closed',closed_at=%s,updated_at=%s WHERE id=%s",(now,now,tid)); conn.commit()
+                if t:
+                    try: await api.send(int(t["user_id"]),f"🎫 تیکت #{tid} توسط پشتیبانی بسته شد.",main_keyboard(int(t["user_id"])))
+                    except Exception: log.exception("Could not notify ticket closure")
+                await api.send(chat_id,f"تیکت #{tid} بسته شد.",admin_back("tickets"))
+            elif section == "customer" and len(action)==3: await show_admin_customer(api,chat_id,int(action[2]),mid)
             else:
                 await api.send(chat_id, "این عملیات مدیریتی هنوز پیاده‌سازی نشده است.", admin_keyboard())
             return
 
         # مدیر نباید بتواند از callbackهای مشتری برای ساخت سبد یا سفارش استفاده کند.
-        if is_admin(uid) and (data.startswith(("cat:", "add:", "qty:", "remove:", "checkout:", "saved:"))):
+        if is_admin(uid) and data.startswith(("cat:", "add:", "qty:", "remove:", "checkout:", "checkoutqty:", "saved:", "customer_order:", "support:", "nameconfirm:", "checkoutgender:", "pay:receipt:", "pay:card:")):
             await api.answer(cbid, "این حساب فقط برای مدیریت فروشگاه است.", True)
             return
 
+        if data.startswith("checkoutqty:"):
+            await api.answer(cbid)
+            parts=data.split(":")
+            action=parts[1]
+            if action in ("plus","minus") and len(parts)==3:
+                cid=int(parts[2])
+                with get_conn() as conn:
+                    row=conn.execute("SELECT ci.id,ci.qty FROM cart_items ci WHERE ci.id=%s AND ci.user_id=%s",(cid,uid)).fetchone()
+                    if row:
+                        qty=int(row["qty"])+(1 if action=="plus" else -1)
+                        if qty<=0: conn.execute("DELETE FROM cart_items WHERE id=%s AND user_id=%s",(cid,uid))
+                        else: conn.execute("UPDATE cart_items SET qty=%s WHERE id=%s AND user_id=%s",(qty,cid,uid))
+                        conn.commit()
+                await show_checkout_quantities(api,chat_id,uid,mid); return
+            if action=="noop": return
+            if action=="back": await show_cart(api,chat_id,uid); return
+            if action=="delete_menu":
+                rows=await asyncio.to_thread(db_cart,uid)
+                buttons=[[{"text":f"🗑 {str(r['name'])[:28]}","callback_data":f"checkoutqty:delete:{r['cart_id']}"}] for r in rows]
+                buttons.append([{"text":"🔙 بازگشت","callback_data":"checkoutqty:refresh"}])
+                await api.send(chat_id,"کدام محصول از سبد حذف شود؟",{"inline_keyboard":buttons}); return
+            if action=="delete" and len(parts)==3:
+                await asyncio.to_thread(db_remove_cart,uid,int(parts[2])); await show_checkout_quantities(api,chat_id,uid); return
+            if action=="refresh": await show_checkout_quantities(api,chat_id,uid); return
+            if action=="continue":
+                state=CHECKOUT.get(uid) or PersistentState(uid,{})
+                state["step"]="name"
+                saved=await asyncio.to_thread(db_saved_data,uid,"name")
+                if saved:
+                    await api.send(chat_id,"👤 نام و نام خانوادگی را انتخاب کن یا نام جدید وارد کن:",await asyncio.to_thread(saved_keyboard,uid,"name","name"))
+                else: await api.send(chat_id,"👤 نام و نام خانوادگی را وارد کن:")
+                return
+        if data.startswith("nameconfirm:"):
+            await api.answer(cbid)
+            state=restore_checkout(uid)
+            if not state or state.get("step")!="confirm_name":
+                await api.send(chat_id,"این مرحله منقضی شده است؛ دوباره ثبت سفارش را شروع کن.",main_keyboard(uid)); return
+            action=data.split(":",1)[1]
+            if action=="edit":
+                state["step"]="name"; await api.send(chat_id,"نام و نام خانوادگی صحیح را وارد کن:"); return
+            state["step"]="phone"
+            saved=await asyncio.to_thread(db_saved_data,uid,"phone")
+            if saved: await api.send(chat_id,"📱 شماره موبایل را انتخاب کن یا شماره جدید وارد کن:",await asyncio.to_thread(saved_keyboard,uid,"phone","phone"))
+            else: await api.send(chat_id,"📱 شماره موبایل ایرانی را وارد کن (مثال: 09123456789).")
+            return
+        if data.startswith("checkoutgender:"):
+            gender=data.split(":",1)[1]
+            if gender not in ("مرد","زن"):
+                await api.answer(cbid,"گزینه نامعتبر است.",True); return
+            state=restore_checkout(uid)
+            if not state or state.get("step")!="gender":
+                await api.answer(cbid,"این مرحله منقضی شده است؛ دوباره ثبت سفارش را شروع کن.",True); return
+            state["gender"]=gender; state["step"]="address"
+            await asyncio.to_thread(set_known_gender,uid,state.get("full_name",""),gender)
+            await api.answer(cbid,"ثبت شد.")
+            await ask_bale_address(api,chat_id,uid); return
+        if data.startswith("customer_order:"):
+            parts=data.split(":")
+            action=parts[1] if len(parts)>1 else "list"
+            if action=="close":
+                await api.answer(cbid)
+                try: await api.call("deleteMessage",{"chat_id":chat_id,"message_id":mid})
+                except Exception: await api.edit(chat_id,mid,"منوی سفارش‌ها بسته شد.")
+                return
+            if action=="list": await api.answer(cbid); await show_my_orders(api,chat_id,uid,mid); return
+            if action=="view" and len(parts)==3:
+                oid=int(parts[2])
+                with get_conn() as conn: order=conn.execute("SELECT * FROM orders WHERE id=%s AND user_id=%s",(oid,uid)).fetchone()
+                if not order: await api.answer(cbid,"این سفارش برای حساب شما پیدا نشد.",True); return
+                finalized=order.get("finalized_at") or order.get("created_at")
+                text=(f"📦 <b>جزئیات سفارش #{oid}</b>\n━━━━━━━━━━━━━━\n"
+                      f"📅 تاریخ: {format_iran_jalali_fa(order.get('created_at'),True)}\n"
+                      f"✅ نهایی‌شدن: {format_iran_jalali_fa(finalized,True)}\n"
+                      f"📌 وضعیت: {escape(str(order.get('status') or '-'))}\n"
+                      f"💳 پرداخت: {escape(str(order.get('payment_status') or '-'))}\n\n"
+                      f"👤 نام: {escape(str(order.get('full_name') or '-'))}\n📞 تلفن: {escape(str(order.get('phone') or '-'))}\n"
+                      f"📍 آدرس: {escape(str(order.get('address') or '-'))}\n\n🛍 محصولات:\n{escape(str(order.get('items_summary') or '-'))}\n\n"
+                      f"💰 مبلغ: <b>{int(order.get('total_price') or 0):,} تومان</b>")
+                await api.answer(cbid)
+                try: await api.edit(chat_id,mid,text,{"inline_keyboard":[[{"text":"🔙 بازگشت به سفارش‌ها","callback_data":"customer_order:list"}]]})
+                except Exception: await api.send(chat_id,text,{"inline_keyboard":[[{"text":"🔙 بازگشت به سفارش‌ها","callback_data":"customer_order:list"}]]})
+                return
+        if data.startswith("support:"):
+            parts=data.split(":",2); action=parts[1] if len(parts)>1 else "home"; extra=parts[2] if len(parts)>2 else ""
+            await api.answer(cbid)
+            if action=="home": await api.send(chat_id,"💬 <b>مرکز پشتیبانی</b>\n\nیک گزینه را انتخاب کن:",support_home_keyboard()); return
+            if action=="orders":
+                with get_conn() as conn: rows=conn.execute("SELECT id,created_at,status FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 20",(uid,)).fetchall()
+                buttons=[[{"text":f"📦 سفارش #{o['id']} · {format_iran_jalali_fa(o.get('created_at'),False)} · {str(o['status'])[:12]}","callback_data":f"customer_order:view:{o['id']}"}] for o in rows]
+                buttons.append([{"text":"🔙 مرکز پشتیبانی","callback_data":"support:home"}])
+                await api.send(chat_id,"📦 سفارش موردنظر را برای مشاهده جزئیات انتخاب کن:",{"inline_keyboard":buttons}); return
+            if action=="faq":
+                await api.send(chat_id,"❓ <b>سؤالات متداول</b>\n\n🛒 ثبت سفارش: محصول را انتخاب و مراحل ثبت سفارش را کامل کن.\n\n💳 پرداخت: کارت‌به‌کارت انجام بده و تصویر رسید را ارسال کن؛ سفارش پس از بررسی نهایی می‌شود.\n\n🚚 ارسال: زمان ارسال پس از ثبت سفارش هماهنگ می‌شود.\n\n🔄 تعویض و مرجوعی: درخواست را از طریق تیکت ثبت کن.",{"inline_keyboard":[[{"text":"🔙 مرکز پشتیبانی","callback_data":"support:home"}]]}); return
+            if action=="phone": await api.send(chat_id,"📞 شماره تماس پشتیبانی: 09384853486",{"inline_keyboard":[[{"text":"🔙 مرکز پشتیبانی","callback_data":"support:home"}]]}); return
+            if action=="mine": await show_support_tickets(api,chat_id,uid,mid,False); return
+            if action=="new":
+                CHECKOUT[uid]={"step":"support_new_message","support_topic":"سایر"}
+                await api.send(chat_id,"📝 درخواستت را در یک پیام بنویس. برای لغو /cancel بفرست.",{"inline_keyboard":[[{"text":"💳 پرداخت","callback_data":"support:topic:پرداخت"},{"text":"🛍 محصول","callback_data":"support:topic:محصول"}], [{"text":"🚚 ارسال","callback_data":"support:topic:ارسال"},{"text":"🔄 تعویض","callback_data":"support:topic:تعویض"}], [{"text":"❓ سایر","callback_data":"support:topic:سایر"}]]}); return
+            if action=="topic":
+                state=restore_checkout(uid)
+                state["step"]="support_new_message"; state["support_topic"]=extra or "سایر"
+                await api.send(chat_id,f"🏷 موضوع: <b>{escape(state['support_topic'])}</b>\n\nحالا متن درخواستت را بفرست:"); return
+            if action=="reply":
+                try: tid=int(extra)
+                except ValueError: await api.send(chat_id,"شناسه تیکت نامعتبر است."); return
+                with get_conn() as conn: ticket=conn.execute("SELECT id FROM support_tickets WHERE id=%s AND user_id=%s AND status!='closed'",(tid,uid)).fetchone()
+                if not ticket: await api.send(chat_id,"تیکت پیدا نشد یا بسته شده است."); return
+                CHECKOUT[uid]={"step":"support_reply","ticket_id":tid}
+                await api.send(chat_id,f"💬 پیام جدیدت برای تیکت #{tid} را بفرست:"); return
+            if action=="view":
+                try: tid=int(extra)
+                except ValueError: await api.send(chat_id,"شناسه تیکت نامعتبر است."); return
+                await show_ticket_detail(api,chat_id,uid,tid,mid,False); return
         if data.startswith("cat:"):
             await api.answer(cbid)
             category = data.split(":", 1)[1]
@@ -1027,15 +1981,18 @@ async def on_callback(api, cb):
                 state = CHECKOUT[uid]
                 value = str(row["value"])
                 if step == "name":
-                    state["full_name"] = value; state["step"] = "phone"
-                    saved = await asyncio.to_thread(db_saved_data, uid, "phone")
+                    state["full_name"] = normalize_name(value); state["step"] = "confirm_name"
                     await api.answer(cbid, "نام انتخاب شد.")
-                    if saved: await api.send(chat_id, "📱 شماره موبایل را انتخاب کن یا شماره جدید وارد کن:", await asyncio.to_thread(saved_keyboard, uid, "phone", "phone"))
-                    else: await api.send(chat_id, "📱 شماره موبایل ایرانی را وارد کن (مثال: 09123456789).")
+                    await api.send(chat_id, f"👤 نام ثبت سفارش: <b>{escape(state['full_name'])}</b>\n\nآیا این نام درست است؟", {"inline_keyboard":[[{"text":"✅ تأیید نام","callback_data":"nameconfirm:yes"},{"text":"✏️ ویرایش نام","callback_data":"nameconfirm:edit"}]]})
                 elif step == "phone":
-                    state["phone"] = value; state["step"] = "gender"
+                    state["phone"] = value
+                    known = await asyncio.to_thread(get_known_gender, uid, state.get("full_name", ""))
                     await api.answer(cbid, "شماره انتخاب شد.")
-                    await api.send(chat_id, "جنسیت را انتخاب کن:", {"keyboard": [[{"text": "مرد"}, {"text": "زن"}], [{"text": "/cancel"}]], "resize_keyboard": True})
+                    if known:
+                        state["gender"] = known; state["step"] = "address"; await ask_bale_address(api, chat_id, uid)
+                    else:
+                        state["step"] = "gender"
+                        await api.send(chat_id, "جنسیت را انتخاب کن:", {"inline_keyboard":[[{"text":"مرد","callback_data":"checkoutgender:مرد"},{"text":"زن","callback_data":"checkoutgender:زن"}]]})
                 elif step == "address":
                     state["address"] = value
                     await api.answer(cbid, "آدرس انتخاب شد.")
@@ -1090,6 +2047,17 @@ async def on_callback(api, cb):
                 await api.send(chat_id, "اطلاعات ذخیره‌شده:", await asyncio.to_thread(saved_keyboard, uid, data_type, data_type))
             else:
                 await api.answer(cbid)
+        elif data.startswith("pay:card:"):
+            parts=data.split(":"); pid=int(parts[2]) if len(parts)>2 else 0
+            with get_conn() as conn:
+                pending=conn.execute("SELECT id,user_id,payment_status FROM pending_payments WHERE id=%s",(pid,)).fetchone()
+                bank=conn.execute("SELECT card_number,bank_name,owner_name FROM bank_accounts WHERE active=TRUE ORDER BY id DESC LIMIT 1").fetchone()
+            if not pending or int(pending["user_id"])!=int(uid):
+                await api.answer(cbid,"این پرداخت برای حساب شما نیست.",True); return
+            await api.answer(cbid)
+            if bank and bank.get("card_number"):
+                await api.send(chat_id,f"💳 شماره کارت برای کپی:\n<code>{escape(str(bank['card_number']))}</code>\nبانک: {escape(str(bank.get('bank_name') or '-'))}\nبه نام: {escape(str(bank.get('owner_name') or '-'))}\n\nبرای کپی، روی شماره کارت لمس طولانی کن.")
+            else: await api.send(chat_id,"شماره کارت فعال تنظیم نشده است.")
         elif data.startswith("pay:receipt:"):
             await api.answer(cbid)
             await api.send(chat_id, "📤 لطفاً عکس رسید بانکی را به‌صورت عکس در همین گفتگو ارسال کن. بهتر است شماره پیگیری و مبلغ خوانا باشند.")
@@ -1141,7 +2109,7 @@ async def main():
     if not DB_URL:
         raise RuntimeError("متغیر SUPABASE_DB_URL یا DATABASE_URL تنظیم نشده است.")
     def check_db():
-        required = {"products", "customers", "cart_items", "bank_accounts", "pending_payments", "orders"}
+        required = {"products", "customers", "customer_saved_data", "support_tickets", "support_ticket_messages", "cart_items", "bank_accounts", "pending_payments", "orders", "app_meta"}
         with get_conn() as conn:
             found = {r["table_name"] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public'").fetchall()}
             missing = sorted(required - found)
@@ -1150,10 +2118,14 @@ async def main():
             for table, columns in {
                 "products": {"id", "name", "category", "price", "active", "photo_url", "pack_info", "size", "color"},
                 "cart_items": {"id", "user_id", "product_id", "qty"},
-                "bank_accounts": {"id", "bank_name", "owner_name", "card_number", "account_number", "iban", "active"},
+                "bank_accounts": {"id", "bank_name", "owner_name", "card_number", "account_number", "iban", "active", "created_at", "updated_at"},
                 "pending_payments": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "payment_status", "receipt_file_id", "created_at", "reviewed_at", "order_id", "admin_id"},
                 "orders": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "status", "created_at", "finalized_at", "payment_status", "transaction_ref"},
                 "customers": {"user_id", "username", "full_name", "phone", "gender", "first_seen", "last_seen"},
+                "customer_saved_data": {"id", "user_id", "data_type", "value", "created_at", "updated_at"},
+                "support_tickets": {"id", "user_id", "order_id", "topic", "status", "created_at", "updated_at", "closed_at"},
+                "support_ticket_messages": {"id", "ticket_id", "sender_id", "sender_type", "message", "created_at"},
+                "app_meta": {"key", "value"},
             }.items():
                 actual = {r["column_name"] for r in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=%s", (table,)).fetchall()}
                 miss = sorted(columns - actual)
@@ -1178,6 +2150,7 @@ async def main():
         log.info("Health server listening on port %s", port)
         offset = None
         log.info("Bale shop bot started; checkout enabled.")
+        channel_task = asyncio.create_task(channel_scheduler(api), name="bale-channel-scheduler")
         try:
             while True:
                 try:
@@ -1196,6 +2169,9 @@ async def main():
                     log.exception("Polling error; retrying in 4 seconds")
                     await asyncio.sleep(4)
         finally:
+            channel_task.cancel()
+            try: await channel_task
+            except asyncio.CancelledError: pass
             await runner.cleanup()
 
 
