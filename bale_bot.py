@@ -784,23 +784,171 @@ def db_record_receipt(uid, file_id):
         return result
 
 
+
+
+def _award_loyalty_cashback(conn, platform, platform_user_id, order_id,
+                            eligible_amount_toman, display_name=None, phone=None):
+    """
+    Create/reuse a platform-specific loyalty identity and award 3% cashback.
+    Must be called inside the same DB transaction that finalizes the order.
+    Phone numbers are intentionally NOT used to merge identities because the
+    current checkout does not verify phone ownership.
+    """
+    eligible = max(0, int(eligible_amount_toman or 0))
+    cashback = (eligible * 3) // 100
+    if cashback <= 0:
+        return 0
+
+    platform_user_id = str(platform_user_id)
+    lock_key = f"loyalty-account:{platform}:{platform_user_id}"
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,))
+
+    account = conn.execute(
+        """SELECT loyalty_customer_id
+           FROM customer_platform_accounts
+           WHERE platform=%s AND platform_user_id=%s
+           FOR UPDATE""",
+        (platform, platform_user_id),
+    ).fetchone()
+
+    if account:
+        loyalty_customer_id = account["loyalty_customer_id"]
+        conn.execute(
+            """UPDATE customer_platform_accounts
+               SET last_seen_at=NOW(), username=COALESCE(%s, username)
+               WHERE platform=%s AND platform_user_id=%s""",
+            (None, platform, platform_user_id),
+        )
+        if display_name:
+            conn.execute(
+                """UPDATE loyalty_customers SET display_name=%s, updated_at=NOW()
+                   WHERE id=%s""",
+                (str(display_name)[:250], loyalty_customer_id),
+            )
+    else:
+        customer = conn.execute(
+            """INSERT INTO loyalty_customers(display_name)
+               VALUES(%s) RETURNING id""",
+            (str(display_name)[:250] if display_name else None,),
+        ).fetchone()
+        loyalty_customer_id = customer["id"]
+        conn.execute(
+            """INSERT INTO customer_platform_accounts
+               (loyalty_customer_id, platform, platform_user_id, linked_at, last_seen_at)
+               VALUES(%s,%s,%s,NOW(),NOW())""",
+            (loyalty_customer_id, platform, platform_user_id),
+        )
+
+    conn.execute(
+        """INSERT INTO wallet_accounts(loyalty_customer_id)
+           VALUES(%s) ON CONFLICT(loyalty_customer_id) DO NOTHING""",
+        (loyalty_customer_id,),
+    )
+    conn.execute(
+        """INSERT INTO sms_customer_preferences(loyalty_customer_id)
+           VALUES(%s) ON CONFLICT(loyalty_customer_id) DO NOTHING""",
+        (loyalty_customer_id,),
+    )
+
+    source_order_id = str(order_id)
+    link = conn.execute(
+        """INSERT INTO loyalty_order_links
+           (platform, source_order_id, loyalty_customer_id, order_status,
+            eligible_items_amount_toman, shipping_amount_toman, paid_at,
+            cashback_processed_at)
+           VALUES(%s,%s,%s,'paid',%s,0,NOW(),NOW())
+           ON CONFLICT(platform, source_order_id) DO NOTHING
+           RETURNING id""",
+        (platform, source_order_id, loyalty_customer_id, eligible),
+    ).fetchone()
+
+    # Existing link means this order was already processed; do not award twice.
+    if not link:
+        return 0
+
+    wallet = conn.execute(
+        """SELECT id, balance_toman FROM wallet_accounts
+           WHERE loyalty_customer_id=%s FOR UPDATE""",
+        (loyalty_customer_id,),
+    ).fetchone()
+    new_balance = int(wallet["balance_toman"]) + cashback
+    source_id = f"{platform}:{source_order_id}"
+    idempotency_key = f"cashback:{platform}:{source_order_id}"
+
+    conn.execute(
+        """INSERT INTO wallet_transactions
+           (wallet_account_id, transaction_type, amount_toman, balance_after_toman,
+            source_type, source_id, idempotency_key, note, metadata)
+           VALUES(%s,'cashback',%s,%s,'order',%s,%s,%s,%s::jsonb)""",
+        (
+            wallet["id"], cashback, new_balance, source_id, idempotency_key,
+            f"کش‌بک ۳٪ سفارش {platform}:{source_order_id}",
+            json.dumps({
+                "platform": platform,
+                "order_id": source_order_id,
+                "eligible_items_amount_toman": eligible,
+                "rate_percent": 3,
+                "shipping_excluded": True,
+            }, ensure_ascii=False),
+        ),
+    )
+    conn.execute(
+        """UPDATE wallet_accounts
+           SET balance_toman=%s, updated_at=NOW()
+           WHERE id=%s""",
+        (new_balance, wallet["id"]),
+    )
+    return cashback
+
+
 def db_review_payment(pid, admin_id, approve):
     with get_conn() as conn:
         now = __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
         with conn.transaction():
-            pending = conn.execute("SELECT * FROM pending_payments WHERE id=%s FOR UPDATE", (pid,)).fetchone()
+            pending = conn.execute(
+                "SELECT * FROM pending_payments WHERE id=%s FOR UPDATE", (pid,)
+            ).fetchone()
             if not pending or pending["payment_status"] != "در انتظار بررسی":
                 return None, "already"
             if not approve:
-                conn.execute("UPDATE pending_payments SET payment_status='رد شد',reviewed_at=%s,admin_id=%s WHERE id=%s", (now, admin_id, pid))
+                conn.execute(
+                    """UPDATE pending_payments
+                       SET payment_status='رد شد',reviewed_at=%s,admin_id=%s
+                       WHERE id=%s""",
+                    (now, admin_id, pid),
+                )
                 return dict(pending), "rejected"
-            order = conn.execute("""INSERT INTO orders
-                (user_id,full_name,phone,address,items_summary,total_price,status,created_at,finalized_at,payment_status,transaction_ref)
-                VALUES(%s,%s,%s,%s,%s,%s,'در انتظار بررسی',%s,%s,'تأیید شده',%s) RETURNING id""",
-                (pending["user_id"],pending["full_name"],pending["phone"],pending["address"],pending["items_summary"],pending["total_price"],now,now,f"BALE-CARD-TRANSFER-{pid}")).fetchone()
+
+            order = conn.execute(
+                """INSERT INTO orders
+                   (user_id,full_name,phone,address,items_summary,total_price,status,
+                    created_at,finalized_at,payment_status,transaction_ref)
+                   VALUES(%s,%s,%s,%s,%s,%s,'در انتظار بررسی',%s,%s,'تأیید شده',%s)
+                   RETURNING id""",
+                (
+                    pending["user_id"], pending["full_name"], pending["phone"],
+                    pending["address"], pending["items_summary"], pending["total_price"],
+                    now, now, f"BALE-CARD-TRANSFER-{pid}",
+                ),
+            ).fetchone()
+
+            cashback_amount = _award_loyalty_cashback(
+                conn=conn,
+                platform="bale",
+                platform_user_id=pending["user_id"],
+                order_id=order["id"],
+                eligible_amount_toman=pending["total_price"],
+                display_name=pending["full_name"],
+                phone=pending["phone"],
+            )
             conn.execute("DELETE FROM cart_items WHERE user_id=%s", (pending["user_id"],))
-            conn.execute("UPDATE pending_payments SET payment_status='تأیید شده',reviewed_at=%s,admin_id=%s,order_id=%s WHERE id=%s", (now, admin_id, order["id"], pid))
-            return dict(pending), f"approved:{order['id']}"
+            conn.execute(
+                """UPDATE pending_payments
+                   SET payment_status='تأیید شده',reviewed_at=%s,admin_id=%s,order_id=%s
+                   WHERE id=%s""",
+                (now, admin_id, order["id"], pid),
+            )
+            return dict(pending), f"approved:{order['id']}:{cashback_amount}"
 
 
 async def show_catalog(api, chat_id):
@@ -2070,8 +2218,12 @@ async def on_callback(api, cb):
                 await api.answer(cbid, "این پرداخت قبلاً بررسی شده یا پیدا نشد.", True); return
             await api.answer(cbid, "بررسی ثبت شد.")
             if action == "approve":
-                await api.send(chat_id, f"✅ پرداخت #{pid_s} تأیید شد و سفارش #{result.split(':',1)[1]} ثبت شد.")
-                customer_msg = f"✅ پرداخت شما تأیید شد و سفارش با موفقیت ثبت شد.\nشماره سفارش: #{result.split(':',1)[1]}"
+                result_parts = result.split(":")
+                order_id = result_parts[1]
+                cashback_amount = int(result_parts[2]) if len(result_parts) > 2 else 0
+                await api.send(chat_id, f"✅ پرداخت #{pid_s} تأیید شد و سفارش #{order_id} ثبت شد.")
+                cashback_line = f"\n🎁 کش‌بک این سفارش: {cashback_amount:,} تومان" if cashback_amount > 0 else ""
+                customer_msg = f"✅ پرداخت شما تأیید شد و سفارش با موفقیت ثبت شد.\nشماره سفارش: #{order_id}{cashback_line}"
             else:
                 await api.send(chat_id, f"❌ پرداخت #{pid_s} رد شد.")
                 customer_msg = "❌ رسید پرداخت تأیید نشد. لطفاً با فروشگاه تماس بگیر یا رسید معتبر ارسال کن."
