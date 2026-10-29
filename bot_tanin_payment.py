@@ -11,6 +11,7 @@
 
 import os
 import asyncio
+import uuid
 import psycopg
 from psycopg.rows import dict_row
 import logging
@@ -335,6 +336,7 @@ def main_menu_keyboard(user_id=None):
     rows = [
         [KeyboardButton("🧾 کاتالوگ محصولات")],
         [KeyboardButton("🛒 سبد خرید"), KeyboardButton("📦 سفارش‌های من")],
+        [KeyboardButton("👛 کیف پول من")],
         [KeyboardButton("💬 مرکز پشتیبانی")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -1997,6 +1999,10 @@ def admin_panel_keyboard():
             InlineKeyboardButton("💳 تنظیمات پرداخت", callback_data="adm:payment"),
         ],
         [
+            InlineKeyboardButton("👛 تنظیمات کیف پول", callback_data="adm:walletcap"),
+            InlineKeyboardButton("🧾 مدیریت کیف پول مشتریان", callback_data="adm:wallets"),
+        ],
+        [
             InlineKeyboardButton("🔄 بروزرسانی داشبورد", callback_data="adm:home"),
             InlineKeyboardButton("✕ بستن پنل", callback_data="adm:close"),
         ],
@@ -2566,6 +2572,107 @@ async def admin_bank_delete_confirm(q, account_id):
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 بله، حذف کن", callback_data=f"adm:bank_delete_confirm:{account_id}")], [InlineKeyboardButton("🔙 انصراف", callback_data=f"adm:bank:{account_id}")]])
     )
 
+
+
+
+
+def _wallet_customer_snapshot(conn, loyalty_customer_id):
+    wallet = conn.execute(
+        """SELECT id, balance_toman FROM wallet_accounts
+           WHERE loyalty_customer_id=%s""",
+        (loyalty_customer_id,),
+    ).fetchone()
+    tx = conn.execute(
+        """SELECT id, transaction_type, amount_toman, balance_after_toman,
+                  note, created_at
+           FROM wallet_transactions
+           WHERE wallet_account_id=%s
+           ORDER BY id DESC LIMIT 10""",
+        (wallet["id"],),
+    ).fetchall() if wallet else []
+    return int(wallet["balance_toman"] or 0) if wallet else 0, tx
+
+
+def _admin_wallet_adjust(loyalty_customer_id, amount_toman, direction, admin_id, platform):
+    """Audited, atomic wallet adjustment. amount is positive; direction is credit/debit."""
+    amount_toman = int(amount_toman)
+    if amount_toman <= 0 or direction not in ("credit", "debit"):
+        raise ValueError("مبلغ یا نوع عملیات نامعتبر است.")
+    with get_conn() as conn:
+        with conn.transaction():
+            conn.execute(
+                """INSERT INTO wallet_accounts(loyalty_customer_id)
+                   VALUES(%s) ON CONFLICT(loyalty_customer_id) DO NOTHING""",
+                (int(loyalty_customer_id),),
+            )
+            wallet = conn.execute(
+                """SELECT id, balance_toman FROM wallet_accounts
+                   WHERE loyalty_customer_id=%s FOR UPDATE""",
+                (int(loyalty_customer_id),),
+            ).fetchone()
+            if not wallet:
+                raise ValueError("کیف پول مشتری پیدا نشد.")
+            old_balance = int(wallet["balance_toman"] or 0)
+            if direction == "debit" and amount_toman > old_balance:
+                raise ValueError("موجودی کیف پول برای این برداشت کافی نیست.")
+            new_balance = old_balance + amount_toman if direction == "credit" else old_balance - amount_toman
+            tx_type = "cashback" if direction == "credit" else "redemption"
+            tx_id = str(uuid.uuid4())
+            note = (
+                f"افزایش دستی کیف پول توسط مدیر {admin_id}"
+                if direction == "credit"
+                else f"کاهش دستی کیف پول توسط مدیر {admin_id}"
+            )
+            conn.execute(
+                """INSERT INTO wallet_transactions
+                   (wallet_account_id, transaction_type, amount_toman,
+                    balance_after_toman, source_type, source_id,
+                    idempotency_key, note, metadata)
+                   VALUES(%s,%s,%s,%s,'admin_adjustment',%s,%s,%s,%s::jsonb)""",
+                (
+                    wallet["id"], tx_type, amount_toman, new_balance,
+                    str(loyalty_customer_id), f"admin-adjustment:{tx_id}",
+                    note, json.dumps({
+                        "kind": "admin_adjustment",
+                        "direction": direction,
+                        "admin_id": str(admin_id),
+                        "platform": platform,
+                        "loyalty_customer_id": int(loyalty_customer_id),
+                        "amount_toman": amount_toman,
+                    }, ensure_ascii=False),
+                ),
+            )
+            conn.execute(
+                "UPDATE wallet_accounts SET balance_toman=%s, updated_at=NOW() WHERE id=%s",
+                (new_balance, wallet["id"]),
+            )
+    return new_balance
+
+
+def _admin_wallet_toggle_sms(loyalty_customer_id, admin_id):
+    with get_conn() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                """SELECT transactional_sms_enabled FROM sms_customer_preferences
+                   WHERE loyalty_customer_id=%s FOR UPDATE""",
+                (int(loyalty_customer_id),),
+            ).fetchone()
+            if not row:
+                conn.execute(
+                    """INSERT INTO sms_customer_preferences(loyalty_customer_id, transactional_sms_enabled)
+                       VALUES(%s, FALSE) ON CONFLICT(loyalty_customer_id) DO NOTHING""",
+                    (int(loyalty_customer_id),),
+                )
+                enabled = False
+            else:
+                enabled = not bool(row["transactional_sms_enabled"])
+                conn.execute(
+                    """UPDATE sms_customer_preferences
+                       SET transactional_sms_enabled=%s, updated_at=NOW()
+                       WHERE loyalty_customer_id=%s""",
+                    (enabled, int(loyalty_customer_id)),
+                )
+            return enabled
 
 
 def _wallet_redemption_cap_toman(conn):
@@ -3149,6 +3256,134 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as e:
             logger.warning("Could not notify admin after payment %s: %s", admin_id, e)
 
+async def admin_walletcap_view(q, context=None):
+    conn = get_conn()
+    try:
+        cap = _wallet_redemption_cap_toman(conn)
+    finally:
+        conn.close()
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("۱۰۰ هزار", callback_data="adm:walletcapset:100000"),
+            InlineKeyboardButton("۲۵۰ هزار", callback_data="adm:walletcapset:250000"),
+        ],
+        [
+            InlineKeyboardButton("۵۰۰ هزار", callback_data="adm:walletcapset:500000"),
+            InlineKeyboardButton("۱ میلیون", callback_data="adm:walletcapset:1000000"),
+        ],
+        [
+            InlineKeyboardButton("۲ میلیون", callback_data="adm:walletcapset:2000000"),
+            InlineKeyboardButton("غیرفعال", callback_data="adm:walletcapset:0"),
+        ],
+        [InlineKeyboardButton("🔄 تازه‌سازی", callback_data="adm:walletcap"),
+         InlineKeyboardButton("🔙 پنل اصلی", callback_data="adm:home")],
+    ])
+    text = (
+        "👛 <b>تنظیمات کیف پول</b>\\n\\n"
+        f"سقف فعلی مصرف برای هر سفارش: <b>{cap:,} تومان</b>\\n"
+        "با انتخاب یکی از دکمه‌ها سقف را تغییر بده. "
+        "این سقف برای هر سفارش است، نه سقف کل موجودی مشتری."
+    )
+    await _safe_edit_text(q, text, parse_mode="HTML", reply_markup=keyboard)
+
+
+
+async def admin_wallets_view(q):
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT lc.id, COALESCE(lc.display_name, 'بدون نام') AS display_name,
+                      COALESCE(wa.balance_toman,0) AS balance_toman,
+                      (SELECT string_agg(cpa.platform || ':' || cpa.platform_user_id, ', ')
+                       FROM customer_platform_accounts cpa
+                       WHERE cpa.loyalty_customer_id=lc.id) AS accounts
+               FROM loyalty_customers lc
+               LEFT JOIN wallet_accounts wa ON wa.loyalty_customer_id=lc.id
+               ORDER BY lc.id DESC LIMIT 30"""
+        ).fetchall()
+    finally:
+        conn.close()
+    buttons = []
+    for r in rows:
+        label = f"{str(r['display_name'])[:18]} · {int(r['balance_toman'] or 0):,} تومان"
+        buttons.append([InlineKeyboardButton(label[:60], callback_data=f"adm:walletdetail:{r['id']}")])
+    buttons += [
+        [InlineKeyboardButton("🔄 تازه‌سازی", callback_data="adm:wallets"),
+         InlineKeyboardButton("🔙 پنل اصلی", callback_data="adm:home")]
+    ]
+    await _safe_edit_text(
+        q, "🧾 <b>مدیریت کیف پول مشتریان</b>\n\nبرای مشاهده موجودی، تاریخچه، افزایش/کاهش اعتبار یا تنظیم پیامک، مشتری را انتخاب کن.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def admin_wallet_detail_view(q, loyalty_customer_id):
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT lc.id, COALESCE(lc.display_name,'بدون نام') AS display_name,
+                      COALESCE(wa.id,0) AS wallet_id, COALESCE(wa.balance_toman,0) AS balance_toman,
+                      COALESCE(scp.transactional_sms_enabled,TRUE) AS sms_enabled,
+                      (SELECT string_agg(cpa.platform || ':' || cpa.platform_user_id, ', ')
+                       FROM customer_platform_accounts cpa
+                       WHERE cpa.loyalty_customer_id=lc.id) AS accounts
+               FROM loyalty_customers lc
+               LEFT JOIN wallet_accounts wa ON wa.loyalty_customer_id=lc.id
+               LEFT JOIN sms_customer_preferences scp ON scp.loyalty_customer_id=lc.id
+               WHERE lc.id=%s""", (int(loyalty_customer_id),)
+        ).fetchone()
+        if row and row["wallet_id"]:
+            txs = conn.execute(
+                """SELECT transaction_type, amount_toman, balance_after_toman, note, created_at
+                   FROM wallet_transactions WHERE wallet_account_id=%s ORDER BY id DESC LIMIT 8""",
+                (row["wallet_id"],)
+            ).fetchall()
+        else:
+            txs = []
+    finally:
+        conn.close()
+    if not row:
+        await _safe_edit_text(q, "مشتری پیدا نشد.", reply_markup=back_keyboard("wallets"))
+        return
+    lines = [
+        f"👛 <b>کیف پول {escape(str(row['display_name']))}</b>",
+        f"شناسه باشگاه: <code>{row['id']}</code>",
+        f"حساب‌ها: <code>{escape(str(row['accounts'] or '-'))}</code>",
+        f"موجودی: <b>{int(row['balance_toman'] or 0):,} تومان</b>",
+        f"پیامک سیستمی: {'فعال' if row['sms_enabled'] else 'غیرفعال'}",
+        "", "📜 <b>تراکنش‌های اخیر</b>",
+    ]
+    if not txs:
+        lines.append("تراکنشی ثبت نشده است.")
+    for tx in txs:
+        lines.append(
+            f"• {escape(str(tx['transaction_type']))}: {int(tx['amount_toman']):,} تومان "
+            f"(مانده {int(tx['balance_after_toman']):,}) — {escape(str(tx['note'] or '-'))[:100]}"
+        )
+    buttons = [
+        [InlineKeyboardButton("+۱۰ هزار", callback_data=f"adm:walletadjust:{row['id']}:credit:10000"),
+         InlineKeyboardButton("+۵۰ هزار", callback_data=f"adm:walletadjust:{row['id']}:credit:50000"),
+         InlineKeyboardButton("+۱۰۰ هزار", callback_data=f"adm:walletadjust:{row['id']}:credit:100000")],
+        [InlineKeyboardButton("−۱۰ هزار", callback_data=f"adm:walletadjust:{row['id']}:debit:10000"),
+         InlineKeyboardButton("−۵۰ هزار", callback_data=f"adm:walletadjust:{row['id']}:debit:50000"),
+         InlineKeyboardButton("−۱۰۰ هزار", callback_data=f"adm:walletadjust:{row['id']}:debit:100000")],
+        [InlineKeyboardButton(
+            "✍️ افزایش مبلغ دلخواه", callback_data=f"adm:walletadjustcustom:{row['id']}:credit"
+        ), InlineKeyboardButton(
+            "✍️ کاهش مبلغ دلخواه", callback_data=f"adm:walletadjustcustom:{row['id']}:debit"
+        )],
+        [InlineKeyboardButton(
+            "🔕 غیرفعال‌سازی پیامک" if row["sms_enabled"] else "🔔 فعال‌سازی پیامک",
+            callback_data=f"adm:walletsms:{row['id']}"
+        )],
+        [InlineKeyboardButton("🔄 تازه‌سازی", callback_data=f"adm:walletdetail:{row['id']}"),
+         InlineKeyboardButton("🔙 فهرست کیف پول‌ها", callback_data="adm:wallets")],
+    ]
+    await _safe_edit_text(q, "\n".join(lines), parse_mode="HTML",
+                          reply_markup=InlineKeyboardMarkup(buttons))
+
+
+
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not is_admin(q.from_user.id):
@@ -3167,6 +3402,72 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=admin_panel_keyboard(),
         )
+        return
+    if action == "wallets":
+        await admin_wallets_view(q)
+        return
+    if action == "walletdetail":
+        await admin_wallet_detail_view(q, int(parts[2]))
+        return
+    if action == "walletadjustcustom":
+        customer_id, direction = int(parts[2]), parts[3]
+        if direction not in ("credit", "debit"):
+            await q.answer("نوع عملیات نامعتبر است.", show_alert=True)
+            return
+        context.user_data["admin_flow"] = {
+            "type": "wallet_adjust_custom",
+            "step": "amount",
+            "customer_id": customer_id,
+            "direction": direction,
+        }
+        verb = "افزایش" if direction == "credit" else "کاهش"
+        await q.message.reply_text(
+            f"✍️ مبلغ دلخواه برای {verb} کیف پول مشتری با شناسه باشگاه {customer_id} را به تومان بفرست.\n"
+            "فقط عدد صحیح مثبت بفرست؛ مثال: 175000\nبرای لغو /cancel را بزن."
+        )
+        return
+    if action == "walletadjust":
+        customer_id, direction, amount = int(parts[2]), parts[3], int(parts[4])
+        try:
+            new_balance = _admin_wallet_adjust(customer_id, amount, direction, q.from_user.id, "telegram")
+        except Exception as exc:
+            logger.exception("Admin wallet adjustment failed")
+            await q.answer(str(exc)[:180], show_alert=True)
+            return
+        await q.answer("موجودی کیف پول به‌روزرسانی شد.")
+        await admin_wallet_detail_view(q, customer_id)
+        return
+    if action == "walletsms":
+        customer_id = int(parts[2])
+        try:
+            enabled = _admin_wallet_toggle_sms(customer_id, q.from_user.id)
+        except Exception:
+            logger.exception("Admin SMS preference update failed")
+            await q.answer("تغییر وضعیت پیامک ناموفق بود.", show_alert=True)
+            return
+        await q.answer("پیامک فعال شد." if enabled else "پیامک غیرفعال شد.")
+        await admin_wallet_detail_view(q, customer_id)
+        return
+    if action == "walletcap":
+        await admin_walletcap_view(q, context)
+        return
+    if action == "walletcapset":
+        try:
+            cap = int(parts[2])
+            if cap < 0:
+                raise ValueError
+            conn = get_conn()
+            try:
+                with conn.transaction():
+                    _set_wallet_redemption_cap_toman(conn, cap, q.from_user.id)
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception("Could not set wallet redemption cap from admin button")
+            await q.answer("ذخیره سقف کیف پول ناموفق بود.", show_alert=True)
+            return
+        await q.answer("سقف کیف پول ذخیره شد.")
+        await admin_walletcap_view(q, context)
         return
     if action == "orders":
         mode = parts[2] if len(parts) > 2 else "all"
@@ -3422,6 +3723,35 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (update.message.text or "").strip()
+
+    if is_admin(update.effective_user.id) and flow and flow.get("type") == "wallet_adjust_custom" and flow.get("step") == "amount":
+        if text in ("/cancel", "لغو", "انصراف"):
+            context.user_data.pop("admin_flow", None)
+            await update.message.reply_text("عملیات کیف پول لغو شد.", reply_markup=admin_panel_keyboard())
+            return
+        normalized = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+        try:
+            amount = int(normalized.replace(",", "").replace("٬", "").replace(" ", ""))
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("مبلغ نامعتبر است. عدد صحیح مثبت به تومان بفرست؛ مثال: 175000 یا /cancel.")
+            return
+        customer_id = int(flow["customer_id"])
+        direction = flow["direction"]
+        try:
+            new_balance = _admin_wallet_adjust(customer_id, amount, direction, update.effective_user.id, "telegram")
+        except Exception as exc:
+            logger.exception("Custom admin wallet adjustment failed")
+            await update.message.reply_text(f"عملیات انجام نشد: {str(exc)[:250]}")
+            return
+        context.user_data.pop("admin_flow", None)
+        verb = "افزایش" if direction == "credit" else "کاهش"
+        await update.message.reply_text(
+            f"✅ {verb} اعتبار انجام شد.\nمبلغ: {amount:,} تومان\nموجودی جدید: {new_balance:,} تومان",
+            reply_markup=admin_panel_keyboard(),
+        )
+        return
 
     if support_flow:
         user_id = update.effective_user.id
@@ -4555,6 +4885,43 @@ async def admin_channel_list(q, kind, page=0):
 # ----------------------------------------------------------------------------
 
 
+
+async def customer_wallet_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    conn = get_conn()
+    try:
+        with conn.transaction():
+            customer_id = _ensure_loyalty_profile_for_platform(
+                conn, "telegram", user.id, user.full_name
+            )
+            balance, txs = _wallet_customer_snapshot(conn, customer_id)
+    finally:
+        conn.close()
+    lines = [
+        "👛 <b>کیف پول من</b>",
+        "",
+        f"💰 موجودی فعلی: <b>{balance:,} تومان</b>",
+        "",
+        "📜 <b>آخرین تراکنش‌ها</b>",
+    ]
+    if not txs:
+        lines.append("هنوز تراکنشی ثبت نشده است.")
+    else:
+        labels = {"cashback": "کش‌بک/افزایش اعتبار", "redemption": "مصرف اعتبار", "refund_reversal": "بازگشت اعتبار"}
+        for tx in txs:
+            lines.append(
+                f"• {escape(labels.get(tx['transaction_type'], tx['transaction_type']))}: "
+                f"{int(tx['amount_toman']):,} تومان — موجودی پس از تراکنش: "
+                f"{int(tx['balance_after_toman']):,} تومان"
+            )
+    await update.effective_message.reply_text(
+        "\n".join(lines), parse_mode="HTML",
+        reply_markup=main_menu_keyboard(user.id),
+    )
+
+
 async def walletcap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only command: /walletcap 500000; zero disables wallet redemption."""
     user = update.effective_user
@@ -4611,6 +4978,7 @@ async def async_main():
     app.add_handler(MessageHandler(filters.Regex("^🧾 کاتالوگ محصولات$"), show_catalog))
     app.add_handler(MessageHandler(filters.Regex("^🛒 سبد خرید$"), show_cart))
     app.add_handler(MessageHandler(filters.Regex("^📦 سفارش‌های من$"), my_orders))
+    app.add_handler(MessageHandler(filters.Regex("^👛 کیف پول من$"), customer_wallet_view))
     app.add_handler(MessageHandler(filters.Regex(r"^💬\s*(?:مرکز پشتیبانی|پشتیبانی)$"), support))
     app.add_handler(CommandHandler("orders_admin", admin_orders))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ پنل مدیریت$"), admin_panel))
