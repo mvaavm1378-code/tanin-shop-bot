@@ -81,6 +81,7 @@ class CheckoutStore(dict):
 
 CHECKOUT = CheckoutStore()
 ADMIN_WALLET_AMOUNT_FLOW = {}
+ADMIN_CUSTOMER_SEARCH = {}
 
 
 def restore_checkout(uid):
@@ -283,6 +284,7 @@ def admin_keyboard():
          {"text": "💳 تنظیمات پرداخت", "callback_data": "adm:payment"}],
         [{"text": "👛 تنظیمات کیف پول", "callback_data": "adm:walletcap"},
          {"text": "🧾 مدیریت کیف پول‌ها", "callback_data": "adm:wallets"}],
+        [{"text": "🧮 بررسی مغایرت کیف پول", "callback_data": "adm:walletreconcile"}],
         [{"text": "🔄 بروزرسانی داشبورد", "callback_data": "adm:home"},
          {"text": "✕ بستن پنل", "callback_data": "adm:close"}],
     ]}
@@ -313,8 +315,50 @@ def admin_home_text(stats):
         f"🎫 تیکت‌های باز: <b>{stats['tickets']}</b>\n\n"
         "📊 <b>وضعیت فروشگاه</b>\n"
         f"🛠 محصولات فعال: {stats['products']}  |  👥 مشتریان: {stats['customers']}\n\n"
-        "یک بخش مدیریتی را انتخاب کن:"
+        "👛 <b>نمای مالی کیف پول</b>\n"
+        f"💰 موجودی کل مشتریان: {stats.get('total_liability',0):,} تومان\n"
+        f"🎁 کش‌بک واقعی ثبت‌شده: {stats.get('cashback_total',0):,} تومان\n"
+        f"🛍 اعتبار مصرف‌شده: {stats.get('redeemed_total',0):,} تومان\n"
+        f"➕ اصلاح دستی: {stats.get('manual_credit_total',0):,} | ➖ {stats.get('manual_debit_total',0):,} تومان\n"
+        + (f"⚠️ مغایرت دفترکل/مانده: {stats['mismatch_count']} کیف پول\n\n" if stats.get('mismatch_count',0)>0 else
+           ("ℹ️ بررسی مغایرت در دسترس نیست.\n\n" if stats.get('mismatch_count',0)<0 else "✅ مغایرت قابل‌مشاهده‌ای پیدا نشد.\n\n"))
+        + "یک بخش مدیریتی را انتخاب کن:"
     )
+
+
+
+def _admin_wallet_dashboard_metrics(conn):
+    """Financial overview plus a non-destructive balance-vs-ledger consistency check."""
+    try:
+        row = conn.execute(
+            """SELECT
+                 COALESCE((SELECT SUM(balance_toman) FROM wallet_accounts),0) AS total_liability,
+                 COALESCE((SELECT SUM(amount_toman) FROM wallet_transactions
+                           WHERE transaction_type='cashback'
+                             AND COALESCE(metadata->>'kind','') <> 'admin_adjustment'),0) AS cashback_total,
+                 COALESCE((SELECT SUM(amount_toman) FROM wallet_transactions
+                           WHERE transaction_type='redemption'
+                             AND COALESCE(metadata->>'kind','') <> 'admin_adjustment'),0) AS redeemed_total,
+                 COALESCE((SELECT SUM(amount_toman) FROM wallet_transactions
+                           WHERE metadata->>'kind'='admin_adjustment'
+                             AND metadata->>'direction'='credit'),0) AS manual_credit_total,
+                 COALESCE((SELECT SUM(amount_toman) FROM wallet_transactions
+                           WHERE metadata->>'kind'='admin_adjustment'
+                             AND metadata->>'direction'='debit'),0) AS manual_debit_total,
+                 COALESCE((SELECT COUNT(*) FROM wallet_accounts wa
+                           JOIN (SELECT DISTINCT ON (wallet_account_id)
+                                        wallet_account_id,balance_after_toman
+                                 FROM wallet_transactions ORDER BY wallet_account_id,id DESC) last_tx
+                             ON last_tx.wallet_account_id=wa.id
+                           WHERE wa.balance_toman IS DISTINCT FROM last_tx.balance_after_toman),0) AS mismatch_count"""
+        ).fetchone()
+        return {k:int(row[k] or 0) for k in (
+            "total_liability","cashback_total","redeemed_total",
+            "manual_credit_total","manual_debit_total","mismatch_count")}
+    except Exception:
+        # Older or partially migrated schemas should not take down the admin dashboard.
+        return {"total_liability":0,"cashback_total":0,"redeemed_total":0,
+                "manual_credit_total":0,"manual_debit_total":0,"mismatch_count":-1}
 
 
 def db_admin_stats():
@@ -330,6 +374,7 @@ def db_admin_stats():
             "tickets": count("SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('new','admin_waiting')"),
             "products": count("SELECT COUNT(*) AS n FROM products WHERE active=TRUE"),
             "customers": count("SELECT COUNT(*) AS n FROM customers"),
+            **_admin_wallet_dashboard_metrics(conn),
         }
 
 
@@ -343,6 +388,45 @@ async def show_admin_home(api, chat_id):
     except Exception:
         log.exception("Admin dashboard failed")
         await api.send(chat_id, "❌ داشبورد مدیریت بارگذاری نشد. Logs را بررسی کن.", admin_keyboard())
+
+
+async def show_admin_customers(api, chat_id, search="", page=0, mid=None):
+    page_size=8
+    search=(search or "").strip()[:80]
+    page=max(0,int(page)); offset=page*page_size
+    where=""; params=[]
+    if search:
+        term=f"%{search}%"
+        where="""WHERE CAST(c.user_id AS TEXT) ILIKE %s OR COALESCE(c.full_name,'') ILIKE %s
+                 OR COALESCE(c.username,'') ILIKE %s OR COALESCE(c.phone,'') ILIKE %s"""
+        params=[term,term,term,term]
+    with get_conn() as conn:
+        rows=conn.execute(
+            f"""SELECT c.user_id,c.full_name,c.phone,c.username,COUNT(o.id) AS orders_count
+                FROM customers c LEFT JOIN orders o ON o.user_id=c.user_id {where}
+                GROUP BY c.user_id ORDER BY orders_count DESC,c.last_seen DESC NULLS LAST
+                LIMIT %s OFFSET %s""",(*params,page_size+1,offset)).fetchall()
+        total=conn.execute(f"SELECT COUNT(*) AS n FROM customers c {where}",tuple(params)).fetchone()["n"]
+    has_next=len(rows)>page_size; rows=rows[:page_size]
+    buttons=[]
+    for r in rows:
+        label=f"👤 {str(r['full_name'] or r['username'] or r['user_id'])[:18]} · {str(r['phone'] or '-')[:12]} · {r['orders_count']} سفارش"
+        buttons.append([{"text":label[:60],"callback_data":f"adm:customer:{r['user_id']}"}])
+    buttons.append([{"text":"🔎 جست‌وجوی نام/تلفن/شناسه","callback_data":"adm:customersearch"}])
+    nav=[]
+    if page>0: nav.append({"text":"⬅️ قبلی","callback_data":f"adm:customerspage:{page-1}"})
+    nav.append({"text":f"صفحه {page+1}","callback_data":"adm:customersnoop"})
+    if has_next: nav.append({"text":"بعدی ➡️","callback_data":f"adm:customerspage:{page+1}"})
+    buttons.append(nav)
+    buttons.append([{"text":"🔄 همه مشتری‌ها","callback_data":"adm:customers"},{"text":"🔙 پنل اصلی","callback_data":"adm:home"}])
+    text=f"👥 <b>{'نتایج جست‌وجو' if search else 'مشتری‌ها'}</b>\nتعداد کل: {int(total)} · نمایش {len(rows)} مورد"
+    if search: text+=f"\nعبارت جست‌وجو: {escape(search)}"
+    if not rows: text+="\nموردی پیدا نشد."
+    markup={"inline_keyboard":buttons}
+    if mid:
+        try: await api.edit(chat_id,mid,text,markup); return
+        except Exception: pass
+    await api.send(chat_id,text,markup)
 
 
 async def show_admin_section(api, chat_id, section):
@@ -391,16 +475,7 @@ async def show_admin_section(api, chat_id, section):
                     [{"text": "🔙 پنل اصلی", "callback_data": "adm:home"}]]
         await api.send(chat_id, "🛠 <b>مدیریت محصولات</b>\nروی محصول بزن تا فعال/غیرفعال شود.", {"inline_keyboard": buttons})
     elif section == "customers":
-        with get_conn() as conn:
-            rows = conn.execute(
-                "SELECT user_id,full_name,phone,username FROM customers ORDER BY last_seen DESC NULLS LAST LIMIT 30"
-            ).fetchall()
-        buttons=[]
-        for r in rows:
-            label=f"👤 {str(r['full_name'] or r['username'] or r['user_id'])[:25]} · {str(r['phone'] or '-')[:14]}"
-            buttons.append([{"text":label[:60],"callback_data":f"adm:customer:{r['user_id']}"}])
-        buttons += [[{"text":"🔄 بروزرسانی","callback_data":"adm:customers"}],[{"text":"🔙 پنل اصلی","callback_data":"adm:home"}]]
-        await api.send(chat_id,"👥 <b>آخرین مشتریان</b>\n\nبرای دیدن سفارش‌ها و اطلاعات هر مشتری، نام او را انتخاب کن." if rows else "👥 هنوز مشتری‌ای ثبت نشده است.", {"inline_keyboard":buttons} if rows else admin_back())
+        await show_admin_customers(api, chat_id)
     elif section == "sales":
         with get_conn() as conn:
             row = conn.execute(
@@ -1010,6 +1085,17 @@ def _wallet_customer_snapshot(conn, loyalty_customer_id):
     return int(wallet["balance_toman"] or 0) if wallet else 0, tx
 
 
+def _wallet_platform_user_id(loyalty_customer_id, platform):
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT platform_user_id FROM customer_platform_accounts
+               WHERE loyalty_customer_id=%s AND platform=%s
+               ORDER BY last_seen_at DESC NULLS LAST LIMIT 1""",
+            (int(loyalty_customer_id), platform),
+        ).fetchone()
+    return str(row["platform_user_id"]) if row else None
+
+
 def _admin_wallet_adjust(loyalty_customer_id, amount_toman, direction, admin_id, platform):
     """Audited, atomic wallet adjustment. amount is positive; direction is credit/debit."""
     amount_toman = int(amount_toman)
@@ -1063,6 +1149,29 @@ def _admin_wallet_adjust(loyalty_customer_id, amount_toman, direction, admin_id,
                 "UPDATE wallet_accounts SET balance_toman=%s, updated_at=NOW() WHERE id=%s",
                 (new_balance, wallet["id"]),
             )
+            # Queue a deduplicated SMS only for a verified phone with SMS enabled.
+            sms_target = conn.execute(
+                """SELECT lc.phone_e164, lc.phone_verified_at, scp.transactional_sms_enabled
+                   FROM loyalty_customers lc
+                   JOIN sms_customer_preferences scp ON scp.loyalty_customer_id=lc.id
+                   WHERE lc.id=%s""",
+                (int(loyalty_customer_id),),
+            ).fetchone()
+            if (sms_target and sms_target["phone_e164"] and sms_target["phone_verified_at"]
+                    and sms_target["transactional_sms_enabled"]):
+                verb_fa = "افزایش" if direction == "credit" else "کاهش"
+                sms_text = (
+                    f"مشتری گرامی، {verb_fa} دستی کیف پول شما به مبلغ {amount_toman:,} تومان انجام شد. "
+                    f"موجودی جدید: {new_balance:,} تومان."
+                )
+                conn.execute(
+                    """INSERT INTO sms_outbox
+                       (loyalty_customer_id,message_category,destination_phone,message_text,status,idempotency_key)
+                       VALUES(%s,'wallet_adjustment_notice',%s,%s,'queued',%s)
+                       ON CONFLICT(idempotency_key) DO NOTHING""",
+                    (int(loyalty_customer_id), str(sms_target["phone_e164"]).strip(),
+                     sms_text, f"wallet-adjustment-sms:{tx_id}"),
+                )
     return new_balance
 
 
@@ -1200,6 +1309,24 @@ def db_pay_pending_order_with_wallet(pending_id, platform_user_id, platform):
                 "UPDATE wallet_accounts SET balance_toman=%s, updated_at=NOW() WHERE id=%s",
                 (new_balance, wallet["id"]),
             )
+            sms_target = conn.execute(
+                """SELECT lc.phone_e164,lc.phone_verified_at,scp.transactional_sms_enabled
+                   FROM loyalty_customers lc
+                   JOIN sms_customer_preferences scp ON scp.loyalty_customer_id=lc.id
+                   WHERE lc.id=%s""",
+                (loyalty_customer_id,),
+            ).fetchone()
+            if (sms_target and sms_target["phone_e164"] and sms_target["phone_verified_at"]
+                    and sms_target["transactional_sms_enabled"]):
+                conn.execute(
+                    """INSERT INTO sms_outbox
+                       (loyalty_customer_id,message_category,destination_phone,message_text,status,idempotency_key)
+                       VALUES(%s,'wallet_payment_notice',%s,%s,'queued',%s)
+                       ON CONFLICT(idempotency_key) DO NOTHING""",
+                    (loyalty_customer_id,str(sms_target["phone_e164"]).strip(),
+                     f"پرداخت سفارش #{order_id} به مبلغ {total:,} تومان از کیف پول انجام شد. موجودی: {new_balance:,} تومان.",
+                     f"wallet-payment-sms:{platform}:{order_id}"),
+                )
             # Mark this order as processed for loyalty; wallet-funded purchases
             # do not generate new cashback under the current policy.
             conn.execute(
@@ -1698,6 +1825,16 @@ async def handle_admin_text(api, msg, uid, chat_id, text):
     flow=state.get("admin_flow")
     if not flow: return False
     step=flow.get("step")
+    if flow.get("type")=="customer_search" and step=="query":
+        if text.strip() in ("/cancel","لغو","انصراف"):
+            CHECKOUT.pop(uid,None)
+            await api.send(chat_id,"جست‌وجوی مشتری لغو شد.",admin_keyboard())
+            return True
+        query=text.strip()[:80]
+        ADMIN_CUSTOMER_SEARCH[int(uid)]=query
+        CHECKOUT.pop(uid,None)
+        await show_admin_customers(api,chat_id,query,0)
+        return True
     if flow.get("type")=="add_product":
         if step=="name":
             if not text.strip(): await api.send(chat_id,"نام محصول خالی است؛ دوباره وارد کن."); return True
@@ -1878,6 +2015,10 @@ async def show_admin_customer(api, chat_id, customer_id, mid=None):
     for o in orders: buttons.append([{"text":f"📦 سفارش #{o['id']} · {str(o['status'])[:15]}","callback_data":f"adm:orderdetail:{o['id']}"}])
     for t in tickets: buttons.append([{"text":f"🎫 تیکت #{t['id']} · {str(t['topic'])[:15]}","callback_data":f"adm:ticket:{t['id']}"}])
     sms_label = "🔕 غیرفعال‌سازی پیامک مشتری" if (loyalty_summary or {}).get("sms_enabled",True) else "🔔 فعال‌سازی پیامک مشتری"
+    buttons.append([{
+        "text": f"👛 مدیریت کیف پول · {int((loyalty_summary or {}).get('balance_toman') or 0):,} تومان",
+        "callback_data": f"adm:walletfromcustomer:{customer_id}"
+    }])
     buttons.append([{"text":sms_label,"callback_data":f"adm:sms_toggle:{customer_id}"}])
     buttons.append([{"text":"🔙 مشتری‌ها","callback_data":"adm:customers"}])
     if mid:
@@ -2049,6 +2190,12 @@ async def on_message(api, msg):
                 return
             ADMIN_WALLET_AMOUNT_FLOW.pop(int(uid), None)
             verb = "افزایش" if direction == "credit" else "کاهش"
+            try:
+                platform_uid = _wallet_platform_user_id(customer_id, "bale")
+                if platform_uid:
+                    await api.send(int(platform_uid), f"👛 {verb} دستی کیف پول به مبلغ {amount:,} تومان انجام شد. موجودی جدید: {new_balance:,} تومان.")
+            except Exception:
+                log.info("Could not send Bale wallet adjustment notice", exc_info=True)
             await api.send(chat_id, f"✅ {verb} اعتبار انجام شد.\nمبلغ: {amount:,} تومان\nموجودی جدید: {new_balance:,} تومان", admin_keyboard())
             return
         if text.startswith("/walletcap"):
@@ -2159,6 +2306,38 @@ def admin_wallets_keyboard(rows):
     return {"inline_keyboard": buttons}
 
 
+async def show_wallet_reconciliation(api, chat_id, mid=None):
+    with get_conn() as conn:
+        rows=conn.execute(
+            """SELECT wa.id AS wallet_id,lc.id AS loyalty_customer_id,
+                      COALESCE(lc.display_name,'بدون نام') AS display_name,
+                      wa.balance_toman AS current_balance,last_tx.balance_after_toman AS ledger_balance,
+                      last_tx.transaction_type,last_tx.id AS tx_id
+               FROM wallet_accounts wa
+               JOIN loyalty_customers lc ON lc.id=wa.loyalty_customer_id
+               JOIN (SELECT DISTINCT ON(wallet_account_id) wallet_account_id,id,
+                            balance_after_toman,transaction_type
+                     FROM wallet_transactions ORDER BY wallet_account_id,id DESC) last_tx
+                 ON last_tx.wallet_account_id=wa.id
+               WHERE wa.balance_toman IS DISTINCT FROM last_tx.balance_after_toman
+               ORDER BY wa.id DESC LIMIT 30"""
+        ).fetchall()
+    lines=["🧮 <b>بررسی مغایرت کیف پول</b>","", "این گزارش فقط‌خواندنی است و هیچ موجودی‌ای را خودکار تغییر نمی‌دهد."]
+    buttons=[]
+    for r in rows:
+        lines.append(f"• {escape(str(r['display_name']))} · شناسه {r['loyalty_customer_id']}: مانده {int(r['current_balance'] or 0):,} / دفترکل {int(r['ledger_balance'] or 0):,} تومان")
+        buttons.append([{"text":f"👛 {str(r['display_name'])[:18]} · مغایرت #{r['wallet_id']}",
+                         "callback_data":f"adm:walletdetail:{r['loyalty_customer_id']}"}])
+    if not rows: lines.append("✅ هیچ مغایرتی بین موجودی فعلی و آخرین تراکنش ثبت‌شده پیدا نشد.")
+    buttons += [[{"text":"🔄 بررسی دوباره","callback_data":"adm:walletreconcile"},
+                 {"text":"🔙 پنل اصلی","callback_data":"adm:home"}]]
+    text="\n".join(lines)
+    if mid:
+        try: await api.edit(chat_id,mid,text,{"inline_keyboard":buttons}); return
+        except Exception: pass
+    await api.send(chat_id,text,{"inline_keyboard":buttons})
+
+
 async def show_admin_wallets(api, chat_id, mid=None):
     with get_conn() as conn:
         rows = conn.execute(
@@ -2179,7 +2358,7 @@ async def show_admin_wallets(api, chat_id, mid=None):
     await api.send(chat_id, text, admin_wallets_keyboard(rows))
 
 
-async def show_admin_wallet_detail(api, chat_id, loyalty_customer_id, mid=None):
+async def show_admin_wallet_detail(api, chat_id, loyalty_customer_id, mid=None, customer_user_id=None):
     with get_conn() as conn:
         row = conn.execute(
             """SELECT lc.id, COALESCE(lc.display_name,'بدون نام') AS display_name,
@@ -2217,7 +2396,8 @@ async def show_admin_wallet_detail(api, chat_id, loyalty_customer_id, mid=None):
         [{"text":"🔕 غیرفعال‌سازی پیامک" if row["sms_enabled"] else "🔔 فعال‌سازی پیامک",
           "callback_data":f"adm:walletsms:{row['id']}"}],
         [{"text":"🔄 تازه‌سازی","callback_data":f"adm:walletdetail:{row['id']}"},
-         {"text":"🔙 فهرست کیف پول‌ها","callback_data":"adm:wallets"}]
+         {"text":"🔙 بازگشت به مشتری" if customer_user_id is not None else "🔙 فهرست کیف پول‌ها",
+          "callback_data":f"adm:walletcustomerback:{customer_user_id}" if customer_user_id is not None else "adm:wallets"}]
     ]}
     text="\n".join(lines)
     if mid:
@@ -2285,8 +2465,27 @@ async def on_callback(api, cb):
             await api.answer(cbid)
             if section == "home":
                 await show_admin_home(api, chat_id)
+            elif section == "customerspage" and len(action) == 3:
+                await show_admin_customers(api, chat_id, ADMIN_CUSTOMER_SEARCH.get(int(uid), ""), int(action[2]), mid)
+            elif section == "customersnoop":
+                return
+            elif section == "customersearch":
+                state=restore_checkout(uid)
+                state["admin_flow"]={"type":"customer_search","step":"query"}
+                CHECKOUT[int(uid)] = state
+                await api.send(chat_id,"🔎 نام، شماره موبایل یا شناسه مشتری را بفرست. برای لغو /cancel را بفرست.",admin_keyboard())
+            elif section == "walletreconcile":
+                await show_wallet_reconciliation(api, chat_id, mid)
             elif section == "wallets":
                 await show_admin_wallets(api, chat_id, mid)
+            elif section == "walletfromcustomer" and len(action) == 3:
+                platform_user_id = int(action[2])
+                with get_conn() as conn:
+                    with conn.transaction():
+                        loyalty_id = _ensure_loyalty_profile_for_platform(conn, "bale", platform_user_id)
+                await show_admin_wallet_detail(api, chat_id, int(loyalty_id), mid, platform_user_id)
+            elif section == "walletcustomerback" and len(action) == 3:
+                await show_admin_customer(api, chat_id, int(action[2]), mid)
             elif section == "walletdetail" and len(action) == 3:
                 await show_admin_wallet_detail(api, chat_id, int(action[2]), mid)
             elif section == "walletadjustcustom" and len(action) == 4:
@@ -2307,8 +2506,15 @@ async def on_callback(api, cb):
             elif section == "walletadjust" and len(action) == 5:
                 customer_id, direction, amount = int(action[2]), action[3], int(action[4])
                 try:
-                    _admin_wallet_adjust(customer_id, amount, direction, uid, "bale")
+                    new_balance = _admin_wallet_adjust(customer_id, amount, direction, uid, "bale")
                     await api.answer(cbid, "موجودی کیف پول به‌روزرسانی شد.")
+                    try:
+                        platform_uid = _wallet_platform_user_id(customer_id, "bale")
+                        if platform_uid:
+                            verb = "افزایش" if direction == "credit" else "کاهش"
+                            await api.send(int(platform_uid), f"👛 {verb} دستی کیف پول به مبلغ {amount:,} تومان انجام شد. موجودی جدید: {new_balance:,} تومان.")
+                    except Exception:
+                        log.info("Could not send Bale wallet adjustment notice", exc_info=True)
                     await show_admin_wallet_detail(api, chat_id, customer_id, mid)
                 except Exception as exc:
                     log.exception("Admin wallet adjustment failed")
@@ -2341,6 +2547,7 @@ async def on_callback(api, cb):
                     try: await api.call("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": "پنل مدیریت بسته شد."})
                     except Exception: await api.send(chat_id, "پنل مدیریت بسته شد.")
             elif section in ("pending", "orders", "products", "customers", "sales", "tickets", "channel", "payment"):
+                if section == "customers": ADMIN_CUSTOMER_SEARCH[int(uid)] = ""
                 if section == "products": await show_admin_products(api, chat_id, mid)
                 elif section == "payment": await show_admin_banks(api, chat_id, mid)
                 elif section == "tickets": await show_support_tickets(api, chat_id, uid, mid, True, action[2] if len(action)>2 else "all")
