@@ -561,6 +561,14 @@ class BaleAPI:
         except Exception:
             log.debug("answerCallbackQuery failed", exc_info=True)
 
+    async def clear_inline_keyboard(self, chat_id, message_id):
+        """Remove the selected message's old inline buttons without deleting its text."""
+        return await self.call(
+            "editMessageReplyMarkup",
+            {"chat_id": chat_id, "message_id": message_id,
+             "reply_markup": {"inline_keyboard": []}},
+        )
+
     async def edit(self, chat_id, message_id, text, markup=None):
         p = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
         if markup is not None:
@@ -2453,6 +2461,16 @@ async def on_callback(api, cb):
     if chat_id is None or uid is None:
         await api.answer(cbid)
         return
+    # Keep forms step-by-step: after a callback is selected, remove the previous
+    # inline keyboard so it cannot remain stacked beside the next step's buttons.
+    # The inert page indicator is intentionally excluded.
+    if mid and data not in ("adm:customersnoop",):
+        try:
+            await api.clear_inline_keyboard(chat_id, mid)
+        except Exception:
+            # Some old/non-editable messages may reject markup edits; never break
+            # the actual callback workflow because of keyboard cleanup.
+            log.debug("Could not clear previous Bale inline keyboard", exc_info=True)
     try:
         restore_checkout(uid)
         # پنل مدیریت فقط برای شناسه‌های موجود در BALE_ADMIN_IDS مجاز است.
