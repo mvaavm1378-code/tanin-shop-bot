@@ -1634,7 +1634,11 @@ async def show_payment_instructions(message, pending):
     settings = conn.execute("SELECT * FROM bank_accounts WHERE active=TRUE ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
     if not settings or not any(settings[k] for k in ("bank_name", "owner_name", "card_number", "account_number", "iban")):
-        await message.reply_text("⚠️ اطلاعات حساب پرداخت هنوز توسط مدیریت تنظیم نشده است. لطفاً کمی بعد دوباره تلاش کنید.")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("👛 پرداخت کامل با کیف پول", callback_data=f"pay:wallet:{pending['id']}")]])
+        await message.reply_text(
+            "⚠️ اطلاعات حساب بانکی تنظیم نشده است. اگر سقف مدیر و موجودی کیف پول کل مبلغ را پوشش دهد، می‌توانی با کیف پول پرداخت کنی.",
+            reply_markup=kb,
+        )
         return
     def v(key): return escape(settings[key] or "-")
     total = int(pending["total_price"])
@@ -1650,8 +1654,11 @@ async def show_payment_instructions(message, pending):
         "بعد از واریز، عکس رسید را همینجا ارسال کنید.\n"
         "🟡 سفارش تا تأیید پرداخت توسط مدیریت نهایی نمی‌شود."
     )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 شماره کارت", callback_data=f"pay:copycard:{pending['id']}")],
-                               [InlineKeyboardButton("📤 راهنمای ارسال رسید", callback_data=f"pay:receipt:{pending['id']}")]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👛 پرداخت کامل با کیف پول", callback_data=f"pay:wallet:{pending['id']}")],
+        [InlineKeyboardButton("📋 شماره کارت", callback_data=f"pay:copycard:{pending['id']}")],
+        [InlineKeyboardButton("📤 راهنمای ارسال رسید", callback_data=f"pay:receipt:{pending['id']}")],
+    ])
     await message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -2559,10 +2566,195 @@ async def admin_bank_delete_confirm(q, account_id):
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 بله، حذف کن", callback_data=f"adm:bank_delete_confirm:{account_id}")], [InlineKeyboardButton("🔙 انصراف", callback_data=f"adm:bank:{account_id}")]])
     )
 
+
+
+def _wallet_redemption_cap_toman(conn):
+    """Maximum amount that can be redeemed from wallet on one order; 0 disables."""
+    row = conn.execute(
+        """SELECT setting_value #>> '{}' AS value
+           FROM loyalty_settings WHERE setting_key='max_wallet_redemption_toman'"""
+    ).fetchone()
+    try:
+        return max(0, int(row["value"])) if row and row["value"] is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_wallet_redemption_cap_toman(conn, amount_toman, actor):
+    amount_toman = int(amount_toman)
+    if amount_toman < 0:
+        raise ValueError("سقف مصرف نمی‌تواند منفی باشد.")
+    conn.execute(
+        """INSERT INTO loyalty_settings(setting_key, setting_value, updated_by, updated_at)
+           VALUES('max_wallet_redemption_toman', %s::jsonb, %s, NOW())
+           ON CONFLICT(setting_key) DO UPDATE
+           SET setting_value=EXCLUDED.setting_value,
+               updated_by=EXCLUDED.updated_by,
+               updated_at=NOW()""",
+        (str(amount_toman), str(actor)),
+    )
+
+
+def db_pay_pending_order_with_wallet(pending_id, platform_user_id, platform):
+    """
+    Full-wallet payment only. Order is finalized atomically without a receipt
+    only if wallet balance and manager cap cover the full pending total.
+    Cashback is not awarded on a fully wallet-funded order.
+    """
+    now = datetime.now(ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
+    with get_conn() as conn:
+        with conn.transaction():
+            pending = conn.execute(
+                "SELECT * FROM pending_payments WHERE id=%s FOR UPDATE",
+                (int(pending_id),),
+            ).fetchone()
+            if not pending or str(pending["user_id"]) != str(platform_user_id):
+                return {"status": "not_found"}
+            if pending["payment_status"] != "در انتظار رسید":
+                return {"status": "already_processed"}
+
+            total = int(pending["total_price"] or 0)
+            if total <= 0:
+                return {"status": "invalid_total"}
+
+            cap = _wallet_redemption_cap_toman(conn)
+            if cap <= 0 or total > cap:
+                return {"status": "cap_exceeded", "cap": cap, "total": total}
+
+            loyalty_customer_id = _ensure_loyalty_profile_for_platform(
+                conn, platform, platform_user_id, pending.get("full_name")
+            )
+            wallet = conn.execute(
+                """SELECT id, balance_toman FROM wallet_accounts
+                   WHERE loyalty_customer_id=%s FOR UPDATE""",
+                (loyalty_customer_id,),
+            ).fetchone()
+            if not wallet or int(wallet["balance_toman"] or 0) < total:
+                return {
+                    "status": "insufficient_balance",
+                    "balance": int(wallet["balance_toman"] or 0) if wallet else 0,
+                    "total": total,
+                }
+
+            # Insert the order before writing a ledger source key based on its ID.
+            order = conn.execute(
+                """INSERT INTO orders
+                   (user_id, full_name, phone, address, items_summary, total_price,
+                    status, created_at, finalized_at, payment_status, transaction_ref)
+                   VALUES(%s,%s,%s,%s,%s,%s,'در انتظار بررسی',%s,%s,'تأیید شده',%s)
+                   RETURNING id""",
+                (
+                    pending["user_id"], pending["full_name"], pending["phone"],
+                    pending["address"], pending["items_summary"], total,
+                    now, now, f"{platform.upper()}-WALLET-{pending_id}",
+                ),
+            ).fetchone()
+            order_id = int(order["id"])
+            new_balance = int(wallet["balance_toman"]) - total
+            source_id = f"{platform}:{order_id}"
+            conn.execute(
+                """INSERT INTO wallet_transactions
+                   (wallet_account_id, transaction_type, amount_toman,
+                    balance_after_toman, source_type, source_id,
+                    idempotency_key, note, metadata)
+                   VALUES(%s,'redemption',%s,%s,'order',%s,%s,%s,%s::jsonb)""",
+                (
+                    wallet["id"], total, new_balance, source_id,
+                    f"redemption:{platform}:{order_id}",
+                    f"پرداخت کامل سفارش {platform}:{order_id} با کیف پول",
+                    json.dumps({
+                        "platform": platform,
+                        "order_id": order_id,
+                        "pending_payment_id": int(pending_id),
+                        "payment_method": "wallet",
+                        "wallet_funded_toman": total,
+                        "cashback_awarded": False,
+                    }, ensure_ascii=False),
+                ),
+            )
+            conn.execute(
+                "UPDATE wallet_accounts SET balance_toman=%s, updated_at=NOW() WHERE id=%s",
+                (new_balance, wallet["id"]),
+            )
+            # Mark this order as processed for loyalty; wallet-funded purchases
+            # do not generate new cashback under the current policy.
+            conn.execute(
+                """INSERT INTO loyalty_order_links
+                   (platform, source_order_id, loyalty_customer_id, order_status,
+                    eligible_items_amount_toman, shipping_amount_toman,
+                    paid_at, cashback_processed_at)
+                   VALUES(%s,%s,%s,'paid',0,0,NOW(),NOW())
+                   ON CONFLICT(platform, source_order_id) DO NOTHING""",
+                (platform, str(order_id), loyalty_customer_id),
+            )
+            conn.execute("DELETE FROM cart_items WHERE user_id=%s", (pending["user_id"],))
+            conn.execute(
+                """UPDATE pending_payments
+                   SET payment_status='تأیید شده', reviewed_at=%s,
+                       order_id=%s, admin_id=NULL
+                   WHERE id=%s AND payment_status='در انتظار رسید'""",
+                (now, order_id, int(pending_id)),
+            )
+            return {
+                "status": "paid",
+                "order_id": order_id,
+                "amount": total,
+                "new_balance": new_balance,
+                "customer_id": pending["user_id"],
+            }
+
+
 async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     user_id = q.from_user.id
     parts = q.data.split(":")
+    if len(parts) >= 3 and parts[1] == "wallet":
+        try:
+            pending_id = int(parts[2])
+        except ValueError:
+            await q.answer("شناسه سفارش نامعتبر است.", show_alert=True)
+            return
+        try:
+            result = await asyncio.to_thread(
+                db_pay_pending_order_with_wallet, pending_id, user_id, "telegram"
+            )
+        except Exception:
+            logger.exception("Wallet payment failed for pending #%s", pending_id)
+            await q.answer("پرداخت با کیف پول انجام نشد؛ موجودی تغییر نکرده یا وضعیت را بررسی کن.", show_alert=True)
+            return
+        status = result.get("status")
+        if status == "paid":
+            await q.answer("پرداخت با کیف پول انجام شد.")
+            await q.message.reply_text(
+                f"✅ سفارش #{result['order_id']} با کیف پول پرداخت شد.\\n"
+                f"مبلغ مصرف‌شده: {result['amount']:,} تومان\\n"
+                f"موجودی باقی‌مانده: {result['new_balance']:,} تومان\\n"
+                "سفارش برای آماده‌سازی به فروشگاه ارسال شد.",
+                reply_markup=main_menu_keyboard(user_id),
+            )
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"👛 سفارش #{result['order_id']} با کیف پول پرداخت شد.\\nمبلغ: {result['amount']:,} تومان\\nمشتری: {user_id}",
+                    )
+                except Exception:
+                    logger.exception("Could not notify admin about wallet order")
+        elif status == "insufficient_balance":
+            await q.answer(
+                f"موجودی کافی نیست. موجودی: {result['balance']:,}؛ مبلغ سفارش: {result['total']:,} تومان.",
+                show_alert=True,
+            )
+        elif status == "cap_exceeded":
+            await q.answer(
+                f"سقف مصرف کیف پول فعال نیست یا از مبلغ سفارش کمتر است. سقف فعلی: {result['cap']:,} تومان.",
+                show_alert=True,
+            )
+        elif status == "already_processed":
+            await q.answer("این سفارش قبلاً پردازش شده است.", show_alert=True)
+        else:
+            await q.answer("سفارش پیدا نشد یا مبلغ آن معتبر نیست.", show_alert=True)
+        return
     if parts[1] == "copycard":
         await q.answer("شماره کارت در پیام بالا قابل کپی است.", show_alert=True)
         return
@@ -4361,6 +4553,42 @@ async def admin_channel_list(q, kind, page=0):
 # ----------------------------------------------------------------------------
 # راه‌اندازی ربات
 # ----------------------------------------------------------------------------
+
+
+async def walletcap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only command: /walletcap 500000; zero disables wallet redemption."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("این دستور مخصوص مدیر است.")
+        return
+    if not context.args:
+        conn = get_conn()
+        try:
+            cap = _wallet_redemption_cap_toman(conn)
+        finally:
+            conn.close()
+        await update.message.reply_text(
+            f"سقف مصرف کیف پول برای هر سفارش: {cap:,} تومان\n"
+            "برای تغییر: /walletcap 500000\n"
+            "برای غیرفعال‌کردن: /walletcap 0"
+        )
+        return
+    try:
+        cap = int(context.args[0])
+        if cap < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("مبلغ نامعتبر است. مثال: /walletcap 500000")
+        return
+    conn = get_conn()
+    try:
+        with conn.transaction():
+            _set_wallet_redemption_cap_toman(conn, cap, user.id)
+    finally:
+        conn.close()
+    await update.message.reply_text(f"✅ سقف مصرف کیف پول روی {cap:,} تومان تنظیم شد.")
+
+
 async def async_main():
     # Web Service رایگان Render باید یک HTTP port باز کند.
     # این نسخه به‌جای run_webhook داخلی، یک HTTP server کوچک aiohttp اجرا می‌کند
@@ -4379,6 +4607,7 @@ async def async_main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("walletcap", walletcap_command))
     app.add_handler(MessageHandler(filters.Regex("^🧾 کاتالوگ محصولات$"), show_catalog))
     app.add_handler(MessageHandler(filters.Regex("^🛒 سبد خرید$"), show_cart))
     app.add_handler(MessageHandler(filters.Regex("^📦 سفارش‌های من$"), my_orders))
