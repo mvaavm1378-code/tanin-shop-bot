@@ -2416,6 +2416,7 @@ async def admin_customer_detail(q, user_id):
     orders = conn.execute(
         "SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 10", (user_id,)
     ).fetchall()
+    loyalty_summary = _loyalty_admin_summary(conn, "telegram", user_id)
     conn.close()
     if not c:
         await q.edit_message_text("مشتری پیدا نشد.", reply_markup=back_keyboard("customers"))
@@ -2443,7 +2444,9 @@ async def admin_customer_detail(q, user_id):
         f"اولین ورود: {escape(format_iran_jalali_fa(c.get('first_seen'), include_time=True))}\n"
         f"آخرین فعالیت: {escape(format_iran_jalali_fa(c.get('last_seen'), include_time=True))}\n\n"
         f"📦 تعداد سفارش‌ها: {len(orders)}\n"
-        f"💰 مجموع خرید غیرلغوشده: {total:,} تومان"
+        f"💰 مجموع خرید غیرلغوشده: {total:,} تومان\n"
+        f"👛 موجودی کیف پول باشگاه: {int((loyalty_summary or {}).get('balance_toman') or 0):,} تومان\n"
+        f"📩 پیامک سیستمی: {'فعال' if (loyalty_summary or {}).get('sms_enabled', True) else 'غیرفعال'}"
     )
     buttons = []
     for o in orders:
@@ -2453,6 +2456,8 @@ async def admin_customer_detail(q, user_id):
                 callback_data=f"order:view:{o['id']}"
             )
         ])
+    sms_label = "🔕 غیرفعال‌سازی پیامک مشتری" if (loyalty_summary or {}).get("sms_enabled", True) else "🔔 فعال‌سازی پیامک مشتری"
+    buttons.append([InlineKeyboardButton(sms_label, callback_data=f"adm:sms_toggle:{user_id}")])
     buttons.append([InlineKeyboardButton(str(c["user_id"]), url=f"tg://user?id={c['user_id']}")])
     buttons.append([InlineKeyboardButton("🔙 مشتری‌ها", callback_data="adm:customers")])
     await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
@@ -2624,6 +2629,60 @@ async def mark_admin_message(q, suffix_html):
 
 
 
+
+
+def _ensure_loyalty_profile_for_platform(conn, platform, platform_user_id, display_name=None):
+    """Ensure a platform-specific loyalty profile exists; never merge by unverified phone."""
+    platform_user_id = str(platform_user_id)
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                 (f"loyalty-account:{platform}:{platform_user_id}",))
+    account = conn.execute(
+        """SELECT loyalty_customer_id FROM customer_platform_accounts
+           WHERE platform=%s AND platform_user_id=%s FOR UPDATE""",
+        (platform, platform_user_id),
+    ).fetchone()
+    if account:
+        loyalty_customer_id = account["loyalty_customer_id"]
+        if display_name:
+            conn.execute(
+                "UPDATE loyalty_customers SET display_name=%s, updated_at=NOW() WHERE id=%s",
+                (str(display_name)[:250], loyalty_customer_id),
+            )
+    else:
+        customer = conn.execute(
+            "INSERT INTO loyalty_customers(display_name) VALUES(%s) RETURNING id",
+            (str(display_name)[:250] if display_name else None,),
+        ).fetchone()
+        loyalty_customer_id = customer["id"]
+        conn.execute(
+            """INSERT INTO customer_platform_accounts
+               (loyalty_customer_id, platform, platform_user_id, linked_at, last_seen_at)
+               VALUES(%s,%s,%s,NOW(),NOW())""",
+            (loyalty_customer_id, platform, platform_user_id),
+        )
+    conn.execute(
+        "INSERT INTO wallet_accounts(loyalty_customer_id) VALUES(%s) ON CONFLICT(loyalty_customer_id) DO NOTHING",
+        (loyalty_customer_id,),
+    )
+    conn.execute(
+        "INSERT INTO sms_customer_preferences(loyalty_customer_id) VALUES(%s) ON CONFLICT(loyalty_customer_id) DO NOTHING",
+        (loyalty_customer_id,),
+    )
+    return loyalty_customer_id
+
+
+def _loyalty_admin_summary(conn, platform, platform_user_id):
+    row = conn.execute(
+        """SELECT lc.id AS loyalty_customer_id, COALESCE(wa.balance_toman,0) AS balance_toman,
+                  COALESCE(scp.transactional_sms_enabled,TRUE) AS sms_enabled
+           FROM customer_platform_accounts cpa
+           JOIN loyalty_customers lc ON lc.id=cpa.loyalty_customer_id
+           LEFT JOIN wallet_accounts wa ON wa.loyalty_customer_id=lc.id
+           LEFT JOIN sms_customer_preferences scp ON scp.loyalty_customer_id=lc.id
+           WHERE cpa.platform=%s AND cpa.platform_user_id=%s""",
+        (platform, str(platform_user_id)),
+    ).fetchone()
+    return row
 
 def _award_loyalty_cashback(conn, platform, platform_user_id, order_id,
                             eligible_amount_toman, display_name=None, phone=None):
@@ -3021,6 +3080,29 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "customer":
         await admin_customer_detail(q, int(parts[2]))
+        return
+    if action == "sms_toggle":
+        customer_id = int(parts[2])
+        with get_conn() as conn:
+            conn.execute("BEGIN")
+            _ensure_loyalty_profile_for_platform(conn, "telegram", customer_id)
+            pref = conn.execute(
+                """SELECT scp.transactional_sms_enabled
+                   FROM customer_platform_accounts cpa
+                   JOIN sms_customer_preferences scp ON scp.loyalty_customer_id=cpa.loyalty_customer_id
+                   WHERE cpa.platform='telegram' AND cpa.platform_user_id=%s FOR UPDATE OF scp""",
+                (str(customer_id),),
+            ).fetchone()
+            new_value = not bool(pref["transactional_sms_enabled"]) if pref else False
+            conn.execute(
+                """UPDATE sms_customer_preferences SET transactional_sms_enabled=%s, updated_by=%s, updated_at=NOW()
+                   WHERE loyalty_customer_id=(SELECT loyalty_customer_id FROM customer_platform_accounts
+                     WHERE platform='telegram' AND platform_user_id=%s)""",
+                (new_value, str(q.from_user.id), str(customer_id)),
+            )
+            conn.commit()
+        await q.answer("وضعیت پیامک تغییر کرد.")
+        await admin_customer_detail(q, customer_id)
         return
     if action == "product":
         await admin_product_detail(q, int(parts[2]))
