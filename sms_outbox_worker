@@ -1,0 +1,99 @@
+# -*- coding: utf-8 -*-
+"""
+Manual SMS outbox worker for the loyalty club.
+Run only during the sender/provider's permitted hours. This script sends
+transactional cashback notices only; it does not send marketing campaigns.
+"""
+import os
+import asyncio
+import logging
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+
+import aiohttp
+import psycopg
+from psycopg.rows import dict_row
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+DB_URL = (os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL") or "").strip()
+USERNAME = os.getenv("MELIPAYAMAK_USERNAME", "").strip()
+PASSWORD = (os.getenv("MELIPAYAMAK_API_KEY") or os.getenv("MELIPAYAMAK_PASSWORD") or "").strip()
+SENDER = os.getenv("MELIPAYAMAK_SENDER", "").strip()
+SMS_URL = "https://rest.payamak-panel.com/api/SendSMS/SendSMS"
+TEHRAN = ZoneInfo("Asia/Tehran")
+
+def permitted_hours():
+    now = datetime.now(TEHRAN).time()
+    return time(8, 0) <= now < time(20, 0)
+
+async def main():
+    if not DB_URL or not USERNAME or not PASSWORD or not SENDER:
+        raise SystemExit("Missing SUPABASE_DB_URL/DATABASE_URL or MELIPAYAMAK credentials/sender.")
+    if not permitted_hours():
+        raise SystemExit("SMS worker stopped: permitted sending window is 08:00-20:00 Asia/Tehran.")
+    async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as conn:
+        # Process a small batch to limit impact and provider charges.
+        rows = await (await conn.execute(
+            """SELECT id, destination_phone, message_text
+               FROM sms_outbox
+               WHERE status='queued'
+                 AND message_category='cashback_notice'
+               ORDER BY queued_at, id
+               FOR UPDATE SKIP LOCKED
+               LIMIT 10"""
+        )).fetchall()
+        for row in rows:
+            # Re-check preference and verified phone at send time.
+            pref = await (await conn.execute(
+                """SELECT lc.phone_e164, lc.phone_verified_at,
+                          scp.transactional_sms_enabled
+                   FROM sms_outbox o
+                   JOIN loyalty_customers lc ON lc.id=o.loyalty_customer_id
+                   JOIN sms_customer_preferences scp ON scp.loyalty_customer_id=lc.id
+                   WHERE o.id=%s""", (row["id"],)
+            )).fetchone()
+            if not pref or not pref["phone_e164"] or not pref["phone_verified_at"] or not pref["transactional_sms_enabled"]:
+                await conn.execute(
+                    "UPDATE sms_outbox SET status='cancelled', last_error=%s, updated_at=NOW() WHERE id=%s",
+                    ("No verified phone or transactional SMS disabled", row["id"])
+                )
+                continue
+            payload = {
+                "username": USERNAME,
+                "password": PASSWORD,
+                "to": str(pref["phone_e164"]),
+                "from": SENDER,
+                "text": row["message_text"],
+                "isFlash": False,
+            }
+            try:
+                timeout = aiohttp.ClientTimeout(total=20)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(SMS_URL, data=payload) as response:
+                        body = (await response.text())[:1000]
+                        ok = response.status == 200
+                # Do not log credentials or phone numbers.
+                if ok:
+                    await conn.execute(
+                        """UPDATE sms_outbox SET status='accepted', attempts=attempts+1,
+                                  provider_message_id=%s, sent_at=NOW(), updated_at=NOW(),
+                                  last_error=NULL WHERE id=%s""",
+                        (body, row["id"])
+                    )
+                else:
+                    await conn.execute(
+                        """UPDATE sms_outbox SET status='failed', attempts=attempts+1,
+                                  last_error=%s, updated_at=NOW() WHERE id=%s""",
+                        (f"Provider HTTP status {response.status}: {body}", row["id"])
+                    )
+            except Exception as exc:
+                await conn.execute(
+                    """UPDATE sms_outbox SET status='failed', attempts=attempts+1,
+                              last_error=%s, updated_at=NOW() WHERE id=%s""",
+                    (str(exc)[:1000], row["id"])
+                )
+        await conn.commit()
+        logging.info("Processed %s queued cashback notice(s).", len(rows))
+
+if __name__ == "__main__":
+    asyncio.run(main())
