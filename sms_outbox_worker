@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Hardened manual worker for cashback-notice SMS only.
+Hardened manual worker for verified transactional wallet/cashback SMS notices.
 Important:
 - Sends only to a phone with phone_verified_at set.
 - Claims queued rows as 'sending' and commits BEFORE contacting provider.
@@ -69,7 +69,7 @@ async def claim_batch(conn):
             SELECT id
             FROM public.sms_outbox
             WHERE status = 'queued'
-              AND message_category = 'cashback_notice'
+              AND message_category IN ('cashback_notice','wallet_adjustment_notice','wallet_payment_notice')
             ORDER BY queued_at, id
             FOR UPDATE SKIP LOCKED
             LIMIT %s
