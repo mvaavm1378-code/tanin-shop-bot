@@ -294,14 +294,18 @@ def admin_back(target="home"):
     return {"inline_keyboard": [[{"text": "🔙 بازگشت", "callback_data": f"adm:{target}"}]]}
 
 
-def admin_order_buttons(order_id, status):
+def admin_order_buttons(order_id, status, customer_user_id=None):
     rows = []
+    context = f":customer:{int(customer_user_id)}" if customer_user_id is not None else ""
     if status == "در انتظار بررسی":
         rows.extend([
-            [{"text": "✅ تأیید سفارش", "callback_data": f"adm:orderstatus:{order_id}:confirmed"}],
-            [{"text": "❌ رد سفارش", "callback_data": f"adm:orderstatus:{order_id}:cancelled"}],
+            [{"text": "✅ تأیید سفارش", "callback_data": f"adm:orderstatus:{order_id}:confirmed{context}"}],
+            [{"text": "❌ رد سفارش", "callback_data": f"adm:orderstatus:{order_id}:cancelled{context}"}],
         ])
-    rows.append([{"text": "🔙 لیست سفارش‌ها", "callback_data": "adm:orders"}])
+    if customer_user_id is not None:
+        rows.append([{"text": "🔙 بازگشت به مشتری", "callback_data": f"adm:customer:{int(customer_user_id)}"}])
+    else:
+        rows.append([{"text": "🔙 لیست سفارش‌ها", "callback_data": "adm:orders"}])
     return {"inline_keyboard": rows}
 
 
@@ -1833,11 +1837,32 @@ async def handle_admin_text(api, msg, uid, chat_id, text):
     flow=state.get("admin_flow")
     if not flow: return False
     step=flow.get("step")
+    if text.strip() in ("/cancel","لغو","انصراف"):
+        flow_type=flow.get("type")
+        return_to=flow.get("return_to","home")
+        CHECKOUT.pop(uid,None)
+        if flow_type=="wallet_adjust_custom":
+            customer_id=int(flow.get("customer_id") or 0)
+            if customer_id:
+                await show_admin_wallet_detail(api,chat_id,customer_id)
+            else:
+                await show_admin_home(api,chat_id)
+        elif return_to=="products":
+            await show_admin_products(api,chat_id)
+        elif return_to=="payment":
+            await show_admin_banks(api,chat_id)
+        elif return_to=="channel":
+            await show_admin_channel(api,chat_id)
+        elif return_to.startswith("ticket:"):
+            await show_ticket_detail(api,chat_id,uid,int(return_to.split(":",1)[1]),None,True)
+        elif return_to.startswith("customer:"):
+            await show_admin_customer(api,chat_id,int(return_to.split(":",1)[1]))
+        elif return_to=="customers":
+            await show_admin_customers(api,chat_id)
+        else:
+            await show_admin_home(api,chat_id)
+        return True
     if flow.get("type")=="customer_search" and step=="query":
-        if text.strip() in ("/cancel","لغو","انصراف"):
-            CHECKOUT.pop(uid,None)
-            await api.send(chat_id,"جست‌وجوی مشتری لغو شد.",admin_keyboard())
-            return True
         query=text.strip()[:80]
         ADMIN_CUSTOMER_SEARCH[int(uid)]=query
         CHECKOUT.pop(uid,None)
@@ -2020,7 +2045,9 @@ async def show_admin_customer(api, chat_id, customer_id, mid=None):
     total=sum(int(o.get("total_price") or 0) for o in orders if o.get("status") not in ("رد شد","لغو شده"))
     lines=["👤 <b>جزئیات مشتری</b>",f"نام: {escape(str(name))}",f"شناسه: <code>{customer_id}</code>",f"نام کاربری: @{escape(str(c.get('username') or '-'))}",f"تلفن: {escape(str(phone))}",f"آدرس ذخیره‌شده: {escape(str(address))}",f"جنسیت: {escape(str(c.get('gender') or '-'))}",f"اولین ورود: {format_iran_jalali_fa(c.get('first_seen'),True)}",f"آخرین فعالیت: {format_iran_jalali_fa(c.get('last_seen'),True)}",f"تعداد سفارش‌های اخیر: {len(orders)}",f"مجموع سفارش‌های غیرلغوشده: {total:,} تومان",f"👛 موجودی کیف پول باشگاه: {int((loyalty_summary or {}).get('balance_toman') or 0):,} تومان",f"📩 پیامک سیستمی: {'فعال' if (loyalty_summary or {}).get('sms_enabled',True) else 'غیرفعال'}"]
     buttons=[]
-    for o in orders: buttons.append([{"text":f"📦 سفارش #{o['id']} · {str(o['status'])[:15]}","callback_data":f"adm:orderdetail:{o['id']}"}])
+    for o in orders:
+        buttons.append([{"text":f"📦 سفارش #{o['id']} · {str(o['status'])[:15]}",
+                         "callback_data":f"adm:orderdetail:{o['id']}:customer:{customer_id}"}])
     for t in tickets: buttons.append([{"text":f"🎫 تیکت #{t['id']} · {str(t['topic'])[:15]}","callback_data":f"adm:ticket:{t['id']}"}])
     sms_label = "🔕 غیرفعال‌سازی پیامک مشتری" if (loyalty_summary or {}).get("sms_enabled",True) else "🔔 فعال‌سازی پیامک مشتری"
     buttons.append([{
@@ -2177,8 +2204,9 @@ async def on_message(api, msg):
         wallet_flow = ADMIN_WALLET_AMOUNT_FLOW.get(int(uid))
         if wallet_flow:
             if text in ("/cancel", "لغو", "انصراف"):
+                customer_id=int(wallet_flow["customer_id"])
                 ADMIN_WALLET_AMOUNT_FLOW.pop(int(uid), None)
-                await api.send(chat_id, "عملیات کیف پول لغو شد.", admin_keyboard())
+                await show_admin_wallet_detail(api,chat_id,customer_id)
                 return
             normalized = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
             try:
@@ -2481,7 +2509,24 @@ async def on_callback(api, cb):
             action = data.split(":")
             section = action[1] if len(action) > 1 else "home"
             await api.answer(cbid)
-            if section == "home":
+            if section == "admincancel":
+                target=action[2] if len(action)>2 else "home"
+                state=restore_checkout(uid)
+                state.pop("admin_flow",None)
+                CHECKOUT.pop(uid,None)
+                if target.startswith("wallet-"):
+                    ADMIN_WALLET_AMOUNT_FLOW.pop(int(uid),None)
+                    await show_admin_wallet_detail(api,chat_id,int(target.split("-",1)[1]),mid)
+                elif target=="products": await show_admin_products(api,chat_id,mid)
+                elif target=="payment": await show_admin_banks(api,chat_id,mid)
+                elif target=="channel": await show_admin_channel(api,chat_id,mid)
+                elif target=="customers": await show_admin_customers(api,chat_id)
+                elif target.startswith("ticket-") and len(action)>3:
+                    await show_ticket_detail(api,chat_id,uid,int(action[3]),mid,True)
+                elif target.startswith("customer-"):
+                    await show_admin_customer(api,chat_id,int(target.split("-",1)[1]),mid)
+                else: await show_admin_home(api,chat_id)
+            elif section == "home":
                 await show_admin_home(api, chat_id)
             elif section == "customerspage" and len(action) == 3:
                 await show_admin_customers(api, chat_id, ADMIN_CUSTOMER_SEARCH.get(int(uid), ""), int(action[2]), mid)
@@ -2489,9 +2534,9 @@ async def on_callback(api, cb):
                 return
             elif section == "customersearch":
                 state=restore_checkout(uid)
-                state["admin_flow"]={"type":"customer_search","step":"query"}
+                state["admin_flow"]={"type":"customer_search","step":"query","return_to":"customers"}
                 CHECKOUT[int(uid)] = state
-                await api.send(chat_id,"🔎 نام، شماره موبایل یا شناسه مشتری را بفرست. برای لغو /cancel را بفرست.",admin_keyboard())
+                await api.send(chat_id,"🔎 نام، شماره موبایل یا شناسه مشتری را بفرست. برای لغو از دکمه زیر یا /cancel استفاده کن.",{"inline_keyboard":[[{"text":"❌ لغو و بازگشت","callback_data":"adm:admincancel:customers"}]]})
             elif section == "walletreconcile":
                 await show_wallet_reconciliation(api, chat_id, mid)
             elif section == "wallets":
@@ -2518,8 +2563,8 @@ async def on_callback(api, cb):
                 await api.send(
                     chat_id,
                     f"✍️ مبلغ دلخواه برای {verb} کیف پول مشتری با شناسه باشگاه {customer_id} را به تومان بفرست.\n"
-                    "فقط عدد صحیح مثبت؛ مثال: 175000\nبرای لغو /cancel را بفرست.",
-                    admin_keyboard(),
+                    "فقط عدد صحیح مثبت؛ مثال: 175000\nبرای لغو از دکمه زیر یا /cancel استفاده کن.",
+                    {"inline_keyboard":[[{"text":"❌ لغو و بازگشت به کیف پول","callback_data":f"adm:admincancel:wallet-{customer_id}"}]]},
                 )
             elif section == "walletadjust" and len(action) == 5:
                 customer_id, direction, amount = int(action[2]), action[3], int(action[4])
@@ -2589,12 +2634,20 @@ async def on_callback(api, cb):
                         conn.execute("UPDATE products SET active=%s WHERE id=%s", (not bool(p["active"]), pid))
                         conn.commit()
                 await api.send(chat_id, f"وضعیت محصول #{pid} تغییر کرد." if p else "محصول پیدا نشد.", admin_back("products"))
-            elif section == "orderdetail" and len(action) == 3:
+            elif section == "orderdetail" and len(action) >= 3:
+                order_id = int(action[2])
+                customer_user_id = None
+                if len(action) >= 5 and action[3] == "customer":
+                    customer_user_id = int(action[4])
                 with get_conn() as conn:
-                    o = conn.execute("SELECT * FROM orders WHERE id=%s", (int(action[2]),)).fetchone()
+                    o = conn.execute("SELECT * FROM orders WHERE id=%s", (order_id,)).fetchone()
                 if not o:
-                    await api.send(chat_id, "سفارش پیدا نشد.", admin_back("orders"))
+                    await api.send(chat_id, "سفارش پیدا نشد.",
+                                   admin_back(f"customer:{customer_user_id}" if customer_user_id is not None else "orders"))
                 else:
+                    # Only retain the customer-origin navigation if it matches this order's owner.
+                    if customer_user_id is not None and int(o.get("user_id") or -1) != customer_user_id:
+                        customer_user_id = None
                     text = (f"📦 <b>سفارش #{o['id']}</b>\n"
                             f"مشتری: {escape(str(o['full_name'] or '-'))}\n"
                             f"تلفن: {escape(str(o['phone'] or '-'))}\n"
@@ -2602,17 +2655,21 @@ async def on_callback(api, cb):
                             f"محصولات: {escape(str(o['items_summary'] or '-'))}\n"
                             f"مبلغ: {int(o['total_price'] or 0):,} تومان\n"
                             f"وضعیت: {escape(str(o['status'] or '-'))}")
-                    await api.send(chat_id, text, admin_order_buttons(o["id"], o["status"]))
-            elif section == "orderstatus" and len(action) == 4:
+                    await api.send(chat_id, text, admin_order_buttons(o["id"], o["status"], customer_user_id))
+            elif section == "orderstatus" and len(action) >= 4:
                 oid, new_status = int(action[2]), action[3]
+                customer_user_id = None
+                if len(action) >= 6 and action[4] == "customer":
+                    customer_user_id = int(action[5])
+                back_target = f"customer:{customer_user_id}" if customer_user_id is not None else "orders"
                 if new_status not in ("confirmed", "cancelled"):
-                    await api.send(chat_id, "وضعیت نامعتبر است.", admin_back("orders"))
+                    await api.send(chat_id, "وضعیت نامعتبر است.", admin_back(back_target))
                 else:
                     status_text = "تأیید شده" if new_status == "confirmed" else "لغو شده"
                     with get_conn() as conn:
                         changed = conn.execute("UPDATE orders SET status=%s WHERE id=%s AND status='در انتظار بررسی' RETURNING user_id,total_price", (status_text, oid)).fetchone()
                         conn.commit()
-                    await api.send(chat_id, f"وضعیت سفارش #{oid} به «{status_text}» تغییر کرد.", admin_back("orders"))
+                    await api.send(chat_id, f"وضعیت سفارش #{oid} به «{status_text}» تغییر کرد.", admin_back(back_target))
                     if changed:
                         customer_text = (f"✅ وضعیت سفارش #{oid} تغییر کرد: {status_text}" if new_status == "confirmed" else f"❌ سفارش #{oid} لغو شد. برای پیگیری با پشتیبانی تماس بگیر.")
                         try: await api.send(int(changed["user_id"]), customer_text, main_keyboard(int(changed["user_id"])))
@@ -2625,7 +2682,7 @@ async def on_callback(api, cb):
             elif section == "product_field" and len(action)==4:
                 pid=int(action[2]); field=action[3]
                 if field not in {"name","category","size","color","pack_info","price","photo_url"}: await api.send(chat_id,"فیلد نامعتبر است."); return
-                CHECKOUT[uid]={"admin_flow":{"type":"product_field","product_id":pid,"field":field}}
+                CHECKOUT[uid]={"admin_flow":{"type":"product_field","product_id":pid,"field":field,"return_to":"products"}}
                 labels={"name":"نام جدید را وارد کن:","category":"دسته جدید را وارد کن: بچگانه یا زنانه","size":"سایز جدید را وارد کن:","color":"رنگ‌بندی جدید را وارد کن:","pack_info":"اطلاعات پک جدید را وارد کن (یا ندارد):","price":"قیمت جدید را به تومان وارد کن:","photo_url":"لینک عکس جدید را وارد کن (یا ندارد):"}
                 await api.send(chat_id,labels[field])
             elif section == "price_adjust" and len(action)==4:
@@ -2637,7 +2694,7 @@ async def on_callback(api, cb):
                         conn.execute("UPDATE products SET price=%s WHERE id=%s",(new_price,pid)); conn.commit()
                 await api.send(chat_id,(f"قیمت محصول #{pid} به {new_price:,} تومان تغییر کرد." if p else "محصول پیدا نشد."),admin_back("products"))
             elif section == "price_set" and len(action)==3:
-                pid=int(action[2]); CHECKOUT[uid]={"admin_flow":{"type":"product_field","product_id":pid,"field":"price"}}
+                pid=int(action[2]); CHECKOUT[uid]={"admin_flow":{"type":"product_field","product_id":pid,"field":"price","return_to":"products"}}
                 await api.send(chat_id,"قیمت جدید را به تومان وارد کن:")
             elif section == "toggle_product" and len(action)==3:
                 pid=int(action[2])
@@ -2651,13 +2708,13 @@ async def on_callback(api, cb):
                 with get_conn() as conn: conn.execute("UPDATE products SET active=FALSE WHERE id=%s",(pid,)); conn.commit()
                 await api.send(chat_id,"محصول غیرفعال شد؛ سابقه سفارش‌ها حفظ شده است.",admin_back("products"))
             elif section == "bank_add":
-                CHECKOUT[uid]={"admin_flow":{"type":"bank_add","index":0,"data":{}}}
+                CHECKOUT[uid]={"admin_flow":{"type":"bank_add","index":0,"data":{},"return_to":"payment"}}
                 await api.send(chat_id,"➕ افزودن حساب بانکی\nنام بانک را وارد کن:")
             elif section == "bank_edit" and len(action)==3:
                 aid=int(action[2])
                 with get_conn() as conn: bank=conn.execute("SELECT * FROM bank_accounts WHERE id=%s",(aid,)).fetchone()
                 if not bank: await api.send(chat_id,"حساب پیدا نشد."); return
-                CHECKOUT[uid]={"admin_flow":{"type":"bank_edit","account_id":aid,"index":0,"data":{}}}
+                CHECKOUT[uid]={"admin_flow":{"type":"bank_edit","account_id":aid,"index":0,"data":{},"return_to":"payment"}}
                 await api.send(chat_id,f"ویرایش حساب #{aid} — نام بانک جدید را وارد کن:")
             elif section == "bank" and len(action)==3: await show_admin_bank(api,chat_id,int(action[2]),mid)
             elif section == "bank_toggle" and len(action)==3:
@@ -2686,10 +2743,10 @@ async def on_callback(api, cb):
             elif section == "chresume":
                 meta_set("bale_channel_enabled","1"); await show_admin_channel(api,chat_id)
             elif section == "chtime" and len(action)==3 and action[2] in ("morning","night"):
-                CHECKOUT[uid]={"admin_flow":{"type":"channel_time","kind":action[2]}}
+                CHECKOUT[uid]={"admin_flow":{"type":"channel_time","kind":action[2],"return_to":"channel"}}
                 await api.send(chat_id,f"ساعت پست {'صبح' if action[2]=='morning' else 'شب'} را به شکل HH:MM وارد کن (مثال 08:15):")
             elif section == "chadd" and len(action)==3 and action[2] in ("morning","night"):
-                CHECKOUT[uid]={"admin_flow":{"type":"channel_message","kind":action[2]}}
+                CHECKOUT[uid]={"admin_flow":{"type":"channel_message","kind":action[2],"return_to":"channel"}}
                 await api.send(chat_id,"متن جدید پست را ارسال کن:")
             elif section == "chpost" and len(action)==3 and action[2] in ("morning","night"):
                 ok,note=await channel_post(api,action[2]); await api.send(chat_id,("✅ " if ok else "❌ ")+note,admin_back("channel"))
@@ -2720,8 +2777,8 @@ async def on_callback(api, cb):
             elif section == "ticket" and len(action)==3: await show_ticket_detail(api,chat_id,uid,int(action[2]),mid,True)
             elif section == "ticket_reply" and len(action)==3:
                 tid=int(action[2])
-                CHECKOUT[uid]={"admin_flow":{"type":"ticket_reply","ticket_id":tid}}
-                await api.send(chat_id,f"💬 پاسخ خود را برای تیکت #{tid} بنویس:")
+                CHECKOUT[uid]={"admin_flow":{"type":"ticket_reply","ticket_id":tid,"return_to":f"ticket:{tid}"}}
+                await api.send(chat_id,f"💬 پاسخ خود را برای تیکت #{tid} بنویس:",{"inline_keyboard":[[{"text":"❌ لغو و بازگشت به تیکت","callback_data":f"adm:admincancel:ticket-{tid}:{tid}"}]]})
             elif section == "ticket_close" and len(action)==3:
                 tid=int(action[2]); now=iran_now_text()
                 with get_conn() as conn:
