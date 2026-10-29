@@ -902,13 +902,14 @@ def _award_loyalty_cashback(conn, platform, platform_user_id, order_id,
     # Queue a cashback notice only when the customer has a verified phone
     # and transactional SMS is enabled. Sending is handled by a separate worker.
     sms_target = conn.execute(
-        """SELECT lc.phone_e164, scp.transactional_sms_enabled
+        """SELECT lc.phone_e164, lc.phone_verified_at, scp.transactional_sms_enabled
            FROM loyalty_customers lc
            JOIN sms_customer_preferences scp ON scp.loyalty_customer_id=lc.id
            WHERE lc.id=%s""",
         (loyalty_customer_id,),
     ).fetchone()
     if (sms_target and sms_target["phone_e164"]
+            and sms_target["phone_verified_at"]
             and sms_target["transactional_sms_enabled"]):
         sms_phone = str(sms_target["phone_e164"]).strip()
         sms_text = (
