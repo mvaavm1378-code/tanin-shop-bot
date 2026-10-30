@@ -3193,14 +3193,9 @@ async def main():
             log.info("Bale webhook cleared for polling.")
         except Exception:
             log.warning("Could not clear a previous Bale webhook; polling may conflict.", exc_info=True)
-        app = web.Application()
-        app.router.add_get("/", health)
-        app.router.add_get("/health", health)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        port = int(os.environ.get("PORT", "10000"))
-        await web.TCPSite(runner, "0.0.0.0", port).start()
-        log.info("Health server listening on port %s", port)
+        # Telegram's webhook service owns the single public Render PORT.
+        # Bale runs polling in this same process and does not bind a second HTTP port.
+        log.info("Bale polling started inside the shared Render Web Service.")
         offset = None
         log.info("Bale shop bot started; checkout enabled.")
         channel_task = asyncio.create_task(channel_scheduler(api), name="bale-channel-scheduler")
@@ -3225,7 +3220,6 @@ async def main():
             channel_task.cancel()
             try: await channel_task
             except asyncio.CancelledError: pass
-            await runner.cleanup()
 
 
 if __name__ == "__main__":
