@@ -37,7 +37,7 @@ BATCH_SIZE = 10
 
 def permitted_hours():
     now = datetime.now(TEHRAN).time()
-    return time(8, 0) <= now < time(20, 0)
+    return time(8, 0) <= now < time(22, 0)
 
 
 def parse_provider_response(body):
@@ -188,7 +188,8 @@ async def process_one(conn, session, outbox_id):
     await conn.commit()
 
 
-async def main():
+
+def validate_configuration():
     missing = []
     if not DB_URL:
         missing.append("SUPABASE_DB_URL/DATABASE_URL")
@@ -198,24 +199,21 @@ async def main():
         missing.append("MELIPAYAMAK_API_KEY/MELIPAYAMAK_PASSWORD")
     if not SENDER:
         missing.append("MELIPAYAMAK_SENDER")
-    if missing:
-        raise SystemExit("Missing required environment variables: " + ", ".join(missing))
-    if not permitted_hours():
-        raise SystemExit("Worker stopped: permitted sending window is 08:00-20:00 Asia/Tehran.")
+    return missing
 
+
+async def process_due_batch():
     async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as conn:
         ids = await claim_batch(conn)
         if not ids:
-            logging.info("No queued cashback notices.")
-            return
-
+            return 0
         timeout = aiohttp.ClientTimeout(total=20)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for outbox_id in ids:
                 try:
                     await process_one(conn, session, outbox_id)
                 except Exception:
-                    # Do not put a possibly-sent message back in the queue.
+                    # Never automatically retry an ambiguous delivery.
                     await conn.execute(
                         """
                         UPDATE public.sms_outbox
@@ -227,8 +225,47 @@ async def main():
                     )
                     await conn.commit()
                     logging.exception("Worker error for outbox id=%s; left in sending state.", outbox_id)
+        return len(ids)
 
-        logging.info("Claimed and processed %s cashback notice(s).", len(ids))
+
+async def run_forever(poll_interval=30):
+    """Run inside the combined Render process; only send from 08:00 to 22:00 Tehran time."""
+    missing = validate_configuration()
+    if missing:
+        logging.error(
+            "SMS worker is disabled because required environment variables are missing: %s. "
+            "Telegram and Bale will continue running.",
+            ", ".join(missing),
+        )
+        # Do not take down either bot if SMS credentials have not yet been configured.
+        while True:
+            await asyncio.sleep(300)
+
+    logging.info("SMS worker scheduler started; sending window 08:00-22:00 Asia/Tehran.")
+    while True:
+        if not permitted_hours():
+            await asyncio.sleep(60)
+            continue
+        try:
+            processed = await process_due_batch()
+            if processed:
+                logging.info("SMS worker processed %s outbox message(s).", processed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("SMS worker batch failed; will retry on next scheduler tick.")
+        await asyncio.sleep(poll_interval)
+
+
+async def main():
+    """Standalone mode retained for manual operation."""
+    missing = validate_configuration()
+    if missing:
+        raise SystemExit("Missing required environment variables: " + ", ".join(missing))
+    if not permitted_hours():
+        raise SystemExit("Worker stopped: permitted sending window is 08:00-22:00 Asia/Tehran.")
+    processed = await process_due_batch()
+    logging.info("Processed %s SMS outbox message(s).", processed)
 
 
 if __name__ == "__main__":
