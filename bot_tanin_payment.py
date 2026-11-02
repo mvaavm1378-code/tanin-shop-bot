@@ -22,6 +22,7 @@ import aiohttp
 from aiohttp import web
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from sms_templates import TEMPLATE_IDS, enqueue_pattern_sms, queue_order_created_sms, queue_order_assigned_sms, queue_order_confirmed_sms
 
 from telegram import (
     Update,
@@ -61,14 +62,7 @@ DB_URL = (
 # تنظیمات پیامک ملی پیامک
 # اطلاعات محرمانه فقط از Environment Variables خوانده می‌شوند.
 # ----------------------------------------------------------------------------
-MELIPAYAMAK_USERNAME = os.getenv("MELIPAYAMAK_USERNAME", "").strip()
-MELIPAYAMAK_API_KEY = (
-    os.getenv("MELIPAYAMAK_API_KEY", "").strip()
-    or os.getenv("MELIPAYAMAK_PASSWORD", "").strip()
-)
-MELIPAYAMAK_SENDER = os.getenv("MELIPAYAMAK_SENDER", "50004001853486").strip()
-SMS_ADMIN_PHONE = os.getenv("SMS_ADMIN_PHONE", "09384853486").strip()
-MELIPAYAMAK_URL = "https://rest.payamak-panel.com/api/SendSMS/SendSMS"
+SMS_ADMIN_PHONE = os.getenv("SMS_ADMIN_PHONE", "").strip()
 
 
 logging.basicConfig(
@@ -229,7 +223,7 @@ def init_db():
             "cart_items": {"id", "user_id", "product_id", "qty"},
             "bank_accounts": {"id", "bank_name", "owner_name", "card_number", "account_number", "iban", "active", "created_at", "updated_at"},
             "pending_payments": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "payment_status", "receipt_file_id", "created_at", "reviewed_at", "order_id", "admin_id"},
-            "orders": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "status", "created_at", "finalized_at", "payment_status", "transaction_ref"},
+            "orders": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "status", "created_at", "finalized_at", "payment_status", "transaction_ref", "display_order_number", "order_number_assigned_at", "order_number_reminder_due_at", "order_number_reminder_sent_at"},
             "app_meta": {"key", "value"},
         }
         for table, cols in expected_columns.items():
@@ -1374,166 +1368,6 @@ async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await create_pending_payment(update.message, context)
 
 
-async def send_order_sms_to_admin(pending_id, full_name, phone, total_price, items_summary):
-    """ارسال پیامک سفارش جدید به مدیر و بررسی واقعی نتیجه API."""
-    missing = []
-    if not MELIPAYAMAK_USERNAME:
-        missing.append("MELIPAYAMAK_USERNAME")
-    if not MELIPAYAMAK_API_KEY:
-        missing.append("MELIPAYAMAK_API_KEY/MELIPAYAMAK_PASSWORD")
-    if not MELIPAYAMAK_SENDER:
-        missing.append("MELIPAYAMAK_SENDER")
-    if not SMS_ADMIN_PHONE:
-        missing.append("SMS_ADMIN_PHONE")
-
-    if missing:
-        logger.error(
-            "ORDER SMS SKIPPED for #%s: missing %s",
-            pending_id, ", ".join(missing)
-        )
-        return False
-
-    clean_items = re.sub(r"\s+", " ", str(items_summary or "-")).strip()
-    if len(clean_items) > 180:
-        clean_items = clean_items[:177] + "..."
-
-    sms_text = (
-        f"تنین ایران | سفارش جدید #{pending_id}\n"
-        f"مشتری: {full_name or '-'}\n"
-        f"موبایل: {phone or '-'}\n"
-        f"مبلغ: {int(total_price):,} تومان\n"
-        f"محصولات: {clean_items}\n"
-        f"لغو11"
-    )
-
-    payload = {
-        "username": MELIPAYAMAK_USERNAME,
-        "password": MELIPAYAMAK_API_KEY,
-        "to": SMS_ADMIN_PHONE,
-        "from": MELIPAYAMAK_SENDER,
-        "text": sms_text,
-        "isFlash": False,
-    }
-
-    try:
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                MELIPAYAMAK_URL,
-                data=payload,
-                headers={"Accept": "application/json, text/plain, */*"},
-            ) as response:
-                body = (await response.text()).strip()
-
-                logger.info(
-                    "Melipayamak response for order #%s: HTTP=%s BODY=%s",
-                    pending_id, response.status, body[:1000]
-                )
-
-                if response.status >= 400:
-                    logger.error(
-                        "ORDER SMS FAILED for #%s: HTTP %s",
-                        pending_id, response.status
-                    )
-                    return False
-
-                try:
-                    result = json.loads(body)
-                except (json.JSONDecodeError, TypeError):
-                    logger.error(
-                        "ORDER SMS FAILED for #%s: invalid API response: %s",
-                        pending_id, body[:1000]
-                    )
-                    return False
-
-                if not isinstance(result, dict):
-                    logger.error(
-                        "ORDER SMS FAILED for #%s: unexpected API response: %s",
-                        pending_id, body[:1000]
-                    )
-                    return False
-
-                ret_status = result.get("RetStatus", result.get("retStatus"))
-                str_status = result.get("StrRetStatus", result.get("strRetStatus", ""))
-                rec_id = result.get("Value", result.get("value", ""))
-
-                try:
-                    ret_status = int(ret_status)
-                except (TypeError, ValueError):
-                    ret_status = -1
-
-                if ret_status != 1:
-                    logger.error(
-                        "ORDER SMS REJECTED for #%s: RetStatus=%s StrRetStatus=%s Value=%s",
-                        pending_id, ret_status, str_status, rec_id
-                    )
-                    return False
-
-                logger.info(
-                    "ORDER SMS ACCEPTED for #%s: RecID=%s Status=%s",
-                    pending_id, rec_id, str_status
-                )
-                return True
-
-    except asyncio.TimeoutError:
-        logger.error("ORDER SMS TIMEOUT for #%s", pending_id)
-        return False
-    except aiohttp.ClientError as e:
-        logger.error("ORDER SMS NETWORK ERROR for #%s: %s", pending_id, e)
-        return False
-    except Exception:
-        logger.exception("ORDER SMS UNEXPECTED ERROR for #%s", pending_id)
-        return False
-
-
-def _order_sms_marker_key(pending_id):
-    return f"order_sms_sent:{int(pending_id)}"
-
-
-def _order_sms_was_sent(pending_id):
-    """Read a shared app_meta marker so Telegram and Bale don't alert twice."""
-    try:
-        with get_conn() as conn:
-            row = conn.execute(
-                "SELECT value FROM app_meta WHERE key=%s",
-                (_order_sms_marker_key(pending_id),),
-            ).fetchone()
-        return row is not None
-    except Exception:
-        # SMS should still be attempted if the marker lookup fails.
-        logger.exception("Could not check SMS marker for pending payment #%s", pending_id)
-        return False
-
-
-def _mark_order_sms_sent(pending_id, platform):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO app_meta(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING",
-            (_order_sms_marker_key(pending_id), f"{platform}:{datetime.now(IRAN_TZ).isoformat()}"),
-        )
-        conn.commit()
-
-
-async def send_order_sms_once(pending_id, full_name, phone, total_price, items_summary, platform="telegram"):
-    """Send one admin SMS per pending-payment row; retry if a previous attempt failed."""
-    if await asyncio.to_thread(_order_sms_was_sent, pending_id):
-        logger.info("ORDER SMS SKIPPED for #%s: already marked sent", pending_id)
-        return True
-    sent = await send_order_sms_to_admin(
-        pending_id=pending_id,
-        full_name=full_name,
-        phone=phone,
-        total_price=total_price,
-        items_summary=items_summary,
-    )
-    if sent:
-        try:
-            await asyncio.to_thread(_mark_order_sms_sent, pending_id, platform)
-        except Exception:
-            logger.exception("SMS was accepted but marker write failed for #%s", pending_id)
-    return sent
-
-
 async def create_pending_payment(message, context, user=None):
     user_id = message.chat_id
     username = (user.username if user is not None else message.from_user.username) or ""
@@ -1582,16 +1416,6 @@ async def create_pending_payment(message, context, user=None):
             pending = dict(pending)
             pending["total_price"] = total
         conn.close()
-        # If this pending payment was created before SMS configuration was fixed,
-        # retry the admin alert. app_meta prevents repeated SMS after success.
-        await send_order_sms_once(
-            pending_id=pending["id"],
-            full_name=full_name,
-            phone=phone,
-            total_price=total,
-            items_summary=summary,
-            platform="telegram",
-        )
         for key in ("full_name", "phone", "address", "gender"):
             context.user_data.pop(key, None)
         await show_payment_instructions(message, pending)
@@ -1608,15 +1432,6 @@ async def create_pending_payment(message, context, user=None):
     conn.commit()
     conn.close()
 
-    # اطلاع‌رسانی پیامکی به مدیر؛ در صورت خطا، ثبت سفارش ادامه پیدا می‌کند.
-    await send_order_sms_once(
-        pending_id=pending_id,
-        full_name=full_name,
-        phone=phone,
-        total_price=total,
-        items_summary=summary,
-        platform="telegram",
-    )
 
     context.user_data.pop("full_name", None)
     context.user_data.pop("phone", None)
@@ -1989,6 +1804,7 @@ def admin_panel_keyboard():
             InlineKeyboardButton("📢 مدیریت کانال", callback_data="adm:channel"),
             InlineKeyboardButton("💳 تنظیمات پرداخت", callback_data="adm:payment"),
         ],
+        [InlineKeyboardButton("📨 ارسال پیامک دستی", callback_data="adm:smsmanual")],
         [
             InlineKeyboardButton("🔄 بروزرسانی داشبورد", callback_data="adm:home"),
             InlineKeyboardButton("✕ بستن پنل", callback_data="adm:close"),
@@ -2017,8 +1833,10 @@ def back_keyboard(target="home"):
     )
 
 
-def order_status_keyboard(order_id, status):
+def order_status_keyboard(order_id, status, display_order_number=None):
     rows = []
+    if not display_order_number:
+        rows.append([InlineKeyboardButton("🏷 تخصیص شماره سفارش TN", callback_data=f"order:assign:{order_id}")])
     if status == "در انتظار بررسی":
         rows.append([InlineKeyboardButton("✅ تأیید سفارش", callback_data=f"order:status:{order_id}:confirmed")])
         rows.append([InlineKeyboardButton("❌ رد سفارش", callback_data=f"order:status:{order_id}:cancelled")])
@@ -2029,6 +1847,7 @@ def order_status_keyboard(order_id, status):
 def order_text(o):
     return (
         f"📦 <b>سفارش #{o['id']}</b>\n"
+        f"🏷 شماره نمایشی: <b>{escape(str(o.get('display_order_number') or 'هنوز تخصیص نیافته'))}</b>\n"
         f"━━━━━━━━━━━━━━\n"
         f"👤 مشتری: {escape(str(o['full_name'] or '-'))}\n"
         f"📞 تلفن: {escape(str(o['phone'] or '-'))}\n"
@@ -2653,11 +2472,15 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
     order_id = cur.fetchone()["id"]
     conn.execute("DELETE FROM cart_items WHERE user_id=%s", (pending['user_id'],))
     conn.execute("UPDATE pending_payments SET payment_status='تأیید شده', reviewed_at=%s, admin_id=%s, order_id=%s WHERE id=%s", (now, q.from_user.id, order_id, pid))
+    queue_order_created_sms(conn, {
+        "id": order_id, "full_name": pending["full_name"], "phone": pending["phone"],
+        "items_summary": pending["items_summary"]
+    }, SMS_ADMIN_PHONE)
     conn.commit(); conn.close()
     await q.answer(f"پرداخت تأیید شد؛ سفارش #{order_id} ثبت شد.")
     await mark_admin_message(q, f"\n\n✅ <b>پرداخت تأیید شد — سفارش #{order_id} ثبت شد</b>")
     try:
-        await context.bot.send_message(pending['user_id'], f"✅ پرداخت شما تأیید شد.\n🆔 شماره سفارش: #{order_id}\n💰 مبلغ: {pending['total_price']:,} تومان\nسفارش شما ثبت نهایی شد.")
+        await context.bot.send_message(pending['user_id'], f"✅ پرداخت شما تأیید شد و درخواست خرید در صف بررسی قرار گرفت.\n🆔 شناسه درخواست: #{order_id}\nشماره سفارش پس از تخصیص مدیر برای شما ارسال می‌شود.")
     except Exception: pass
     for admin_id in ADMIN_IDS:
         try:
@@ -2673,6 +2496,27 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = q.data.split(":")
     action = parts[1]
 
+    if action == "smsmanual":
+        choices = [
+            ("اعلان صف بررسی مشتری", "order_waiting_customer"),
+            ("اعلان سفارش جدید مدیر", "order_admin_new"),
+            ("یادآوری مدیر", "order_reminder_admin"),
+            ("ثبت شماره سفارش مشتری", "order_assigned_customer"),
+            ("تأیید سفارش مشتری", "order_confirmed_customer"),
+            ("تغییر کیف پول", "wallet_notice"),
+            ("ثبت کش‌بک", "cashback_notice"),
+        ]
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"adm:smsmanualtpl:{key}")] for label,key in choices] +
+                                  [[InlineKeyboardButton("🔙 پنل اصلی", callback_data="adm:home")]])
+        await q.edit_message_text("الگوی پیامک را برای ارسال دستی انتخاب کن:", reply_markup=kb)
+        return
+    if action == "smsmanualtpl" and len(parts) == 3:
+        template_key = parts[2]
+        if template_key not in TEMPLATE_IDS:
+            await q.answer("الگوی نامعتبر است.", show_alert=True); return
+        context.user_data["admin_flow"] = {"type":"manual_pattern_sms","step":"phone","template_key":template_key}
+        await q.edit_message_text("شماره موبایل گیرنده را وارد کن (09xxxxxxxxx). برای لغو /cancel را بفرست.")
+        return
     if action == "close":
         await q.edit_message_text("پنل مدیریت بسته شد.")
         return
@@ -3013,6 +2857,102 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id) or not flow:
         return
 
+    if text.lower() in ("/cancel", "لغو", "انصراف") and flow.get("type") in ("assign_order_number", "manual_pattern_sms"):
+        context.user_data.pop("admin_flow", None)
+        await update.message.reply_text("عملیات لغو شد.", reply_markup=admin_panel_keyboard())
+        return
+
+    if flow.get("type") == "assign_order_number":
+        raw = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")).strip().upper()
+        suffix = raw[3:] if raw.startswith("TN-") else raw
+        if not re.fullmatch(r"[0-9]{1,12}", suffix):
+            await update.message.reply_text("شماره نامعتبر است. فقط عدد وارد کن؛ مثال TN-1258.")
+            return
+        order_number = f"TN-{suffix}"
+        conn = get_conn()
+        try:
+            order = conn.execute(
+                """UPDATE orders
+                   SET display_order_number=%s, order_number_assigned_at=NOW(),
+                       order_number_assigned_by=%s, order_number_reminder_due_at=NULL
+                   WHERE id=%s AND display_order_number IS NULL
+                   RETURNING *""",
+                (order_number, str(update.effective_user.id), int(flow["order_id"])),
+            ).fetchone()
+            if not order:
+                existing = conn.execute("SELECT display_order_number FROM orders WHERE id=%s",
+                                        (int(flow["order_id"]),)).fetchone()
+                conn.rollback()
+                await update.message.reply_text(
+                    f"این سفارش قبلاً شماره {existing['display_order_number'] if existing else 'نامشخص'} گرفته است."
+                )
+                return
+            queue_order_assigned_sms(conn, order)
+            conn.execute(
+                """UPDATE sms_outbox SET status='cancelled',
+                       last_error='Order number assigned before reminder delivery', updated_at=NOW()
+                   WHERE idempotency_key=%s AND status='queued'""",
+                (f"order-number-reminder:{int(flow['order_id'])}",),
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            if "duplicate key" in str(exc).lower():
+                await update.message.reply_text("این شماره قبلاً برای سفارش دیگری استفاده شده است. شماره دیگری بفرست.")
+                return
+            logger.exception("Could not assign display order number")
+            await update.message.reply_text("ثبت شماره سفارش ناموفق بود؛ دوباره تلاش کن.")
+            return
+        finally:
+            conn.close()
+        context.user_data.pop("admin_flow", None)
+        await update.message.reply_text(
+            f"✅ شماره سفارش {order_number} ثبت شد. پیامک ثبت شماره در صف ارسال قرار گرفت.",
+            reply_markup=admin_panel_keyboard()
+        )
+        return
+
+    if flow.get("type") == "manual_pattern_sms":
+        if flow.get("step") == "phone":
+            from sms_templates import normalize_mobile
+            phone = normalize_mobile(text)
+            if not phone:
+                await update.message.reply_text("شماره موبایل معتبر نیست؛ مثل 09123456789 وارد کن.")
+                return
+            flow["phone"] = phone
+            flow["step"] = "vars"
+            key = flow["template_key"]
+            count = {"order_waiting_customer":2,"order_admin_new":3,"order_reminder_admin":2,
+                     "order_assigned_customer":3,"order_confirmed_customer":3,"wallet_notice":3,"cashback_notice":3}[key]
+            await update.message.reply_text(
+                f"حالا {count} متغیر الگو را به‌ترتیب با علامت | جدا کن.\\nمثال: نام مشتری | شماره سفارش | جزئیات"
+            )
+            return
+        if flow.get("step") == "vars":
+            key = flow["template_key"]
+            variables = [v.strip() for v in text.split("|")]
+            count = {"order_waiting_customer":2,"order_admin_new":3,"order_reminder_admin":2,
+                     "order_assigned_customer":3,"order_confirmed_customer":3,"wallet_notice":3,"cashback_notice":3}[key]
+            if len(variables) != count or any(not v for v in variables):
+                await update.message.reply_text(f"دقیقاً {count} متغیر غیرخالی با | جداشده وارد کن.")
+                return
+            conn = get_conn()
+            try:
+                enqueue_pattern_sms(conn, phone=flow["phone"], template_id=TEMPLATE_IDS[key],
+                    variables=variables,
+                    idempotency_key=f"manual-pattern-sms:telegram:{update.effective_user.id}:{update.message.message_id}",
+                    recipient_type="order_customer")
+                conn.commit()
+            except Exception:
+                conn.rollback(); logger.exception("Manual pattern SMS queue failed")
+                await update.message.reply_text("ثبت پیامک در صف ناموفق بود.")
+                return
+            finally:
+                conn.close()
+            context.user_data.pop("admin_flow", None)
+            await update.message.reply_text("✅ پیامک دستی در صف ارسال قرار گرفت.", reply_markup=admin_panel_keyboard())
+            return
+
     if flow["type"] == "channel_settings":
         step = flow.get("step")
         value = _valid_hhmm(text)
@@ -3228,7 +3168,20 @@ async def order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         await q.edit_message_text(
             order_text(order), parse_mode="HTML",
-            reply_markup=order_status_keyboard(order_id, order["status"])
+            reply_markup=order_status_keyboard(order_id, order["status"], order.get("display_order_number"))
+        )
+        return
+
+    if action == "assign":
+        conn.close()
+        context.user_data["admin_flow"] = {"type": "assign_order_number", "order_id": order_id}
+        await q.answer()
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await q.message.reply_text(
+            f"شماره سفارش برای درخواست #{order_id} را وارد کن. مثال: TN-1258 یا 1258\\nبرای لغو /cancel را بفرست."
         )
         return
 
@@ -3237,6 +3190,10 @@ async def order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "cancelled": "رد شد",
     }
     new_status = status_map.get(parts[3])
+    if parts[3] == "confirmed" and not order.get("display_order_number"):
+        conn.close()
+        await q.answer("ابتدا شماره سفارش TN را تخصیص بده.", show_alert=True)
+        return
     if not new_status:
         conn.close()
         await q.answer("وضعیت نامعتبر است.", show_alert=True)
@@ -3244,20 +3201,31 @@ async def order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     old_status = order["status"]
     conn.execute("UPDATE orders SET status=%s WHERE id=%s", (new_status, order_id))
-    conn.commit()
     order = conn.execute("SELECT * FROM orders WHERE id=%s", (order_id,)).fetchone()
+    if parts[3] == "confirmed" and order:
+        if queue_order_confirmed_sms(conn, order):
+            conn.execute("UPDATE orders SET order_confirmation_sms_queued_at=NOW() WHERE id=%s", (order_id,))
+    elif parts[3] == "cancelled":
+        conn.execute("UPDATE orders SET order_number_reminder_due_at=NULL WHERE id=%s", (order_id,))
+        conn.execute(
+            """UPDATE sms_outbox SET status='cancelled',
+                   last_error='Order cancelled before reminder delivery', updated_at=NOW()
+               WHERE idempotency_key=%s AND status='queued'""",
+            (f"order-number-reminder:{order_id}",),
+        )
+    conn.commit()
     conn.close()
 
     await q.answer(f"وضعیت سفارش #{order_id}: {new_status}")
     await q.edit_message_text(
         order_text(order), parse_mode="HTML",
-        reply_markup=order_status_keyboard(order_id, new_status)
+        reply_markup=order_status_keyboard(order_id, new_status, order.get("display_order_number"))
     )
 
     if old_status != new_status:
         if parts[3] == "confirmed":
             customer_text = (
-                f"✅ سفارش شما (#{order_id}) <b>تأیید شد</b> و در حال پردازش هست.\n"
+                f"✅ سفارش شما ({order.get('display_order_number') or ('#'+str(order_id))}) <b>تأیید شد</b> و در حال پردازش هست.\n"
                 f"به‌زودی برای هماهنگی ارسال باهاتون تماس می‌گیریم."
             )
         else:  # cancelled
