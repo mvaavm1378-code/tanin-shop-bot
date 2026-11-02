@@ -32,7 +32,7 @@ def normalize_mobile(value):
 
 def enqueue_pattern_sms(conn, *, phone, template_id, variables, idempotency_key,
                         recipient_type="customer", loyalty_customer_id=None,
-                        category="wallet_payment_notice", scheduled_at=None):
+                        category="transactional", scheduled_at=None):
     """Queue one approved pattern. Does not send SMS or affect the caller's transaction."""
     phone = normalize_mobile(phone)
     if not phone:
@@ -44,10 +44,16 @@ def enqueue_pattern_sms(conn, *, phone, template_id, variables, idempotency_key,
         raise ValueError("Unsupported SMS recipient_type")
     if not idempotency_key or len(str(idempotency_key)) > 240:
         raise ValueError("Invalid SMS idempotency key")
-    # Keep message_category within the existing transactional categories accepted by
-    # the production table's CHECK constraint; template_id carries the real purpose.
-    if category not in {"cashback_notice", "wallet_adjustment_notice", "wallet_payment_notice"}:
-        category = "wallet_payment_notice"
+    # Keep message_category aligned with the production CHECK constraint:
+    # cashback_notice, inactive_customer, campaign, transactional.
+    # Legacy wallet-specific labels are aliases; template_id carries the precise purpose.
+    category_aliases = {
+        "wallet_adjustment_notice": "transactional",
+        "wallet_payment_notice": "transactional",
+    }
+    category = category_aliases.get(category, category)
+    if category not in {"cashback_notice", "inactive_customer", "campaign", "transactional"}:
+        category = "transactional"
     try:
         # Nested psycopg transaction becomes a SAVEPOINT when the caller already
         # has a transaction. SMS queue failure must never roll back an order/payment.
