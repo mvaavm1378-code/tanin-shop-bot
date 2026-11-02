@@ -32,7 +32,7 @@ PATTERN_URL = os.getenv(
     "https://rest.payamak-panel.com/api/SendSMS/BaseServiceNumber",
 ).strip()
 BATCH_SIZE = 20
-TRANSACTIONAL_CATEGORIES = ("cashback_notice", "wallet_adjustment_notice", "wallet_payment_notice")
+TRANSACTIONAL_CATEGORIES = ("transactional", "cashback_notice")
 
 
 def parse_standard_response(body):
@@ -133,7 +133,7 @@ async def queue_due_order_reminders(conn):
                 INSERT INTO public.sms_outbox
                     (loyalty_customer_id,message_category,destination_phone,message_text,
                      status,idempotency_key,template_id,template_vars,recipient_type,scheduled_at)
-                VALUES(NULL,'wallet_payment_notice',%s,%s,'queued',%s,%s,%s::jsonb,'admin',NOW())
+                VALUES(NULL,'transactional',%s,%s,'queued',%s,%s,%s::jsonb,'admin',NOW())
                 ON CONFLICT(idempotency_key) DO NOTHING
                 """,
                 (SMS_ADMIN_PHONE, f"[Melipayamak pattern {TEMPLATE_IDS['order_reminder_admin']}]",
