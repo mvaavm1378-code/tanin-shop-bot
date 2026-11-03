@@ -53,24 +53,50 @@ def parse_standard_response(body):
 
 
 def parse_pattern_response(body):
-    """Pattern REST commonly returns a RecId string; also accept JSON wrappers."""
+    """Accept only a real RecId; short numeric provider return codes are errors."""
     raw = str(body or "").strip().strip('"')
+
+    # Some API gateways wrap the result in JSON. Do not trust RetStatus alone:
+    # the returned Value must itself be a long numeric RecId.
     try:
         data = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         data = None
+
     if isinstance(data, dict):
         status = data.get("RetStatus", data.get("retStatus"))
-        value = data.get("Value", data.get("value"))
-        try:
-            if int(status) == 1:
-                return True, str(value or "")[:200] or None, str(data.get("StrRetStatus") or "")
-        except (TypeError, ValueError):
-            pass
-        return False, None, str(data.get("StrRetStatus") or data.get("Message") or raw)[:500]
-    # Documented pattern endpoint returns a numeric RecId; negative numbers are errors.
-    if re.fullmatch(r"\d{1,30}", raw) and int(raw) > 0:
+        value = str(data.get("Value", data.get("value")) or "").strip()
+        if str(status) == "1" and re.fullmatch(r"\d{16,30}", value):
+            return True, value[:200], str(data.get("StrRetStatus") or "Pattern accepted")[:500]
+        raw_detail = data.get("StrRetStatus") or data.get("Message") or raw
+        if value and re.fullmatch(r"-?\d{1,15}", value):
+            _, _, mapped = parse_pattern_response(value)
+            return False, None, mapped
+        return False, None, f"Pattern provider rejected/unknown response: {str(raw_detail)[:400]}"
+
+    if re.fullmatch(r"\d{16,30}", raw):
         return True, raw[:200], "Pattern accepted"
+
+    provider_errors = {
+        "-7": "خطای شماره فرستنده؛ با پشتیبانی ملی‌پیامک تماس بگیرید.",
+        "-6": "خطای داخلی ملی‌پیامک.",
+        "-5": "متغیرهای ارسالی با الگوی تأییدشده مطابقت ندارند.",
+        "-4": "کد الگو نامعتبر است یا تأیید نشده است.",
+        "-3": "خط ارسال در سامانه تعریف نشده است.",
+        "-2": "در هر درخواست فقط یک شماره مجاز است.",
+        "-1": "دسترسی وب‌سرویس غیرفعال است.",
+        "0": "نام کاربری یا رمز عبور وب‌سرویس نامعتبر است.",
+        "2": "اعتبار پنل کافی نیست.",
+        "6": "سامانه ملی‌پیامک در حال به‌روزرسانی است.",
+        "7": "متن یا یکی از متغیرهای پیامک شامل کلمه فیلترشده است.",
+        "10": "کاربر پنل فعال نیست.",
+        "11": "پیامک توسط سرویس ارسال نشده است.",
+        "12": "مدارک حساب کاربری کامل نیست.",
+    }
+    if raw in provider_errors:
+        return False, None, f"Melipayamak error {raw}: {provider_errors[raw]}"
+    if re.fullmatch(r"-?\d{1,15}", raw):
+        return False, None, f"Melipayamak returned an unrecognized short status code: {raw}"
     return False, None, f"Pattern provider rejected/unknown response: {raw[:400]}"
 
 
@@ -239,6 +265,11 @@ async def process_one(conn, session, outbox_id):
         async with session.post(url, data=payload) as response:
             body = (await response.text())[:1200]
             http_status = response.status
+            if is_pattern:
+                log.info(
+                    "Melipayamak pattern response: outbox_id=%s template_id=%s HTTP=%s body=%s",
+                    outbox_id, template_id, http_status, body[:400],
+                )
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         await conn.execute(
             """UPDATE public.sms_outbox SET last_error=%s,updated_at=NOW()
