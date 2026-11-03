@@ -13,7 +13,7 @@ log = logging.getLogger("tanin-sms-templates")
 # business owner. Keep variable order aligned with the approved pattern text.
 TEMPLATE_IDS = {
     "order_waiting_customer": 575477,   # {0}=customer name, {1}=requested products
-    "order_admin_new": 575482,          # {0}=customer name, {1}=mobile, {2}=products
+    "order_admin_new": 575951,          # approved replacement: {0}=buyer name, {1}=mobile, {2}=products
     "order_reminder_admin": 575486,     # {0}=customer name, {1}=request number
     "order_assigned_customer": 575478,  # {0}=customer name, {1}=order number, {2}=details
     "order_confirmed_customer": 575449, # {0}=customer name, {1}=order number, {2}=details
@@ -23,7 +23,7 @@ TEMPLATE_IDS = {
 
 TEMPLATE_VARIABLE_COUNTS = {
     575477: 2,
-    575482: 3,
+    575951: 3,
     575486: 2,
     575478: 3,
     575449: 3,
