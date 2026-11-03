@@ -216,18 +216,11 @@ async def process_one(conn, session, outbox_id):
             await conn.commit()
             log.error("Outbox %s rejected before provider call: %s", outbox_id, reason)
             return
-        # Melipayamak SendByBaseNumber expects pattern variables as a
-        # comma-separated string. Convert commas inside values to Persian
-        # commas so they are not mistaken for variable separators.
-        pattern_text = ",".join(
-            str(v).replace(",", "،").replace("\r", " ").replace("\n", " ").strip()
-            for v in variables
-        )
         payload = {
             "username": USERNAME,
             "password": PASSWORD,
             "to": phone,
-            "text": pattern_text,
+            "text": ";".join(str(v) for v in variables),
             "bodyId": template_id,
         }
         url = PATTERN_URL
@@ -259,10 +252,6 @@ async def process_one(conn, session, outbox_id):
     if http_status != 200:
         accepted, provider_id, detail = False, None, f"HTTP {http_status}: {body}"
     elif is_pattern:
-        log.info(
-            "Melipayamak pattern response: outbox_id=%s HTTP=%s BODY=%s",
-            outbox_id, http_status, body[:400],
-        )
         accepted, provider_id, detail = parse_pattern_response(body)
     else:
         accepted, provider_id, detail = parse_standard_response(body)
@@ -283,11 +272,6 @@ async def process_one(conn, session, outbox_id):
             (str(detail)[:1000], outbox_id),
         )
     await conn.commit()
-    if is_pattern:
-        log.info(
-            "Melipayamak pattern result: outbox_id=%s template_id=%s accepted=%s provider_id=%s detail=%s",
-            outbox_id, template_id, accepted, provider_id, detail,
-        )
 
 
 def validate_configuration():
