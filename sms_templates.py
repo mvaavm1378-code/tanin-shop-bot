@@ -9,14 +9,26 @@ import logging
 
 log = logging.getLogger("tanin-sms-templates")
 
+# IDs below are the seven approved Melipayamak patterns supplied by the
+# business owner. Keep variable order aligned with the approved pattern text.
 TEMPLATE_IDS = {
-    "order_waiting_customer": 575427,
-    "order_admin_new": 575422,
-    "order_reminder_admin": 575426,
-    "order_assigned_customer": 575439,
-    "order_confirmed_customer": 575428,
-    "wallet_notice": 575528,
-    "cashback_notice": 575530,
+    "order_waiting_customer": 575477,   # {0}=customer name, {1}=requested products
+    "order_admin_new": 575482,          # {0}=customer name, {1}=mobile, {2}=products
+    "order_reminder_admin": 575486,     # {0}=customer name, {1}=request number
+    "order_assigned_customer": 575478,  # {0}=customer name, {1}=order number, {2}=details
+    "order_confirmed_customer": 575449, # {0}=customer name, {1}=order number, {2}=details
+    "wallet_notice": 575528,            # {0}=customer name, {1}=transaction type, {2}=description
+    "cashback_notice": 575530,          # {0}=customer name, {1}=order number, {2}=credit description
+}
+
+TEMPLATE_VARIABLE_COUNTS = {
+    575477: 2,
+    575482: 3,
+    575486: 2,
+    575478: 3,
+    575449: 3,
+    575528: 3,
+    575530: 3,
 }
 
 def normalize_mobile(value):
@@ -40,6 +52,16 @@ def enqueue_pattern_sms(conn, *, phone, template_id, variables, idempotency_key,
     template_id = int(template_id)
     variables = [str(v if v is not None else "-").replace("\r", " ").replace("\n", " ").strip()[:500]
                  for v in (variables or [])]
+    expected_count = TEMPLATE_VARIABLE_COUNTS.get(template_id)
+    if expected_count is None:
+        log.error("Refusing unapproved Melipayamak pattern ID %s", template_id)
+        return False
+    if len(variables) != expected_count:
+        log.error(
+            "Refusing pattern %s: expected %s variables, received %s",
+            template_id, expected_count, len(variables),
+        )
+        return False
     if recipient_type not in {"customer", "order_customer", "admin"}:
         raise ValueError("Unsupported SMS recipient_type")
     if not idempotency_key or len(str(idempotency_key)) > 240:
