@@ -22,7 +22,7 @@ import aiohttp
 from aiohttp import web
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from sms_templates import TEMPLATE_IDS, enqueue_pattern_sms, queue_order_created_sms, queue_order_assigned_sms, queue_order_confirmed_sms
+from sms_templates import TEMPLATE_IDS, enqueue_pattern_sms, queue_order_assigned_sms, queue_order_confirmed_sms
 
 from telegram import (
     Update,
@@ -1368,6 +1368,36 @@ async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await create_pending_payment(update.message, context)
 
 
+def queue_pending_request_sms(conn, pending_id, full_name, phone, items_summary):
+    """Queue the customer and admin request notices as soon as a pending request exists."""
+    pending_id = int(pending_id)
+    name_value = str(full_name or "-")
+    phone_value = str(phone or "-")
+    products_value = str(items_summary or "-")
+
+    customer_ok = enqueue_pattern_sms(
+        conn,
+        phone=phone,
+        template_id=TEMPLATE_IDS["order_waiting_customer"],
+        variables=[name_value, products_value],
+        idempotency_key=f"pending-order-waiting-customer:{pending_id}",
+        recipient_type="order_customer",
+    )
+    admin_ok = enqueue_pattern_sms(
+        conn,
+        phone=SMS_ADMIN_PHONE,
+        template_id=TEMPLATE_IDS["order_admin_new"],
+        variables=[name_value, phone_value, products_value],
+        idempotency_key=f"pending-order-admin-new:{pending_id}",
+        recipient_type="admin",
+    )
+    logger.info(
+        "Pending request SMS enqueue result for #%s: customer=%s admin=%s",
+        pending_id, customer_ok, admin_ok,
+    )
+    return customer_ok, admin_ok
+
+
 async def create_pending_payment(message, context, user=None):
     user_id = message.chat_id
     username = (user.username if user is not None else message.from_user.username) or ""
@@ -1404,6 +1434,7 @@ async def create_pending_payment(message, context, user=None):
            ORDER BY id DESC LIMIT 1""", (user_id,)
     ).fetchone()
     if pending:
+        pending_data = dict(pending)
         if pending["payment_status"] == "در انتظار رسید":
             # هنوز رسیدی ارسال نشده؛ اطلاعات و مبلغ را با سبد فعلی هماهنگ می‌کنیم.
             conn.execute(
@@ -1412,10 +1443,18 @@ async def create_pending_payment(message, context, user=None):
                    WHERE id=%s AND payment_status='در انتظار رسید'""",
                 (full_name, phone, address, summary, total, pending["id"]),
             )
-            conn.commit()
-            pending = dict(pending)
-            pending["total_price"] = total
+            pending_data.update(
+                full_name=full_name, phone=phone, address=address,
+                items_summary=summary, total_price=total,
+            )
+        # Queue once per pending request; idempotency keys prevent duplicates on re-entry.
+        queue_pending_request_sms(
+            conn, pending["id"], pending_data.get("full_name"),
+            pending_data.get("phone"), pending_data.get("items_summary"),
+        )
+        conn.commit()
         conn.close()
+        pending = pending_data
         for key in ("full_name", "phone", "address", "gender"):
             context.user_data.pop(key, None)
         await show_payment_instructions(message, pending)
@@ -1429,9 +1468,10 @@ async def create_pending_payment(message, context, user=None):
         (user_id, full_name, phone, address, summary, total, now),
     )
     pending_id = cur.fetchone()["id"]
+    # Queue both approved request-notice patterns immediately after request creation.
+    queue_pending_request_sms(conn, pending_id, full_name, phone, summary)
     conn.commit()
     conn.close()
-
 
     context.user_data.pop("full_name", None)
     context.user_data.pop("phone", None)
@@ -2472,10 +2512,6 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
     order_id = cur.fetchone()["id"]
     conn.execute("DELETE FROM cart_items WHERE user_id=%s", (pending['user_id'],))
     conn.execute("UPDATE pending_payments SET payment_status='تأیید شده', reviewed_at=%s, admin_id=%s, order_id=%s WHERE id=%s", (now, q.from_user.id, order_id, pid))
-    queue_order_created_sms(conn, {
-        "id": order_id, "full_name": pending["full_name"], "phone": pending["phone"],
-        "items_summary": pending["items_summary"]
-    }, SMS_ADMIN_PHONE)
     conn.commit(); conn.close()
     await q.answer(f"پرداخت تأیید شد؛ سفارش #{order_id} ثبت شد.")
     await mark_admin_message(q, f"\n\n✅ <b>پرداخت تأیید شد — سفارش #{order_id} ثبت شد</b>")
