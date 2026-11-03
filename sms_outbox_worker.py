@@ -15,7 +15,7 @@ import aiohttp
 import psycopg
 from psycopg.rows import dict_row
 
-from sms_templates import TEMPLATE_IDS, normalize_mobile
+from sms_templates import TEMPLATE_IDS, TEMPLATE_VARIABLE_COUNTS, normalize_mobile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tanin-sms-worker")
@@ -196,15 +196,32 @@ async def process_one(conn, session, outbox_id):
 
     is_pattern = row["template_id"] is not None
     if is_pattern:
+        template_id = int(row["template_id"])
         variables = row["template_vars"] or []
         if not isinstance(variables, list):
             variables = []
+        expected_count = TEMPLATE_VARIABLE_COUNTS.get(template_id)
+        if expected_count is None or len(variables) != expected_count:
+            reason = (
+                f"Unapproved pattern ID {template_id}"
+                if expected_count is None
+                else f"Pattern {template_id} requires {expected_count} variables; got {len(variables)}"
+            )
+            await conn.execute(
+                """UPDATE public.sms_outbox
+                   SET status='failed',last_error=%s,updated_at=NOW()
+                   WHERE id=%s AND status='sending'""",
+                (reason, outbox_id),
+            )
+            await conn.commit()
+            log.error("Outbox %s rejected before provider call: %s", outbox_id, reason)
+            return
         payload = {
             "username": USERNAME,
             "password": PASSWORD,
             "to": phone,
             "text": ";".join(str(v) for v in variables),
-            "bodyId": int(row["template_id"]),
+            "bodyId": template_id,
         }
         url = PATTERN_URL
     else:
