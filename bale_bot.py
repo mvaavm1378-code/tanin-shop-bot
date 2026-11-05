@@ -554,6 +554,21 @@ class BaleAPI:
             p["reply_markup"] = markup
         return await self.call("sendPhoto", p)
 
+    async def download_file(self, file_id):
+        """Download a file received by this Bale bot."""
+        info = await self.call("getFile", {"file_id": file_id})
+        file_path = (info or {}).get("file_path")
+        if not file_path:
+            raise RuntimeError("Bale فایل ارسالی را برای دانلود آماده نکرد.")
+        file_url = f"https://tapi.bale.ai/file/bot{TOKEN}/{file_path}"
+        async with self.session.get(file_url) as response:
+            if response.status != 200:
+                raise RuntimeError(f"دانلود عکس از بله ناموفق بود: HTTP {response.status}")
+            data = await response.read()
+            if len(data) > 10 * 1024 * 1024:
+                raise ValueError("حجم عکس بیشتر از ۱۰ مگابایت است.")
+            return data
+
     async def answer(self, callback_id, text=None, alert=False):
         p = {"callback_query_id": callback_id}
         if text:
@@ -578,6 +593,72 @@ class BaleAPI:
         if markup is not None:
             p["reply_markup"] = markup
         return await self.call("editMessageText", p)
+
+
+async def upload_product_image(image_bytes, content_type="image/jpeg", filename="product.jpg"):
+    """Upload image to the shared public Supabase Storage bucket used by both bots."""
+    base_url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "product-images").strip() or "product-images"
+    if not base_url or not service_key:
+        raise RuntimeError("متغیرهای SUPABASE_URL و SUPABASE_SERVICE_ROLE_KEY روی Render تنظیم نشده‌اند.")
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise ValueError("حجم عکس بیشتر از ۱۰ مگابایت است.")
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
+    if ext not in ("jpg", "jpeg", "png", "webp", "gif"):
+        ext = "jpg"
+    object_path = f"products/{uuid.uuid4().hex}.{ext}"
+    headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}",
+               "Content-Type": content_type or "image/jpeg", "x-upsert": "true"}
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(f"{base_url}/storage/v1/object/{bucket}/{object_path}",
+                                data=image_bytes, headers=headers) as response:
+            body = await response.text()
+            if response.status not in (200, 201):
+                raise RuntimeError(f"ذخیره عکس در Supabase ناموفق بود ({response.status}): {body[:250]}")
+    return f"{base_url}/storage/v1/object/public/{bucket}/{object_path}"
+
+
+async def handle_admin_product_photo(api, msg, uid, chat_id):
+    flow = (CHECKOUT.get(int(uid)) or {}).get("admin_flow") or {}
+    waiting_add = flow.get("type") == "add_product" and flow.get("step") == "photo_url"
+    waiting_edit = flow.get("type") == "product_field" and flow.get("field") == "photo_url"
+    if not is_admin(uid) or not (waiting_add or waiting_edit):
+        return False
+    photos = msg.get("photo") or []
+    document = msg.get("document") or {}
+    file_id = photos[-1].get("file_id") if photos else document.get("file_id")
+    if not file_id:
+        await api.send(chat_id, "لطفاً عکس را به‌صورت تصویر یا فایل تصویری ارسال کن.")
+        return True
+    try:
+        image_bytes = await api.download_file(file_id)
+        mime = document.get("mime_type") or "image/jpeg"
+        filename = document.get("file_name") or "product.jpg"
+        photo_url = await upload_product_image(image_bytes, mime, filename)
+        if waiting_add:
+            state = flow
+            with get_conn() as conn:
+                row = conn.execute("""INSERT INTO products(name,category,size,color,price,photo_url,active,pack_info)
+                    VALUES(%s,%s,%s,%s,%s,%s,TRUE,%s) RETURNING id""",
+                    (state["name"], state["category"], state["size"], state.get("color", ""),
+                     state["price"], photo_url, state.get("pack_info", ""))).fetchone()
+                conn.commit()
+            CHECKOUT.pop(uid, None)
+            await api.send(chat_id, f"✅ محصول «{escape(state['name'])}» با عکس ثبت شد.\nشناسه: #{row['id']}", admin_keyboard())
+        else:
+            pid = int(flow["product_id"])
+            with get_conn() as conn:
+                conn.execute("UPDATE products SET photo_url=%s WHERE id=%s", (photo_url, pid))
+                conn.commit()
+            CHECKOUT.pop(uid, None)
+            await api.send(chat_id, f"✅ عکس محصول #{pid} با موفقیت تغییر کرد.", admin_keyboard())
+        return True
+    except Exception as exc:
+        log.exception("Bale admin product image upload failed")
+        await api.send(chat_id, f"❌ ذخیره عکس انجام نشد: {str(exc)[:300]}\nلطفاً دوباره عکس را ارسال کن.")
+        return True
 
 
 def db_products(category):
@@ -1809,7 +1890,7 @@ async def handle_admin_text(api, msg, uid, chat_id, text):
         if step=="price":
             try: price=int(text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹","0123456789")).replace(",","")); assert price>=0
             except Exception: await api.send(chat_id,"قیمت نامعتبر است؛ یک عدد صفر یا بزرگ‌تر وارد کن."); return True
-            state.update({"step":"photo_url","price":price}); await api.send(chat_id,"لینک مستقیم عکس محصول را بفرست؛ در صورت نداشتن عکس «ندارد» بنویس:"); return True
+            state.update({"step":"photo_url","price":price}); await api.send(chat_id,"🖼 حالا عکس محصول را مستقیماً از گالری ارسال کن؛ یا برای ثبت بدون عکس «ندارد» بنویس:"); return True
         if step=="photo_url":
             url="" if text.lower().strip() in ("ندارد","ندارم","-","no") else text.strip()
             if url and not url.startswith(("https://","http://")): await api.send(chat_id,"لینک عکس باید با http:// یا https:// شروع شود."); return True
@@ -1912,7 +1993,7 @@ async def show_admin_product(api, chat_id, pid, mid=None, quick=False, price_qui
     buttons=[[{"text":"✏️ ویرایش نام","callback_data":f"adm:product_field:{pid}:name"},{"text":"💰 تغییر قیمت","callback_data":f"adm:price_set:{pid}"}],
              [{"text":"📂 دسته","callback_data":f"adm:product_field:{pid}:category"},{"text":"📏 سایز","callback_data":f"adm:product_field:{pid}:size"}],
              [{"text":"🎨 رنگ","callback_data":f"adm:product_field:{pid}:color"},{"text":"📦 اطلاعات پک","callback_data":f"adm:product_field:{pid}:pack_info"}],
-             [{"text":"🖼 لینک عکس","callback_data":f"adm:product_field:{pid}:photo_url"}],
+             [{"text":"🖼 تغییر عکس با ارسال تصویر","callback_data":f"adm:product_field:{pid}:photo_url"}],
              [{"text":"➖ ۵۰ هزار","callback_data":f"adm:price_adjust:{pid}:-50000"},{"text":"➕ ۵۰ هزار","callback_data":f"adm:price_adjust:{pid}:50000"}],
              [{"text":"➖ ۱۰۰ هزار","callback_data":f"adm:price_adjust:{pid}:-100000"},{"text":"➕ ۱۰۰ هزار","callback_data":f"adm:price_adjust:{pid}:100000"}],
              [{"text":("⛔ غیرفعال کردن" if p['active'] else "🟢 فعال کردن"),"callback_data":f"adm:toggle_product:{pid}"}],
@@ -2162,6 +2243,9 @@ async def on_message(api, msg):
                 log.info("Could not send Bale wallet adjustment notice", exc_info=True)
             await api.send(chat_id, f"✅ {verb} اعتبار انجام شد.\nمبلغ: {amount:,} تومان\nموجودی جدید: {new_balance:,} تومان", admin_keyboard())
             return
+        if msg.get("photo") or (msg.get("document") and str((msg.get("document") or {}).get("mime_type", "")).startswith("image/")):
+            if await handle_admin_product_photo(api, msg, uid, chat_id):
+                return
         if text.startswith("/walletcap"):
             parts = text.split()
             if len(parts) == 1:
@@ -2653,7 +2737,7 @@ async def on_callback(api, cb):
                 pid=int(action[2]); field=action[3]
                 if field not in {"name","category","size","color","pack_info","price","photo_url"}: await api.send(chat_id,"فیلد نامعتبر است."); return
                 CHECKOUT[uid]={"admin_flow":{"type":"product_field","product_id":pid,"field":field,"return_to":"products"}}
-                labels={"name":"نام جدید را وارد کن:","category":"دسته جدید را وارد کن: بچگانه یا زنانه","size":"سایز جدید را وارد کن:","color":"رنگ‌بندی جدید را وارد کن:","pack_info":"اطلاعات پک جدید را وارد کن (یا ندارد):","price":"قیمت جدید را به تومان وارد کن:","photo_url":"لینک عکس جدید را وارد کن (یا ندارد):"}
+                labels={"name":"نام جدید را وارد کن:","category":"دسته جدید را وارد کن: بچگانه یا زنانه","size":"سایز جدید را وارد کن:","color":"رنگ‌بندی جدید را وارد کن:","pack_info":"اطلاعات پک جدید را وارد کن (یا ندارد):","price":"قیمت جدید را به تومان وارد کن:","photo_url":"🖼 عکس جدید محصول را مستقیماً از گالری ارسال کن؛ یا برای حذف عکس «ندارد» بنویس:"}
                 await api.send(chat_id,labels[field])
             elif section == "price_adjust" and len(action)==4:
                 pid=int(action[2]); delta=int(action[3])
