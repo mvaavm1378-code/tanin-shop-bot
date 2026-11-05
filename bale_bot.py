@@ -15,6 +15,12 @@ from zoneinfo import ZoneInfo
 from sms_templates import TEMPLATE_IDS, enqueue_pattern_sms, queue_order_created_sms, queue_order_assigned_sms, queue_order_confirmed_sms
 from html import escape
 import aiohttp
+from io import BytesIO
+from urllib.parse import urlparse, unquote
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = ImageOps = None
 from aiohttp import web
 import psycopg
 from psycopg.rows import dict_row
@@ -595,30 +601,65 @@ class BaleAPI:
         return await self.call("editMessageText", p)
 
 
-async def upload_product_image(image_bytes, content_type="image/jpeg", filename="product.jpg"):
-    """Upload image to the shared public Supabase Storage bucket used by both bots."""
+def optimize_product_image(image_bytes):
+    """Normalize product images to a 1000px WebP image (~80 quality)."""
+    if Image is None:
+        raise RuntimeError("برای فشرده‌سازی عکس، کتابخانه Pillow نصب نیست؛ Pillow را به requirements.txt اضافه کن.")
+    with Image.open(BytesIO(image_bytes)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        image.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+        output = BytesIO()
+        image.save(output, format="WEBP", quality=80, method=6)
+        result = output.getvalue()
+    if len(result) > 2 * 1024 * 1024:
+        raise ValueError("حجم عکس بهینه‌شده هنوز بیشتر از ۲ مگابایت است.")
+    return result
+
+
+async def upload_product_image(image_bytes, content_type="image/webp", filename="product.webp"):
+    """Optimize and upload a WebP product image to shared Supabase Storage."""
     base_url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
     service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
     bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "product-images").strip() or "product-images"
     if not base_url or not service_key:
         raise RuntimeError("متغیرهای SUPABASE_URL و SUPABASE_SERVICE_ROLE_KEY روی Render تنظیم نشده‌اند.")
     if len(image_bytes) > 10 * 1024 * 1024:
-        raise ValueError("حجم عکس بیشتر از ۱۰ مگابایت است.")
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
-    if ext not in ("jpg", "jpeg", "png", "webp", "gif"):
-        ext = "jpg"
-    object_path = f"products/{uuid.uuid4().hex}.{ext}"
+        raise ValueError("حجم عکس اصلی بیشتر از ۱۰ مگابایت است.")
+    optimized = optimize_product_image(image_bytes)
+    object_path = f"products/{uuid.uuid4().hex}.webp"
     headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}",
-               "Content-Type": content_type or "image/jpeg", "x-upsert": "true"}
+               "Content-Type": "image/webp", "x-upsert": "true"}
     timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(f"{base_url}/storage/v1/object/{bucket}/{object_path}",
-                                data=image_bytes, headers=headers) as response:
+                                data=optimized, headers=headers) as response:
             body = await response.text()
             if response.status not in (200, 201):
                 raise RuntimeError(f"ذخیره عکس در Supabase ناموفق بود ({response.status}): {body[:250]}")
     return f"{base_url}/storage/v1/object/public/{bucket}/{object_path}"
 
+
+async def delete_old_product_image(photo_url):
+    """Delete only an old object belonging to this project's configured bucket."""
+    if not photo_url:
+        return False
+    base_url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "product-images").strip() or "product-images"
+    prefix = f"{base_url}/storage/v1/object/public/{bucket}/"
+    if not base_url or not service_key or not photo_url.startswith(prefix):
+        return False
+    object_path = unquote(photo_url[len(prefix):]).split("?", 1)[0]
+    if not object_path or ".." in object_path.split("/"):
+        return False
+    headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}"}
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.delete(f"{base_url}/storage/v1/object/{bucket}", json={"prefixes": [object_path]}, headers=headers) as response:
+            if response.status not in (200, 204):
+                log.warning("Could not delete replaced product image (%s): %s", response.status, (await response.text())[:200])
+                return False
+    return True
 
 async def handle_admin_product_photo(api, msg, uid, chat_id):
     flow = (CHECKOUT.get(int(uid)) or {}).get("admin_flow") or {}
@@ -650,10 +691,17 @@ async def handle_admin_product_photo(api, msg, uid, chat_id):
         else:
             pid = int(flow["product_id"])
             with get_conn() as conn:
+                previous = conn.execute("SELECT photo_url FROM products WHERE id=%s", (pid,)).fetchone()
+                old_url = (previous or {}).get("photo_url") or ""
                 conn.execute("UPDATE products SET photo_url=%s WHERE id=%s", (photo_url, pid))
                 conn.commit()
+            if old_url and old_url != photo_url:
+                try:
+                    await delete_old_product_image(old_url)
+                except Exception:
+                    log.exception("Could not clean up previous product image for #%s", pid)
             CHECKOUT.pop(uid, None)
-            await api.send(chat_id, f"✅ عکس محصول #{pid} با موفقیت تغییر کرد.", admin_keyboard())
+            await api.send(chat_id, f"✅ عکس محصول #{pid} با موفقیت تغییر کرد و به WebP فشرده شد.", admin_keyboard())
         return True
     except Exception as exc:
         log.exception("Bale admin product image upload failed")
