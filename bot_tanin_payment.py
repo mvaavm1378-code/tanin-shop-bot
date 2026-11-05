@@ -17,6 +17,7 @@ import logging
 import json
 import re
 import random
+import uuid
 from html import escape
 import aiohttp
 from aiohttp import web
@@ -1928,6 +1929,7 @@ def admin_product_keyboard(product_id, active, show_quick_edit=False, show_price
             [InlineKeyboardButton("📏 ویرایش سریع سایز", callback_data=f"adm:quick_field:{product_id}:size")],
             [InlineKeyboardButton("🎨 ویرایش سریع رنگ‌بندی", callback_data=f"adm:quick_field:{product_id}:color")],
             [InlineKeyboardButton("📦 ویرایش سریع پک", callback_data=f"adm:quick_field:{product_id}:pack_info")],
+            [InlineKeyboardButton("🖼 تغییر عکس محصول", callback_data=f"adm:quick_photo:{product_id}")],
             [InlineKeyboardButton(
                 "💰 بستن گزینه‌های قیمت" if show_price_adjust else "💰 ویرایش سریع قیمت",
                 callback_data=f"adm:price_quick_toggle:{product_id}:{0 if show_price_adjust else 1}"
@@ -2425,8 +2427,74 @@ async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await q.answer()
 
+async def upload_product_image(image_bytes: bytes, content_type: str = "image/jpeg", filename: str = "product.jpg") -> str:
+    """Upload a product image to the shared public Supabase Storage bucket."""
+    base_url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "product-images").strip() or "product-images"
+    if not base_url or not service_key:
+        raise RuntimeError("متغیرهای SUPABASE_URL و SUPABASE_SERVICE_ROLE_KEY روی Render تنظیم نشده‌اند.")
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise ValueError("حجم عکس بیشتر از ۱۰ مگابایت است.")
+    ext = (filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg")
+    if ext not in ("jpg", "jpeg", "png", "webp", "gif"):
+        ext = "jpg"
+    object_path = f"products/{uuid.uuid4().hex}.{ext}"
+    url = f"{base_url}/storage/v1/object/{bucket}/{object_path}"
+    headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}",
+               "Content-Type": content_type or "image/jpeg", "x-upsert": "true"}
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, data=image_bytes, headers=headers) as response:
+            body = await response.text()
+            if response.status not in (200, 201):
+                raise RuntimeError(f"ذخیره عکس در Supabase ناموفق بود ({response.status}): {body[:250]}")
+    return f"{base_url}/storage/v1/object/public/{bucket}/{object_path}"
+
+
+async def handle_admin_product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.message
+    flow = context.user_data.get("admin_flow") or {}
+    if not message or not is_admin(update.effective_user.id):
+        return False
+    waiting_add = flow.get("type") == "add_product" and flow.get("step") == "photo"
+    waiting_edit = flow.get("type") == "edit_product" and flow.get("step") == "photo"
+    waiting_quick = flow.get("type") == "quick_photo"
+    if not (waiting_add or waiting_edit or waiting_quick):
+        return False
+    file_obj = message.photo[-1] if message.photo else message.document
+    if not file_obj:
+        return False
+    try:
+        telegram_file = await context.bot.get_file(file_obj.file_id)
+        image_bytes = bytes(await telegram_file.download_as_bytearray())
+        content_type = getattr(message.document, "mime_type", None) if message.document else "image/jpeg"
+        filename = getattr(message.document, "file_name", None) if message.document else "product.jpg"
+        photo_url = await upload_product_image(image_bytes, content_type or "image/jpeg", filename or "product.jpg")
+        if waiting_add:
+            conn = get_conn()
+            cur = conn.execute("""INSERT INTO products(name,category,size,color,price,photo_url,active,pack_info)
+                VALUES(%s,%s,%s,%s,%s,%s,TRUE,%s) RETURNING id""",
+                (flow["name"], flow["category"], flow["size"], "رنگ‌بندی طبق ژورنال موجود", flow["price"], photo_url, flow.get("pack_info", "")))
+            pid = cur.fetchone()["id"]; conn.commit(); conn.close()
+            context.user_data.pop("admin_flow", None)
+            await message.reply_text(f"✅ محصول «{flow['name']}» با عکس ثبت شد.\nشناسه: #{pid}", reply_markup=admin_panel_keyboard())
+        else:
+            pid = int(flow["product_id"])
+            conn = get_conn(); conn.execute("UPDATE products SET photo_url=%s WHERE id=%s", (photo_url, pid)); conn.commit(); conn.close()
+            context.user_data.pop("admin_flow", None)
+            await message.reply_text(f"✅ عکس محصول #{pid} با موفقیت تغییر کرد.", reply_markup=admin_panel_keyboard())
+        return True
+    except Exception as exc:
+        logger.exception("Admin product image upload failed")
+        await message.reply_text(f"❌ ذخیره عکس انجام نشد: {str(exc)[:300]}\nلطفاً دوباره عکس را ارسال کن.")
+        return True
+
+
 async def receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not (update.message.photo or update.message.document):
+        return
+    if await handle_admin_product_photo(update, context):
         return
     user_id = update.effective_user.id
     conn = get_conn()
@@ -2713,6 +2781,12 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pid, show = int(parts[2]), parts[3] == "1"
         await q.answer()
         await admin_product_detail(q, pid, show_quick_edit=show)
+        return
+    if action == "quick_photo":
+        pid = int(parts[2])
+        context.user_data["admin_flow"] = {"type": "quick_photo", "product_id": pid}
+        await q.answer()
+        await q.message.reply_text("🖼 عکس جدید محصول را مستقیماً از گالری ارسال کن؛ برای لغو /cancel را بفرست.")
         return
     if action == "quick_field":
         pid, field = int(parts[2]), parts[3]
@@ -3116,7 +3190,7 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif step == "price":
             try: flow["price"] = int(text.replace(",", "")); assert flow["price"] >= 0
             except Exception: await update.message.reply_text("❌ قیمت نامعتبر است."); return
-            flow["step"] = "photo"; await update.message.reply_text("لینک عکس محصول را بفرست؛ اگر عکس نداری بنویس «ندارد».")
+            flow["step"] = "photo"; await update.message.reply_text("🖼 حالا عکس محصول را مستقیماً از گالری ارسال کن؛ یا برای ثبت بدون عکس «ندارد» بنویس.")
         elif step == "photo":
             photo_url = "" if text.lower() in ("ندارد","ندارم","-","no") else text
             conn=get_conn(); cur=conn.execute("""INSERT INTO products(name,category,size,color,price,photo_url,active,pack_info) VALUES(%s,%s,%s,%s,%s,%s,TRUE,%s) RETURNING id""",
@@ -3177,7 +3251,7 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif step == "price":
             try: price=int(text.replace(",","")); assert price>=0
             except Exception: conn.close(); await update.message.reply_text("❌ قیمت نامعتبر است."); return
-            conn.execute("UPDATE products SET price=%s WHERE id=%s",(price,pid)); flow["step"]="photo"; await update.message.reply_text("لینک عکس جدید را بفرست؛ برای بدون عکس «ندارد».")
+            conn.execute("UPDATE products SET price=%s WHERE id=%s",(price,pid)); flow["step"]="photo"; await update.message.reply_text("🖼 عکس جدید محصول را مستقیماً از گالری ارسال کن؛ یا برای حذف عکس «ندارد» بنویس.")
         elif step == "photo":
             photo_url="" if text.lower() in ("ندارد","ندارم","-","no") else text; conn.execute("UPDATE products SET photo_url=%s WHERE id=%s",(photo_url,pid)); conn.commit(); p=conn.execute("SELECT * FROM products WHERE id=%s",(pid,)).fetchone(); conn.close(); context.user_data.pop("admin_flow",None); await update.message.reply_text(f"✅ محصول «{p['name']}» ویرایش شد.",reply_markup=admin_panel_keyboard()); return
         conn.commit(); conn.close()
