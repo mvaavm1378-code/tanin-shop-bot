@@ -9,7 +9,7 @@ import logging
 
 log = logging.getLogger("tanin-sms-templates")
 
-# IDs below are the approved Melipayamak patterns supplied by the
+# IDs below are the seven approved Melipayamak patterns supplied by the
 # business owner. Keep variable order aligned with the approved pattern text.
 TEMPLATE_IDS = {
     "order_waiting_customer": 575477,   # {0}=customer name, {1}=requested products
@@ -19,7 +19,6 @@ TEMPLATE_IDS = {
     "order_confirmed_customer": 575449, # {0}=customer name, {1}=order number, {2}=details
     "wallet_notice": 575528,            # {0}=customer name, {1}=transaction type, {2}=description
     "cashback_notice": 575530,          # {0}=customer name, {1}=order number, {2}=credit description
-    "phone_verification": 578916,       # {0}=six-digit one-time verification code
 }
 
 TEMPLATE_VARIABLE_COUNTS = {
