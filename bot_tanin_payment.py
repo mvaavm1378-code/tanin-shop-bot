@@ -30,6 +30,12 @@ from aiohttp import web
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from sms_templates import TEMPLATE_IDS, enqueue_pattern_sms, queue_order_assigned_sms, queue_order_confirmed_sms
+from customer_identity import (ensure_platform_account, get_profile, get_profile_for_platform,
+    start_phone_verification, verify_phone_code, save_profile_field, request_wholesaler,
+    approve_wholesaler_request, reject_wholesaler_request, add_wholesaler_by_phone,
+    remove_wholesaler, update_wholesaler_phone, customer_is_wholesaler, parse_jalali_date,
+    gregorian_to_jalali, queue_delivery_sms, normalize_mobile_e164, mobile_e164_to_local,
+    admin_update_wholesaler_profile)
 
 from telegram import (
     Update,
@@ -204,6 +210,9 @@ def init_db():
         "pending_payments",
         "orders",
         "app_meta",
+        "loyalty_customers", "customer_platform_accounts", "customer_phone_verifications",
+        "customer_profile_history", "wholesaler_requests", "wholesaler_members",
+        "sms_outbox", "sms_customer_preferences", "wallet_accounts", "loyalty_order_links",
     }
     conn = get_conn()
     try:
@@ -222,16 +231,26 @@ def init_db():
 
         # Check the columns that this version of the bot relies on.
         expected_columns = {
-            "products": {"id", "name", "category", "size", "color", "price", "photo_url", "active", "pack_info"},
+            "products": {"id", "name", "category", "size", "color", "price", "wholesale_price", "photo_url", "active", "pack_info"},
             "customers": {"user_id", "username", "full_name", "phone", "gender", "first_seen", "last_seen"},
             "customer_saved_data": {"id", "user_id", "data_type", "value", "created_at", "updated_at"},
             "support_tickets": {"id", "user_id", "order_id", "topic", "status", "created_at", "updated_at", "closed_at"},
             "support_ticket_messages": {"id", "ticket_id", "sender_id", "sender_type", "message", "created_at"},
             "cart_items": {"id", "user_id", "product_id", "qty"},
             "bank_accounts": {"id", "bank_name", "owner_name", "card_number", "account_number", "iban", "active", "created_at", "updated_at"},
-            "pending_payments": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "payment_status", "receipt_file_id", "created_at", "reviewed_at", "order_id", "admin_id"},
-            "orders": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "status", "created_at", "finalized_at", "payment_status", "transaction_ref", "display_order_number", "order_number_assigned_at", "order_number_reminder_due_at", "order_number_reminder_sent_at"},
+            "pending_payments": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "payment_status", "receipt_file_id", "created_at", "reviewed_at", "order_id", "admin_id", "platform", "loyalty_customer_id"},
+            "orders": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "status", "created_at", "finalized_at", "payment_status", "transaction_ref", "display_order_number", "order_number_assigned_at", "order_number_reminder_due_at", "order_number_reminder_sent_at", "delivery_date", "platform", "loyalty_customer_id"},
             "app_meta": {"key", "value"},
+            "loyalty_customers": {"id", "display_name", "phone_e164", "phone_verified_at", "birth_date", "address", "display_name_updated_at", "address_updated_at", "birth_date_updated_at", "is_wholesaler", "merged_into_id"},
+            "customer_platform_accounts": {"loyalty_customer_id", "platform", "platform_user_id", "linked_at", "last_seen_at"},
+            "customer_phone_verifications": {"id", "platform", "platform_user_id", "loyalty_customer_id", "phone_e164", "code_hash", "salt", "attempts", "created_at", "expires_at", "verified_at", "consumed_at"},
+            "customer_profile_history": {"id", "loyalty_customer_id", "legacy_platform", "data_type", "value", "archived_at"},
+            "wholesaler_requests": {"id", "loyalty_customer_id", "phone_e164", "status", "created_at", "reviewed_at", "reviewed_by"},
+            "wholesaler_members": {"id", "phone_e164", "loyalty_customer_id", "active", "added_by", "created_at", "updated_at"},
+            "sms_outbox": {"id", "destination_phone", "message_text", "message_category", "recipient_type", "status", "idempotency_key"},
+            "sms_customer_preferences": {"loyalty_customer_id", "transactional_sms_enabled", "marketing_enabled_by_admin", "updated_at"},
+            "wallet_accounts": {"id", "loyalty_customer_id", "balance_toman", "updated_at"},
+            "loyalty_order_links": {"platform", "source_order_id", "loyalty_customer_id"},
         }
         for table, cols in expected_columns.items():
             actual = {
@@ -295,7 +314,7 @@ def admin_menu_counts():
             "SELECT COUNT(*) AS n FROM orders WHERE status='در انتظار بررسی'"
         ).fetchone()["n"]
         payments = conn.execute(
-            "SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی'"
+            "SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی' AND platform='telegram'"
         ).fetchone()["n"]
         products = conn.execute(
             "SELECT COUNT(*) AS n FROM products WHERE active=TRUE"
@@ -329,6 +348,7 @@ def main_menu_keyboard(user_id=None):
                  KeyboardButton(_admin_badge("💳 پرداخت‌های در انتظار", counts["payments"]))],
                 [KeyboardButton(_admin_badge("🛠 مدیریت محصولات", counts["products"])),
                  KeyboardButton(_admin_badge("🎫 پشتیبانی", counts["tickets"]))],
+                [KeyboardButton("🏬 مدیریت بنکداران")],
             ],
             resize_keyboard=True,
         )
@@ -336,10 +356,163 @@ def main_menu_keyboard(user_id=None):
     rows = [
         [KeyboardButton("🧾 کاتالوگ محصولات")],
         [KeyboardButton("🛒 سبد خرید"), KeyboardButton("📦 سفارش‌های من")],
-        [KeyboardButton("💬 مرکز پشتیبانی")],
+        [KeyboardButton("👤 پروفایل من"), KeyboardButton("💬 مرکز پشتیبانی")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
+
+
+async def show_customer_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    target = update.effective_message
+    try:
+        with get_conn() as conn:
+            with conn.transaction():
+                customer_id, profile = get_profile_for_platform(conn, "telegram", user.id, user.full_name)
+    except Exception:
+        logger.exception("Could not load Telegram customer profile")
+        await target.reply_text("فعلاً دریافت پروفایل ممکن نیست. چند لحظه بعد دوباره تلاش کن.")
+        return
+    phone = mobile_e164_to_local(profile.get("phone_e164") or "") or "ثبت نشده"
+    birth = gregorian_to_jalali(profile["birth_date"]) if profile.get("birth_date") else "ثبت نشده"
+    request_status = profile.get("wholesaler_request_status")
+    wholesale_text = "فعال ✅" if profile.get("wholesaler_active") else ("در انتظار بررسی" if request_status == "pending" else "عضو نیست")
+    text = (
+        "👤 <b>پروفایل مشتری تنین ایران</b>\n\n"
+        f"شناسه مشتری: <code>{customer_id}</code>\n"
+        f"نام و نام خانوادگی: {escape(str(profile.get('display_name') or 'ثبت نشده'))}\n"
+        f"شماره موبایل: {escape(phone)} {'✅ تأییدشده' if profile.get('phone_verified_at') else '⚠️ تأییدنشده'}\n"
+        f"آدرس اصلی: {escape(str(profile.get('address') or 'ثبت نشده'))}\n"
+        f"تاریخ تولد: {escape(birth)}\n"
+        f"وضعیت بنکداری: {wholesale_text}\n\n"
+        "اطلاعات اصلی فقط یک‌بار نگهداری می‌شود و از تلگرام و بله مشترک است."
+    )
+    buttons = [
+        [InlineKeyboardButton("📱 تأیید / تغییر شماره موبایل", callback_data="profile:phone")],
+        [InlineKeyboardButton("✏️ ویرایش نام", callback_data="profile:name"), InlineKeyboardButton("📍 ویرایش آدرس", callback_data="profile:address")],
+        [InlineKeyboardButton("🎂 ثبت / ویرایش تاریخ تولد", callback_data="profile:birth")],
+        [InlineKeyboardButton("🏬 درخواست عضویت بنکداری", callback_data="profile:wholesaler")],
+        [InlineKeyboardButton("🔄 بروزرسانی", callback_data="profile:refresh")],
+    ]
+    await target.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def customer_profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action = q.data.split(":", 1)[1]
+    if action == "refresh":
+        await show_customer_profile(update, context)
+        return
+    if action == "phone":
+        context.user_data["profile_flow"] = {"step": "phone"}
+        await q.message.reply_text("📱 شماره موبایل خودت را وارد کن (مثال 09123456789). کد تأیید پیامکی ارسال می‌شود. برای لغو /cancel را بفرست.")
+        return
+    if action in ("name", "address", "birth"):
+        context.user_data["profile_flow"] = {"step": action}
+        prompts = {
+            "name": "نام و نام خانوادگی اصلی را وارد کن:",
+            "address": "آدرس اصلی و کامل را وارد کن:",
+            "birth": "تاریخ تولد شمسی را وارد کن؛ مثال ۱۳۷۵/۰۶/۲۰:",
+        }
+        await q.message.reply_text(prompts[action])
+        return
+    if action == "wholesaler":
+        try:
+            with get_conn() as conn:
+                with conn.transaction():
+                    customer_id = ensure_platform_account(conn, "telegram", q.from_user.id, q.from_user.full_name)
+                    status = request_wholesaler(conn, customer_id)
+                    profile = get_profile(conn, customer_id)
+        except Exception:
+            logger.exception("Could not create Telegram wholesaler request")
+            await q.message.reply_text("ثبت درخواست انجام نشد؛ لطفاً دوباره تلاش کن.")
+            return
+        if status == "phone_unverified":
+            context.user_data["profile_flow"] = {"step":"phone", "after_verify":"wholesaler_request"}
+            await q.message.reply_text("برای ثبت درخواست بنکداری، شماره موبایلت را وارد کن تا با پیامک تأیید شود:")
+            return
+        messages = {
+            "phone_unverified": "برای درخواست بنکداری ابتدا شماره موبایلت را با پیامک تأیید کن.",
+            "already_active": "عضویت بنکداری شما از قبل فعال است.",
+            "pending": "درخواست شما قبلاً ثبت شده و در انتظار بررسی مدیر است.",
+            "submitted": "✅ درخواست عضویت بنکداری ثبت شد و برای مدیر ارسال شد.",
+        }
+        await q.message.reply_text(messages.get(status, "درخواست بررسی شد."))
+        if status == "submitted":
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(admin_id, f"🏬 درخواست عضویت بنکداری جدید\nشناسه مشتری: {customer_id}\nشماره: {mobile_e164_to_local(profile.get('phone_e164') or '')}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بررسی درخواست‌ها", callback_data="adm:wholesalers:requests")]]))
+                except Exception:
+                    logger.exception("Could not notify admin about wholesaler request")
+        return
+
+
+async def customer_profile_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    flow = context.user_data.get("profile_flow") or {}
+    if not flow or not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    if text in ("/cancel", "لغو", "انصراف"):
+        context.user_data.pop("profile_flow", None)
+        await update.message.reply_text("عملیات لغو شد.")
+        return
+    step = flow.get("step")
+    try:
+        if step == "phone":
+            with get_conn() as conn:
+                with conn.transaction():
+                    result = start_phone_verification(conn, "telegram", update.effective_user.id, text, update.effective_user.full_name)
+            flow["step"] = "otp"
+            await update.message.reply_text(f"کد تأیید به شماره {result['masked_phone']} ارسال شد. کد ۶ رقمی را وارد کن. اعتبار کد ۵ دقیقه است.")
+            return
+        if step == "otp":
+            with get_conn() as conn:
+                with conn.transaction():
+                    result = verify_phone_code(conn, "telegram", update.effective_user.id, text, update.effective_user.full_name)
+            if result["status"] != "verified":
+                errors = {"wrong": "کد اشتباه است؛ دوباره وارد کن.", "expired": "کد منقضی شده؛ دوباره شماره را ثبت کن.", "locked": "به‌دلیل ورود اشتباه، کد باطل شد. دوباره درخواست کد بده.", "not_found": "کد فعالی پیدا نشد؛ دوباره شماره را ثبت کن.", "invalid_format": "کد باید ۶ رقم باشد."}
+                await update.message.reply_text(errors.get(result["status"], "تأیید شماره انجام نشد."))
+                if result["status"] in ("expired", "locked", "not_found"):
+                    flow["step"] = "phone"
+                return
+            after_verify = flow.get("after_verify")
+            if after_verify == "wholesaler_request":
+                customer_id = int(result["loyalty_customer_id"])
+                with get_conn() as conn:
+                    with conn.transaction():
+                        request_status = request_wholesaler(conn, customer_id)
+                        profile = get_profile(conn, customer_id)
+                if request_status == "submitted":
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await context.bot.send_message(admin_id, f"🏬 درخواست عضویت بنکداری جدید\nشناسه مشتری: {customer_id}\nشماره: {mobile_e164_to_local(profile.get('phone_e164') or '')}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بررسی درخواست‌ها", callback_data="adm:wholesalers:requests")]]))
+                        except Exception:
+                            logger.exception("Could not notify admin about wholesaler request")
+                context.user_data.pop("profile_flow", None)
+                message = "✅ شماره تأیید شد و درخواست بنکداری برای مدیر ارسال شد." if request_status == "submitted" else ("عضویت بنکداری شما از قبل فعال است." if request_status == "already_active" else "درخواست شما قبلاً ثبت شده و در انتظار بررسی مدیر است.")
+                await update.message.reply_text(message)
+                await show_customer_profile(update, context)
+                return
+            context.user_data.pop("profile_flow", None)
+            await update.message.reply_text("✅ شماره موبایل تأیید شد. حساب تلگرام شما به پرونده مشترک مشتری متصل شد.")
+            await show_customer_profile(update, context)
+            return
+        field_map = {"name": "name", "address": "address", "birth": "birth_date"}
+        if step in field_map:
+            value = parse_jalali_date(text) if step == "birth" else text
+            with get_conn() as conn:
+                with conn.transaction():
+                    save_profile_field(conn, "telegram", update.effective_user.id, field_map[step], value, update.effective_user.full_name)
+            context.user_data.pop("profile_flow", None)
+            await update.message.reply_text("✅ اطلاعات پروفایل به‌روزرسانی شد و در هر دو ربات قابل مشاهده است.")
+            await show_customer_profile(update, context)
+            return
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+    except Exception:
+        logger.exception("Telegram customer profile flow failed")
+        await update.message.reply_text("عملیات انجام نشد. لطفاً دوباره تلاش کن.")
 
 def category_keyboard():
     return InlineKeyboardMarkup(
@@ -407,12 +580,15 @@ def checkout_quantity_text(rows):
 
 async def show_checkout_quantities(message, user_id):
     conn = get_conn()
+    is_wholesaler = customer_is_wholesaler(conn, "telegram", user_id)
     rows = conn.execute(
-        """SELECT cart_items.id AS cid, products.name, products.price, cart_items.qty
+        """SELECT cart_items.id AS cid, products.name,
+                  CASE WHEN %s AND COALESCE(products.wholesale_price,0)>0 THEN products.wholesale_price ELSE products.price END AS price,
+                  cart_items.qty
            FROM cart_items JOIN products ON cart_items.product_id = products.id
            WHERE cart_items.user_id=%s AND products.active=TRUE
            ORDER BY cart_items.id""",
-        (user_id,),
+        (is_wholesaler, user_id),
     ).fetchall()
     conn.close()
     if not rows:
@@ -472,12 +648,15 @@ async def checkout_quantity_callback(update: Update, context: ContextTypes.DEFAU
 
     if action == "back":
         conn = get_conn()
+        is_wholesaler = customer_is_wholesaler(conn, "telegram", user_id)
         rows = conn.execute(
-            """SELECT cart_items.id AS cid, products.name, products.price, cart_items.qty
+            """SELECT cart_items.id AS cid, products.name,
+                      CASE WHEN %s AND COALESCE(products.wholesale_price,0)>0 THEN products.wholesale_price ELSE products.price END AS price,
+                      cart_items.qty
                FROM cart_items JOIN products ON cart_items.product_id = products.id
                WHERE cart_items.user_id=%s AND products.active=TRUE
                ORDER BY cart_items.id""",
-            (user_id,),
+            (is_wholesaler, user_id),
         ).fetchall()
         conn.close()
         if not rows:
@@ -493,12 +672,15 @@ async def checkout_quantity_callback(update: Update, context: ContextTypes.DEFAU
         conn = get_conn()
         conn.execute("DELETE FROM cart_items WHERE id=%s AND user_id=%s", (cart_id, user_id))
         conn.commit()
+        is_wholesaler = customer_is_wholesaler(conn, "telegram", user_id)
         rows = conn.execute(
-            """SELECT cart_items.id AS cid, products.name, products.price, cart_items.qty
+            """SELECT cart_items.id AS cid, products.name,
+                      CASE WHEN %s AND COALESCE(products.wholesale_price,0)>0 THEN products.wholesale_price ELSE products.price END AS price,
+                      cart_items.qty
                FROM cart_items JOIN products ON cart_items.product_id = products.id
                WHERE cart_items.user_id=%s AND products.active=TRUE
                ORDER BY cart_items.id""",
-            (user_id,),
+            (is_wholesaler, user_id),
         ).fetchall()
         conn.close()
         if not rows:
@@ -528,12 +710,15 @@ async def checkout_quantity_callback(update: Update, context: ContextTypes.DEFAU
             return ASK_QTY
         conn.execute("UPDATE cart_items SET qty=%s WHERE id=%s AND user_id=%s", (new_qty, cart_id, user_id))
         conn.commit()
+        is_wholesaler = customer_is_wholesaler(conn, "telegram", user_id)
         rows = conn.execute(
-            """SELECT cart_items.id AS cid, products.name, products.price, cart_items.qty
+            """SELECT cart_items.id AS cid, products.name,
+                      CASE WHEN %s AND COALESCE(products.wholesale_price,0)>0 THEN products.wholesale_price ELSE products.price END AS price,
+                      cart_items.qty
                FROM cart_items JOIN products ON cart_items.product_id = products.id
                WHERE cart_items.user_id=%s AND products.active=TRUE
                ORDER BY cart_items.id""",
-            (user_id,),
+            (is_wholesaler, user_id),
         ).fetchall()
         conn.close()
         await q.message.edit_text(
@@ -547,6 +732,15 @@ async def checkout_quantity_callback(update: Update, context: ContextTypes.DEFAU
 # ----------------------------------------------------------------------------
 # دستورات پایه
 # ----------------------------------------------------------------------------
+async def cancel_nonconversation_flows(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.pop("profile_flow", None):
+        await update.message.reply_text("عملیات پروفایل لغو شد.", reply_markup=main_menu_keyboard())
+        return
+    if context.user_data.pop("admin_flow", None) and is_admin(update.effective_user.id):
+        await update.message.reply_text("عملیات مدیریتی لغو شد.", reply_markup=admin_panel_keyboard())
+        return
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     conn = get_conn()
@@ -561,12 +755,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (u.id, u.username or "", u.full_name or "", now, now),
     )
     conn.commit()
+    with conn.transaction():
+        customer_id = ensure_platform_account(conn, "telegram", u.id, u.full_name or None)
+        profile = get_profile(conn, customer_id)
     conn.close()
 
-    await update.message.reply_text(
+    welcome = (
         "🌸 به «تولیدی تنین ایران» خوش آمدید.\n\n"
         "🧵 از نخ تا ویترین، کنار شماییم.\n\n"
-        "💗 از اینکه ما را برای خرید خود انتخاب و به ما اعتماد کرده‌اید، سپاسگزاریم.🫰🏻",
+        "💗 از اینکه ما را برای خرید خود انتخاب و به ما اعتماد کرده‌اید، سپاسگزاریم.🫰🏻"
+    )
+    if not profile.get("phone_verified_at"):
+        welcome += "\n\n📱 برای اینکه اطلاعات و سوابق خرید شما در تلگرام و بله یکپارچه شود، از بخش «👤 پروفایل من» شماره موبایل خود را با پیامک تأیید کنید."
+    await update.message.reply_text(
+        welcome,
         reply_markup=main_menu_keyboard(update.effective_user.id),
     )
 
@@ -581,8 +783,12 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     category = query.data.split(":", 1)[1]
 
     conn = get_conn()
+    is_wholesaler = customer_is_wholesaler(conn, "telegram", query.from_user.id)
     rows = conn.execute(
-        "SELECT * FROM products WHERE category=%s AND active=TRUE", (category,)
+        """SELECT p.*,
+                  CASE WHEN %s AND COALESCE(p.wholesale_price,0)>0 THEN p.wholesale_price ELSE p.price END AS display_price
+           FROM products p WHERE p.category=%s AND p.active=TRUE ORDER BY p.id DESC""",
+        (is_wholesaler, category),
     ).fetchall()
     conn.close()
 
@@ -596,7 +802,7 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"سایز: {escape(p['size'] or '-') }\n"
             f"رنگ‌بندی: {escape(p.get('color') or '-')}\n"
             + (f"{escape(p['pack_info'])}\n" if p['pack_info'] else "")
-            + f"قیمت: {p['price']:,} تومان"
+            + f"قیمت: {int(p['display_price'] or 0):,} تومان"
         )
         sent = False
         if p["photo_url"]:
@@ -729,11 +935,14 @@ async def add_quantity_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conn = get_conn()
+    is_wholesaler = customer_is_wholesaler(conn, "telegram", user_id)
     rows = conn.execute(
-        """SELECT cart_items.id as cid, products.*, cart_items.qty
+        """SELECT cart_items.id AS cid, products.name,
+                  CASE WHEN %s AND COALESCE(products.wholesale_price,0)>0 THEN products.wholesale_price ELSE products.price END AS price,
+                  cart_items.qty
            FROM cart_items JOIN products ON cart_items.product_id = products.id
            WHERE cart_items.user_id=%s""",
-        (user_id,),
+        (is_wholesaler, user_id),
     ).fetchall()
     conn.close()
 
@@ -847,7 +1056,8 @@ async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def get_saved_data(user_id, data_type):
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, value FROM customer_saved_data WHERE user_id=%s AND data_type=%s ORDER BY id DESC",
+        """SELECT id,value FROM customer_saved_data WHERE user_id=%s AND data_type=%s
+           ORDER BY COALESCE(NULLIF(updated_at,''),created_at) DESC NULLS LAST,id DESC LIMIT 1""",
         (user_id, data_type),
     ).fetchall()
     conn.close()
@@ -860,12 +1070,7 @@ def saved_value_exists(user_id, data_type, value, exclude_id=None):
     if not value:
         return False
 
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, value FROM customer_saved_data WHERE user_id=%s AND data_type=%s",
-        (user_id, data_type),
-    ).fetchall()
-    conn.close()
+    rows = get_saved_data(user_id, data_type)
 
     def canonical(v):
         v = str(v or "").strip()
@@ -887,26 +1092,46 @@ def save_saved_data(user_id, data_type, value):
         return
     now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
     conn = get_conn()
-    conn.execute(
-        """INSERT INTO customer_saved_data(user_id, data_type, value, created_at, updated_at)
-           VALUES (%s, %s, %s, %s, %s)
-           ON CONFLICT(user_id, data_type, value) DO UPDATE SET updated_at=excluded.updated_at""",
-        (user_id, data_type, value, now, now),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        with conn.transaction():
+            if data_type in ("name", "address"):
+                save_profile_field(conn, "telegram", user_id, data_type, value)
+                return
+            current = conn.execute(
+                """SELECT id FROM customer_saved_data WHERE user_id=%s AND data_type=%s
+                   ORDER BY COALESCE(NULLIF(updated_at,''),created_at) DESC NULLS LAST,id DESC LIMIT 1""",
+                (user_id, data_type),
+            ).fetchone()
+            same = conn.execute(
+                "SELECT id FROM customer_saved_data WHERE user_id=%s AND data_type=%s AND value=%s ORDER BY id DESC LIMIT 1",
+                (user_id, data_type, value),
+            ).fetchone()
+            if same:
+                conn.execute("UPDATE customer_saved_data SET updated_at=%s WHERE id=%s", (now, same["id"]))
+            elif current:
+                conn.execute("UPDATE customer_saved_data SET value=%s,updated_at=%s WHERE id=%s", (value, now, current["id"]))
+            else:
+                conn.execute("INSERT INTO customer_saved_data(user_id,data_type,value,created_at,updated_at) VALUES(%s,%s,%s,%s,%s)",
+                             (user_id, data_type, value, now, now))
+    finally:
+        conn.close()
 
 
 def update_saved_data(user_id, data_id, data_type, value):
     value = (value or "").strip()
     now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
     conn = get_conn()
-    conn.execute(
-        "UPDATE customer_saved_data SET value=%s, updated_at=%s WHERE id=%s AND user_id=%s AND data_type=%s",
-        (value, now, data_id, user_id, data_type),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        with conn.transaction():
+            if data_type in ("name", "address"):
+                save_profile_field(conn, "telegram", user_id, data_type, value)
+            else:
+                conn.execute(
+                    "UPDATE customer_saved_data SET value=%s, updated_at=%s WHERE id=%s AND user_id=%s AND data_type=%s",
+                    (value, now, data_id, user_id, data_type),
+                )
+    finally:
+        conn.close()
 
 
 def delete_saved_data(user_id, data_id, data_type):
@@ -920,20 +1145,18 @@ def delete_saved_data(user_id, data_id, data_type):
 
 
 def saved_data_keyboard(data_type, rows):
-    labels = {"name": "نام", "phone": "شماره تماس", "address": "آدرس"}
+    labels = {"name": "نام و نام خانوادگی", "phone": "شماره تماس", "address": "آدرس"}
     buttons = []
-    for row in rows:
+    if rows:
+        row = rows[0]
         value = str(row["value"])
-        display = value if data_type != "address" else value.replace("\n", " ")
+        display = value.replace("\n", " ") if data_type == "address" else value
         buttons.append([
-            InlineKeyboardButton(
-                f"✅ {display[:38]}",
-                callback_data=f"saved:{data_type}:use:{row['id']}"
-            ),
-            InlineKeyboardButton("✏️", callback_data=f"saved:{data_type}:edit:{row['id']}"),
-            InlineKeyboardButton("🗑", callback_data=f"saved:{data_type}:delete:{row['id']}"),
+            InlineKeyboardButton(f"✅ {display[:38]}", callback_data=f"saved:{data_type}:use:{row['id']}"),
+            InlineKeyboardButton("✏️ ویرایش", callback_data=f"saved:{data_type}:edit:{row['id']}"),
         ])
-    buttons.append([InlineKeyboardButton(f"➕ {labels[data_type]} جدید", callback_data=f"saved:{data_type}:new")])
+    else:
+        buttons.append([InlineKeyboardButton(f"➕ ثبت {labels[data_type]}", callback_data=f"saved:{data_type}:new")])
     buttons.append([InlineKeyboardButton("🔙 مرحله قبلی", callback_data=f"saved:{data_type}:back")])
     return InlineKeyboardMarkup(buttons)
 
@@ -943,8 +1166,7 @@ async def show_saved_step(message, context, data_type):
     labels = {"name": "نام و نام خانوادگی", "phone": "شماره موبایل", "address": "آدرس"}
     if rows:
         await message.reply_text(
-            f"📌 {labels[data_type]} قبلی را انتخاب کن یا مورد جدید اضافه کن.\n\n"
-            "برای ویرایش ✏️ و برای حذف 🗑 را بزن:",
+            f"📌 {labels[data_type]} اصلی ثبت‌شده را انتخاب کن یا همان مورد را ویرایش کن.",
             reply_markup=saved_data_keyboard(data_type, rows),
         )
         return True
@@ -1273,6 +1495,13 @@ async def handle_saved_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.message.reply_text("📱 شماره موبایل جدیدت را با دکمه زیر ارسال کن:", reply_markup=phone_keyboard())
         return ASK_PHONE
     elif action == "edit":
+        with get_conn() as conn:
+            with conn.transaction():
+                customer_id = ensure_platform_account(conn, "telegram", user_id, q.from_user.full_name)
+                profile = get_profile(conn, customer_id)
+        if profile.get("phone_verified_at"):
+            await q.message.reply_text("برای تغییر شماره اصلی، از «👤 پروفایل من» گزینه «تأیید / تغییر شماره موبایل» را بزن؛ شماره جدید با پیامک تأیید می‌شود.")
+            return ASK_PHONE
         context.user_data["editing_saved_phone_id"] = parts[3]
         await q.message.reply_text("📱 شماره جدیدت را با دکمه زیر ارسال کن:", reply_markup=phone_keyboard())
         return ASK_PHONE
@@ -1418,11 +1647,15 @@ async def create_pending_payment(message, context, user=None):
         "UPDATE customers SET phone=%s, gender=%s, full_name=%s, username=%s, last_seen=%s WHERE user_id=%s",
         (phone, gender, full_name, username, now, user_id),
     )
+    with conn.transaction():
+        loyalty_customer_id = ensure_platform_account(conn, "telegram", user_id, full_name)
+    is_wholesaler = customer_is_wholesaler(conn, "telegram", user_id)
     rows = conn.execute(
-        """SELECT products.id AS product_id, products.name, products.price,
+        """SELECT products.id AS product_id, products.name,
+                  CASE WHEN %s AND COALESCE(products.wholesale_price,0)>0 THEN products.wholesale_price ELSE products.price END AS price,
                   cart_items.qty, products.pack_info
            FROM cart_items JOIN products ON cart_items.product_id = products.id
-           WHERE cart_items.user_id=%s AND products.active=TRUE""", (user_id,)
+           WHERE cart_items.user_id=%s AND products.active=TRUE""", (is_wholesaler, user_id)
     ).fetchall()
     if not rows:
         conn.close()
@@ -1436,7 +1669,7 @@ async def create_pending_payment(message, context, user=None):
     )
     # فقط یک پرداخت باز برای هر مشتری؛ اگر قبلی هنوز منتظر رسید/بررسی است همان را نشان می‌دهیم.
     pending = conn.execute(
-        """SELECT * FROM pending_payments WHERE user_id=%s
+        """SELECT * FROM pending_payments WHERE user_id=%s AND platform='telegram'
            AND payment_status IN ('در انتظار رسید','در انتظار بررسی')
            ORDER BY id DESC LIMIT 1""", (user_id,)
     ).fetchone()
@@ -1446,9 +1679,10 @@ async def create_pending_payment(message, context, user=None):
             # هنوز رسیدی ارسال نشده؛ اطلاعات و مبلغ را با سبد فعلی هماهنگ می‌کنیم.
             conn.execute(
                 """UPDATE pending_payments
-                   SET full_name=%s, phone=%s, address=%s, items_summary=%s, total_price=%s
+                   SET full_name=%s, phone=%s, address=%s, items_summary=%s, total_price=%s,
+                       platform='telegram', loyalty_customer_id=%s
                    WHERE id=%s AND payment_status='در انتظار رسید'""",
-                (full_name, phone, address, summary, total, pending["id"]),
+                (full_name, phone, address, summary, total, loyalty_customer_id, pending["id"]),
             )
             pending_data.update(
                 full_name=full_name, phone=phone, address=address,
@@ -1469,10 +1703,10 @@ async def create_pending_payment(message, context, user=None):
 
     cur = conn.execute(
         """INSERT INTO pending_payments
-           (user_id, full_name, phone, address, items_summary, total_price, created_at)
-           VALUES (%s, %s, %s, %s, %s, %s, %s)
+           (user_id, full_name, phone, address, items_summary, total_price, created_at, platform, loyalty_customer_id)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, 'telegram', %s)
            RETURNING id""",
-        (user_id, full_name, phone, address, summary, total, now),
+        (user_id, full_name, phone, address, summary, total, now, loyalty_customer_id),
     )
     pending_id = cur.fetchone()["id"]
     # Queue both approved request-notice patterns immediately after request creation.
@@ -1550,7 +1784,8 @@ def customer_order_detail_text(o):
         f"💳 وضعیت پرداخت: <b>{escape(str(o['payment_status'] or '-'))}</b>\n\n"
         f"👤 نام: {escape(str(o['full_name'] or '-'))}\n"
         f"📞 شماره تماس: {escape(str(o['phone'] or '-'))}\n"
-        f"📍 آدرس: {escape(str(o['address'] or '-'))}\n\n"
+        f"📍 آدرس: {escape(str(o['address'] or '-'))}\n"
+        f"📅 تاریخ تحویل: {escape(format_iran_jalali_fa(o.get('delivery_date'), include_time=False) if o.get('delivery_date') else 'هنوز تعیین نشده')}\n\n"
         f"🛍 <b>محصولات:</b>\n{escape(str(o['items_summary'] or '-'))}\n\n"
         f"💰 مبلغ: <b>{int(o['total_price'] or 0):,} تومان</b>"
     )
@@ -1559,8 +1794,11 @@ def customer_order_detail_text(o):
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conn = get_conn()
+    with conn.transaction():
+        loyalty_customer_id = ensure_platform_account(conn, "telegram", user_id, update.effective_user.full_name)
     rows = conn.execute(
-        "SELECT id, created_at FROM orders WHERE user_id=%s ORDER BY id DESC", (user_id,)
+        "SELECT id, created_at FROM orders WHERE loyalty_customer_id=%s OR (platform='telegram' AND user_id=%s) ORDER BY id DESC LIMIT 50",
+        (loyalty_customer_id, user_id),
     ).fetchall()
     conn.close()
 
@@ -1590,8 +1828,11 @@ async def customer_order_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if action == "list":
         conn = get_conn()
+        with conn.transaction():
+            loyalty_customer_id = ensure_platform_account(conn, "telegram", q.from_user.id, q.from_user.full_name)
         rows = conn.execute(
-            "SELECT id, created_at FROM orders WHERE user_id=%s ORDER BY id DESC", (q.from_user.id,)
+            "SELECT id, created_at FROM orders WHERE loyalty_customer_id=%s OR (platform='telegram' AND user_id=%s) ORDER BY id DESC LIMIT 50",
+            (loyalty_customer_id, q.from_user.id),
         ).fetchall()
         conn.close()
         if not rows:
@@ -1617,8 +1858,11 @@ async def customer_order_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     conn = get_conn()
+    with conn.transaction():
+        loyalty_customer_id = ensure_platform_account(conn, "telegram", q.from_user.id, q.from_user.full_name)
     order = conn.execute(
-        "SELECT * FROM orders WHERE id=%s AND user_id=%s", (order_id, q.from_user.id)
+        "SELECT * FROM orders WHERE id=%s AND (loyalty_customer_id=%s OR (platform='telegram' AND user_id=%s))",
+        (order_id, loyalty_customer_id, q.from_user.id),
     ).fetchone()
     conn.close()
 
@@ -1693,7 +1937,9 @@ def support_ticket_list_keyboard(rows, prefix="support:view"):
 
 async def support_orders_view(q):
     conn=get_conn()
-    rows=conn.execute("SELECT id, created_at, status FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 20", (q.from_user.id,)).fetchall()
+    with conn.transaction():
+        loyalty_customer_id=ensure_platform_account(conn,"telegram",q.from_user.id,q.from_user.full_name)
+    rows=conn.execute("SELECT id, created_at, status FROM orders WHERE loyalty_customer_id=%s OR (platform='telegram' AND user_id=%s) ORDER BY id DESC LIMIT 20", (loyalty_customer_id,q.from_user.id)).fetchall()
     conn.close()
     if not rows:
         await q.edit_message_text("📦 هنوز سفارشی برای این حساب ثبت نشده.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 مرکز پشتیبانی", callback_data="support:home")]]))
@@ -1807,7 +2053,7 @@ async def admin_dashboard_stats():
     conn = get_conn()
     try:
         pending = conn.execute(
-            "SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی'"
+            "SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی' AND platform='telegram'"
         ).fetchone()["n"]
         orders = conn.execute(
             "SELECT COUNT(*) AS n FROM orders WHERE status='در انتظار بررسی'"
@@ -1847,6 +2093,7 @@ def admin_panel_keyboard():
             InlineKeyboardButton("📊 فروش و آمار", callback_data="adm:sales"),
             InlineKeyboardButton("🎫 پشتیبانی", callback_data="adm:tickets"),
         ],
+        [InlineKeyboardButton("🏬 مدیریت بنکداران", callback_data="adm:wholesalers")],
         [
             InlineKeyboardButton("📢 مدیریت کانال", callback_data="adm:channel"),
             InlineKeyboardButton("💳 تنظیمات پرداخت", callback_data="adm:payment"),
@@ -1884,6 +2131,7 @@ def order_status_keyboard(order_id, status, display_order_number=None):
     rows = []
     if not display_order_number:
         rows.append([InlineKeyboardButton("🏷 تخصیص شماره سفارش TN", callback_data=f"order:assign:{order_id}")])
+    rows.append([InlineKeyboardButton("📅 تعیین / تغییر تاریخ تحویل", callback_data=f"order:delivery:{order_id}")])
     if status == "در انتظار بررسی":
         rows.append([InlineKeyboardButton("✅ تأیید سفارش", callback_data=f"order:status:{order_id}:confirmed")])
         rows.append([InlineKeyboardButton("❌ رد سفارش", callback_data=f"order:status:{order_id}:cancelled")])
@@ -1899,6 +2147,7 @@ def order_text(o):
         f"👤 مشتری: {escape(str(o['full_name'] or '-'))}\n"
         f"📞 تلفن: {escape(str(o['phone'] or '-'))}\n"
         f"📍 آدرس: {escape(str(o['address'] or '-'))}\n"
+        f"📅 تاریخ تحویل: {escape(format_iran_jalali_fa(o.get('delivery_date'), include_time=False) if o.get('delivery_date') else 'هنوز تعیین نشده')}\n"
         f"🕐 زمان: {escape(format_iran_jalali_fa(o.get('created_at'), include_time=True))}\n\n"
         f"🛍 <b>محصولات:</b>\n{escape(str(o['items_summary'] or '-'))}\n\n"
         f"💰 مبلغ: <b>{o['total_price']:,} تومان</b>\n"
@@ -1917,7 +2166,8 @@ def product_text(p):
         f"سایز: {escape(p['size'] or '-')}\n"
         f"رنگ‌بندی: {escape(p.get('color') or '-')}\n"
         f"{pack}"
-        f"قیمت: {p['price']:,} تومان\n"
+        f"قیمت عادی: {p['price']:,} تومان\n"
+        f"قیمت بنکداری: {int(p.get('wholesale_price') or 0):,} تومان\n"
         f"وضعیت: {state}"
     )
 
@@ -1947,7 +2197,8 @@ def admin_product_keyboard(product_id, active, show_quick_edit=False, show_price
                 [InlineKeyboardButton("➖۲۰۰", callback_data=f"adm:price_adjust:{product_id}:-200000"), InlineKeyboardButton("➕۲۰۰", callback_data=f"adm:price_adjust:{product_id}:200000"), InlineKeyboardButton("➖۳۰۰", callback_data=f"adm:price_adjust:{product_id}:-300000"), InlineKeyboardButton("➕۳۰۰", callback_data=f"adm:price_adjust:{product_id}:300000")],
                 [InlineKeyboardButton("➖۴۰۰", callback_data=f"adm:price_adjust:{product_id}:-400000"), InlineKeyboardButton("➕۴۰۰", callback_data=f"adm:price_adjust:{product_id}:400000"), InlineKeyboardButton("➖۵۰۰", callback_data=f"adm:price_adjust:{product_id}:-500000"), InlineKeyboardButton("➕۵۰۰", callback_data=f"adm:price_adjust:{product_id}:500000")],
             ])
-        rows.append([InlineKeyboardButton("💵 ثبت قیمت دلخواه", callback_data=f"adm:price_set:{product_id}")])
+        rows.append([InlineKeyboardButton("💵 ثبت قیمت عادی", callback_data=f"adm:price_set:{product_id}")])
+    rows.append([InlineKeyboardButton("🏬 تعیین قیمت بنکداری", callback_data=f"adm:wholesale_price_set:{product_id}")])
     rows.extend([
         [InlineKeyboardButton(f"⛔ {toggle}", callback_data=f"adm:toggle_product:{product_id}:{toggle_action}")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"adm:delete_product:{product_id}")],
@@ -2030,13 +2281,15 @@ async def admin_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_products_view(q)
     elif text == "🎫 پشتیبانی":
         await admin_tickets_view(q, "all")
+    elif text == "🏬 مدیریت بنکداران":
+        await show_wholesaler_admin_message(update.effective_message, context)
 
 
 async def admin_pending_payments_view(q):
     conn = get_conn()
     rows = conn.execute(
         """SELECT * FROM pending_payments
-           WHERE payment_status='در انتظار بررسی'
+           WHERE payment_status='در انتظار بررسی' AND platform='telegram'
            ORDER BY id DESC LIMIT 50"""
     ).fetchall()
     conn.close()
@@ -2077,7 +2330,7 @@ async def admin_pending_payments_view(q):
 async def admin_pending_payment_detail(q, pending_id):
     conn = get_conn()
     pending = conn.execute(
-        "SELECT * FROM pending_payments WHERE id=%s", (pending_id,)
+        "SELECT * FROM pending_payments WHERE id=%s AND platform='telegram'", (pending_id,)
     ).fetchone()
     conn.close()
 
@@ -2114,7 +2367,7 @@ async def admin_pending_payment_detail(q, pending_id):
 async def admin_pending_payment_receipt(q, context, pending_id):
     conn = get_conn()
     pending = conn.execute(
-        "SELECT * FROM pending_payments WHERE id=%s", (pending_id,)
+        "SELECT * FROM pending_payments WHERE id=%s AND platform='telegram'", (pending_id,)
     ).fetchone()
     conn.close()
 
@@ -2280,8 +2533,12 @@ async def admin_customers_view(q):
 async def admin_customer_detail(q, user_id):
     conn = get_conn()
     c = conn.execute("SELECT * FROM customers WHERE user_id=%s", (user_id,)).fetchone()
+    account = conn.execute("SELECT loyalty_customer_id FROM customer_platform_accounts WHERE platform='telegram' AND platform_user_id=%s", (str(user_id),)).fetchone()
+    loyalty_customer_id = int(account["loyalty_customer_id"]) if account else None
+    customer_profile = get_profile(conn, loyalty_customer_id) if loyalty_customer_id else {}
     orders = conn.execute(
-        "SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 10", (user_id,)
+        "SELECT * FROM orders WHERE (loyalty_customer_id=%s) OR (platform='telegram' AND user_id=%s) ORDER BY id DESC LIMIT 10",
+        (loyalty_customer_id, user_id),
     ).fetchall()
     conn.close()
     if not c:
@@ -2294,9 +2551,9 @@ async def admin_customer_detail(q, user_id):
     saved_names = get_saved_data(user_id, "name")
     saved_phones = get_saved_data(user_id, "phone")
     saved_addresses = get_saved_data(user_id, "address")
-    current_name = saved_names[0]["value"] if saved_names else (c["full_name"] or "-")
-    current_phone = saved_phones[0]["value"] if saved_phones else (c["phone"] or "-")
-    current_address = saved_addresses[0]["value"] if saved_addresses else "-"
+    current_name = customer_profile.get("display_name") or (saved_names[0]["value"] if saved_names else (c["full_name"] or "-"))
+    current_phone = mobile_e164_to_local(customer_profile["phone_e164"]) if customer_profile.get("phone_verified_at") and customer_profile.get("phone_e164") else (saved_phones[0]["value"] if saved_phones else (c["phone"] or "-"))
+    current_address = customer_profile.get("address") or (saved_addresses[0]["value"] if saved_addresses else "-")
 
     total = sum((o["total_price"] or 0) for o in orders if o["status"] != "رد شد")
     text = (
@@ -2306,6 +2563,7 @@ async def admin_customer_detail(q, user_id):
         f"تلگرام: @{escape(c['username'] or '-')}\n"
         f"تلفن: {escape(current_phone)}\n"
         f"آدرس: {escape(current_address)}\n"
+        f"تاریخ تولد: {escape(gregorian_to_jalali(customer_profile['birth_date']) if customer_profile.get('birth_date') else 'ثبت نشده')}\n"
         f"جنسیت: {escape(c['gender'] or '-')}\n"
         f"اولین ورود: {escape(format_iran_jalali_fa(c.get('first_seen'), include_time=True))}\n"
         f"آخرین فعالیت: {escape(format_iran_jalali_fa(c.get('last_seen'), include_time=True))}\n\n"
@@ -2548,12 +2806,12 @@ async def receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conn = get_conn()
     pending = conn.execute(
-        """SELECT * FROM pending_payments WHERE user_id=%s AND payment_status='در انتظار رسید'
+        """SELECT * FROM pending_payments WHERE user_id=%s AND platform='telegram' AND payment_status='در انتظار رسید'
            ORDER BY id DESC LIMIT 1""", (user_id,)
     ).fetchone()
     if not pending:
         under_review = conn.execute(
-            """SELECT id FROM pending_payments WHERE user_id=%s AND payment_status='در انتظار بررسی'
+            """SELECT id FROM pending_payments WHERE user_id=%s AND platform='telegram' AND payment_status='در انتظار بررسی'
                LIMIT 1""", (user_id,)
         ).fetchone()
         conn.close()
@@ -2606,12 +2864,15 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
     parts = q.data.split(":")
     pid = int(parts[2]); action = parts[1]
     conn = get_conn()
-    pending = conn.execute("SELECT * FROM pending_payments WHERE id=%s", (pid,)).fetchone()
+    pending = conn.execute("SELECT * FROM pending_payments WHERE id=%s AND platform='telegram'", (pid,)).fetchone()
     if not pending:
         conn.close(); await q.answer("پرداخت پیدا نشد.", show_alert=True); return
     if pending['payment_status'] not in ('در انتظار بررسی',):
         conn.close(); await q.answer("این پرداخت قبلاً بررسی شده است.", show_alert=True); return
     now = iran_now_naive().strftime("%Y-%m-%d %H:%M")
+    with conn.transaction():
+        loyalty_customer_id = ensure_platform_account(conn, "telegram", pending["user_id"], pending.get("full_name"))
+        conn.execute("UPDATE pending_payments SET platform='telegram',loyalty_customer_id=%s WHERE id=%s", (loyalty_customer_id, pid))
     if action == 'reject':
         conn.execute("UPDATE pending_payments SET payment_status='رد شد', reviewed_at=%s, admin_id=%s WHERE id=%s", (now, q.from_user.id, pid))
         conn.commit(); conn.close()
@@ -2622,10 +2883,10 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
     # approve: only here is the real order inserted and cart cleared
     cur = conn.execute("""INSERT INTO orders
-        (user_id, full_name, phone, address, items_summary, total_price, status, created_at, finalized_at, payment_status, transaction_ref)
-        VALUES (%s, %s, %s, %s, %s, %s, 'در انتظار بررسی', %s, %s, 'تأیید شده', %s)
+        (user_id, full_name, phone, address, items_summary, total_price, status, created_at, finalized_at, payment_status, transaction_ref, platform, loyalty_customer_id)
+        VALUES (%s, %s, %s, %s, %s, %s, 'در انتظار بررسی', %s, %s, 'تأیید شده', %s, 'telegram', %s)
         RETURNING id""",
-        (pending['user_id'], pending['full_name'], pending['phone'], pending['address'], pending['items_summary'], pending['total_price'], now, now, f"CARD-TRANSFER-{pid}"))
+        (pending['user_id'], pending['full_name'], pending['phone'], pending['address'], pending['items_summary'], pending['total_price'], now, now, f"CARD-TRANSFER-{pid}", loyalty_customer_id))
     order_id = cur.fetchone()["id"]
     conn.execute("DELETE FROM cart_items WHERE user_id=%s", (pending['user_id'],))
     conn.execute("UPDATE pending_payments SET payment_status='تأیید شده', reviewed_at=%s, admin_id=%s, order_id=%s WHERE id=%s", (now, q.from_user.id, order_id, pid))
@@ -2640,6 +2901,52 @@ async def payment_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
             await context.bot.send_message(admin_id, f"🔔 <b>سفارش جدید #{order_id}</b>\n👤 {escape(pending['full_name'] or '-')}\n📞 {escape(pending['phone'] or '-')}\n📍 {escape(pending['address'] or '-')}\n\n🛍 {escape(pending['items_summary'] or '-')}\n\n💰 <b>{pending['total_price']:,} تومان</b>", parse_mode="HTML", reply_markup=order_status_keyboard(order_id, 'در انتظار بررسی'))
         except Exception as e: logger.warning(f"Could not notify admin after payment {admin_id}: {e}")
 
+async def _wholesaler_admin_content(view="home"):
+    with get_conn() as conn:
+        if view == "requests":
+            rows = conn.execute("""SELECT wr.id,wr.phone_e164,wr.created_at,lc.display_name
+                FROM wholesaler_requests wr JOIN loyalty_customers lc ON lc.id=wr.loyalty_customer_id
+                WHERE wr.status='pending' ORDER BY wr.id DESC LIMIT 50""").fetchall()
+            buttons=[]
+            for r in rows:
+                buttons.append([InlineKeyboardButton(
+                    f"درخواست #{r['id']} · {str(r.get('display_name') or '-')[:16]} · {mobile_e164_to_local(r['phone_e164'])}",
+                    callback_data=f"adm:wholesaler_request:{r['id']}")])
+            buttons.append([InlineKeyboardButton("🔙 مدیریت بنکداران", callback_data="adm:wholesalers")])
+            return "📨 <b>درخواست‌های عضویت بنکداری</b>\\n" + (f"تعداد: {len(rows)}" if rows else "درخواست در انتظار بررسی وجود ندارد."), InlineKeyboardMarkup(buttons)
+        if view == "members":
+            rows = conn.execute("""SELECT wm.id,wm.phone_e164,wm.loyalty_customer_id,lc.display_name
+                FROM wholesaler_members wm LEFT JOIN loyalty_customers lc ON lc.id=wm.loyalty_customer_id
+                WHERE wm.active=TRUE ORDER BY wm.id DESC LIMIT 100""").fetchall()
+            buttons=[]
+            for r in rows:
+                label=f"{mobile_e164_to_local(r['phone_e164'])} · {str(r.get('display_name') or 'بدون پروفایل')[:18]}"
+                buttons.append([InlineKeyboardButton(label[:60], callback_data=f"adm:wholesaler_member:{r['id']}")])
+            buttons += [[InlineKeyboardButton("➕ افزودن مستقیم با شماره", callback_data="adm:wholesaler_add")],
+                        [InlineKeyboardButton("🔙 مدیریت بنکداران", callback_data="adm:wholesalers")]]
+            return f"👥 <b>بنکداران فعال</b>\\nتعداد: {len(rows)}", InlineKeyboardMarkup(buttons)
+        req_count=conn.execute("SELECT COUNT(*) AS n FROM wholesaler_requests WHERE status='pending'").fetchone()["n"]
+        member_count=conn.execute("SELECT COUNT(*) AS n FROM wholesaler_members WHERE active=TRUE").fetchone()["n"]
+    text=f"🏬 <b>مدیریت بنکداران تنین ایران</b>\\n\\nبنکداران فعال: {member_count}\\nدرخواست‌های در انتظار: {req_count}"
+    markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("📨 درخواست‌های عضویت", callback_data="adm:wholesalers:requests")],
+        [InlineKeyboardButton("👥 فهرست بنکداران", callback_data="adm:wholesalers:members")],
+        [InlineKeyboardButton("➕ افزودن مستقیم با شماره", callback_data="adm:wholesaler_add")],
+        [InlineKeyboardButton("🔙 پنل اصلی", callback_data="adm:home")],
+    ])
+    return text, markup
+
+
+async def show_wholesaler_admin_message(message, context=None, view="home"):
+    text, markup = await _wholesaler_admin_content(view)
+    await message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def show_wholesaler_admin_callback(q, view="home"):
+    text, markup = await _wholesaler_admin_content(view)
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+
+
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not is_admin(q.from_user.id):
@@ -2648,6 +2955,68 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     parts = q.data.split(":")
     action = parts[1]
+
+    if action == "wholesalers":
+        view = parts[2] if len(parts) > 2 else "home"
+        await show_wholesaler_admin_callback(q, view)
+        return
+    if action == "wholesaler_request" and len(parts) == 3:
+        request_id = int(parts[2])
+        with get_conn() as conn:
+            row = conn.execute("""SELECT wr.*,lc.display_name FROM wholesaler_requests wr
+                JOIN loyalty_customers lc ON lc.id=wr.loyalty_customer_id WHERE wr.id=%s""", (request_id,)).fetchone()
+        if not row:
+            await q.edit_message_text("درخواست پیدا نشد.", reply_markup=admin_panel_keyboard()); return
+        text = (f"🏬 <b>درخواست بنکداری #{request_id}</b>\nنام: {escape(str(row.get('display_name') or '-'))}\n"
+                f"شماره تأییدشده: {escape(mobile_e164_to_local(row['phone_e164']))}\nتاریخ درخواست: {escape(str(row['created_at']))}")
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ تأیید عضویت", callback_data=f"adm:wholesaler_approve:{request_id}"), InlineKeyboardButton("❌ رد", callback_data=f"adm:wholesaler_reject:{request_id}")],
+            [InlineKeyboardButton("🔙 درخواست‌ها", callback_data="adm:wholesalers:requests")],
+        ]))
+        return
+    if action == "wholesaler_approve" and len(parts) == 3:
+        with get_conn() as conn:
+            with conn.transaction(): ok = approve_wholesaler_request(conn, int(parts[2]), q.from_user.id)
+        await show_wholesaler_admin_callback(q, "requests")
+        return
+    if action == "wholesaler_reject" and len(parts) == 3:
+        with get_conn() as conn:
+            with conn.transaction(): ok = reject_wholesaler_request(conn, int(parts[2]), q.from_user.id)
+        await show_wholesaler_admin_callback(q, "requests")
+        return
+    if action == "wholesaler_add":
+        context.user_data["admin_flow"] = {"type":"wholesaler_add","step":"phone"}
+        await q.message.reply_text("شماره موبایل بنکدار را وارد کن (مثال 09123456789). برای لغو /cancel را بفرست.")
+        return
+    if action == "wholesaler_member" and len(parts) == 3:
+        member_id=int(parts[2])
+        with get_conn() as conn:
+            row=conn.execute("""SELECT wm.*,lc.display_name,lc.address FROM wholesaler_members wm
+                LEFT JOIN loyalty_customers lc ON lc.id=wm.loyalty_customer_id WHERE wm.id=%s""",(member_id,)).fetchone()
+        if not row:
+            await q.edit_message_text("بنکدار پیدا نشد.", reply_markup=admin_panel_keyboard()); return
+        text=(f"🏬 بنکدار #{member_id}\nشماره: {escape(mobile_e164_to_local(row['phone_e164']))}\n"
+              f"نام: {escape(str(row.get('display_name') or 'هنوز پروفایل متصل نشده'))}\nآدرس: {escape(str(row.get('address') or 'ثبت نشده'))}\n"
+              f"وضعیت: {'فعال' if row['active'] else 'غیرفعال'}")
+        buttons=[[InlineKeyboardButton("✏️ ویرایش شماره",callback_data=f"adm:wholesaler_edit:{member_id}")],
+                 [InlineKeyboardButton("✏️ ویرایش نام",callback_data=f"adm:wholesaler_profile_edit:{member_id}:name"),InlineKeyboardButton("📍 ویرایش آدرس",callback_data=f"adm:wholesaler_profile_edit:{member_id}:address")],
+                 [InlineKeyboardButton("🗑 حذف عضویت",callback_data=f"adm:wholesaler_remove:{member_id}")],
+                 [InlineKeyboardButton("🔙 فهرست",callback_data="adm:wholesalers:members")]]
+        await q.edit_message_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    if action == "wholesaler_edit" and len(parts) == 3:
+        context.user_data["admin_flow"]={"type":"wholesaler_edit","step":"phone","member_id":int(parts[2])}
+        await q.message.reply_text("شماره موبایل جدید بنکدار را وارد کن:")
+        return
+    if action == "wholesaler_profile_edit" and len(parts) == 4:
+        context.user_data["admin_flow"]={"type":"wholesaler_profile_edit","step":"value","member_id":int(parts[2]),"field":parts[3]}
+        await q.message.reply_text("نام و نام خانوادگی جدید را وارد کن:" if parts[3]=="name" else "آدرس اصلی جدید را وارد کن:")
+        return
+    if action == "wholesaler_remove" and len(parts) == 3:
+        with get_conn() as conn:
+            with conn.transaction(): ok=remove_wholesaler(conn,int(parts[2]))
+        await show_wholesaler_admin_callback(q,"members")
+        return
 
     if action == "smsmanual":
         choices = [
@@ -2868,8 +3237,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "price_set":
         pid = int(parts[2])
-        context.user_data["admin_flow"] = {"type": "quick_price", "product_id": pid, "step": "price"}
-        await q.message.reply_text("💰 قیمت جدید را فقط به تومان و با عدد بفرست. برای لغو /cancel را بزن.")
+        context.user_data["admin_flow"] = {"type": "quick_price", "product_id": pid, "field": "price", "step": "price"}
+        await q.message.reply_text("💰 قیمت عادی جدید را فقط به تومان و با عدد بفرست. برای لغو /cancel را بزن.")
+        return
+    if action == "wholesale_price_set":
+        pid = int(parts[2])
+        context.user_data["admin_flow"] = {"type": "quick_price", "product_id": pid, "field": "wholesale_price", "step": "price"}
+        await q.message.reply_text("🏬 قیمت بنکداری را به تومان وارد کن؛ برای حذف قیمت بنکداری عدد ۰ را بفرست.")
         return
     if action == "toggle_product":
         pid = int(parts[2])
@@ -3016,9 +3390,63 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id) or not flow:
         return
 
-    if text.lower() in ("/cancel", "لغو", "انصراف") and flow.get("type") in ("assign_order_number", "manual_pattern_sms"):
+    if text.lower() in ("/cancel", "لغو", "انصراف") and flow.get("type") in ("assign_order_number", "manual_pattern_sms", "delivery_date", "wholesaler_add", "wholesaler_edit", "wholesaler_profile_edit"):
         context.user_data.pop("admin_flow", None)
         await update.message.reply_text("عملیات لغو شد.", reply_markup=admin_panel_keyboard())
+        return
+
+    if flow.get("type") == "wholesaler_profile_edit":
+        try:
+            with get_conn() as conn:
+                with conn.transaction():
+                    admin_update_wholesaler_profile(conn,int(flow["member_id"]),flow["field"],text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc)); return
+        except Exception:
+            logger.exception("Telegram admin wholesaler profile edit failed")
+            await update.message.reply_text("ویرایش اطلاعات بنکدار انجام نشد."); return
+        context.user_data.pop("admin_flow",None)
+        await update.message.reply_text("✅ اطلاعات بنکدار ویرایش شد و در هر دو ربات به‌روزرسانی می‌شود.",reply_markup=admin_panel_keyboard())
+        return
+    if flow.get("type") in ("wholesaler_add", "wholesaler_edit"):
+        try:
+            with get_conn() as conn:
+                with conn.transaction():
+                    if flow["type"] == "wholesaler_add":
+                        normalized = add_wholesaler_by_phone(conn, text, update.effective_user.id)
+                    else:
+                        normalized = update_wholesaler_phone(conn, int(flow["member_id"]), text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc)); return
+        except Exception:
+            logger.exception("Telegram admin wholesaler add/edit failed")
+            await update.message.reply_text("ثبت بنکدار انجام نشد؛ ممکن است این شماره قبلاً ثبت شده باشد.")
+            return
+        context.user_data.pop("admin_flow", None)
+        await update.message.reply_text(f"✅ بنکدار ثبت شد: {mobile_e164_to_local(normalized)}\nپیامک خوشامدگویی در صف ارسال قرار گرفت.", reply_markup=admin_panel_keyboard())
+        await show_wholesaler_admin_message(update.message, context, "members")
+        return
+
+    if flow.get("type") == "delivery_date":
+        delivery_date = parse_jalali_date(text, allow_future=True)
+        if not delivery_date:
+            await update.message.reply_text("تاریخ نامعتبر است؛ نمونه درست: ۱۴۰۵/۰۸/۲۰")
+            return
+        order_id = int(flow["order_id"])
+        conn = get_conn()
+        order = conn.execute("UPDATE orders SET delivery_date=%s WHERE id=%s RETURNING *", (delivery_date, order_id)).fetchone()
+        sms_queued = queue_delivery_sms(conn, order, gregorian_to_jalali(delivery_date)) if order else False
+        conn.commit(); conn.close()
+        context.user_data.pop("admin_flow", None)
+        if not order:
+            await update.message.reply_text("سفارش پیدا نشد؛ تاریخ تحویل ثبت نشد.", reply_markup=admin_panel_keyboard())
+            return
+        if order and order.get("platform") == "telegram":
+            try:
+                await context.bot.send_message(int(order["user_id"]), f"📅 تاریخ تحویل سفارش {order.get('display_order_number') or ('#'+str(order_id))} تعیین شد: {gregorian_to_jalali(delivery_date)}")
+            except Exception:
+                logger.info("Could not send Telegram delivery date notice", exc_info=True)
+        await update.message.reply_text("✅ تاریخ تحویل سفارش ثبت شد و پیامک اطلاع‌رسانی در صف ارسال قرار گرفت." if sms_queued else "✅ تاریخ تحویل ثبت شد؛ اما برای سفارش شماره تماس معتبر وجود نداشت و پیامکی در صف قرار نگرفت.", reply_markup=admin_panel_keyboard())
         return
 
     if flow.get("type") == "assign_order_number":
@@ -3218,11 +3646,12 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("admin_flow", None)
             await update.message.reply_text("محصول پیدا نشد.")
             return
-        conn.execute("UPDATE products SET price=%s WHERE id=%s", (price, pid))
+        field = flow.get("field", "price")
+        conn.execute(f"UPDATE products SET {field}=%s WHERE id=%s", (None if field == "wholesale_price" and price == 0 else price, pid))
         conn.commit()
         conn.close()
         context.user_data.pop("admin_flow", None)
-        await update.message.reply_text(f"✅ قیمت محصول با موفقیت به {price:,} تومان تغییر کرد.", reply_markup=admin_panel_keyboard())
+        await update.message.reply_text(f"✅ {'قیمت بنکداری' if field == 'wholesale_price' else 'قیمت عادی'} محصول با موفقیت به {price:,} تومان تغییر کرد.", reply_markup=admin_panel_keyboard())
         return
 
     if flow["type"] == "add_product":
@@ -3329,6 +3758,13 @@ async def order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order_text(order), parse_mode="HTML",
             reply_markup=order_status_keyboard(order_id, order["status"], order.get("display_order_number"))
         )
+        return
+
+    if action == "delivery":
+        conn.close()
+        context.user_data["admin_flow"] = {"type": "delivery_date", "order_id": order_id}
+        await q.answer()
+        await q.message.reply_text("📅 تاریخ تحویل شمسی را وارد کن؛ مثال ۱۴۰۵/۰۸/۲۰. برای لغو /cancel را بفرست.")
         return
 
     if action == "assign":
@@ -4190,13 +4626,17 @@ async def async_main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("profile", show_customer_profile))
+    app.add_handler(MessageHandler(filters.Regex("^👤 پروفایل من$"), show_customer_profile))
+    app.add_handler(CallbackQueryHandler(customer_profile_callback, pattern=r"^profile:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, customer_profile_input), group=-1)
     app.add_handler(MessageHandler(filters.Regex("^🧾 کاتالوگ محصولات$"), show_catalog))
     app.add_handler(MessageHandler(filters.Regex("^🛒 سبد خرید$"), show_cart))
     app.add_handler(MessageHandler(filters.Regex("^📦 سفارش‌های من$"), my_orders))
     app.add_handler(MessageHandler(filters.Regex(r"^💬\s*(?:مرکز پشتیبانی|پشتیبانی)$"), support))
     app.add_handler(CommandHandler("orders_admin", admin_orders))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ پنل مدیریت$"), admin_panel))
-    app.add_handler(MessageHandler(filters.Regex(r"^(?:📦 سفارش‌ها|💳 پرداخت‌های در انتظار|🛠 مدیریت محصولات|🎫 پشتیبانی)(?: \(\d+\))?$"), admin_shortcut))
+    app.add_handler(MessageHandler(filters.Regex(r"^(?:📦 سفارش‌ها|💳 پرداخت‌های در انتظار|🛠 مدیریت محصولات|🎫 پشتیبانی|🏬 مدیریت بنکداران)(?: \(\d+\))?$"), admin_shortcut))
 
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(support_callback, pattern=r"^support:"))
@@ -4239,6 +4679,7 @@ async def async_main():
         conversation_timeout=1800 if app.job_queue is not None else None,
     )
     app.add_handler(conv)
+    app.add_handler(CommandHandler("cancel", cancel_nonconversation_flows), group=1)
 
     # دکمه‌های مراحل ثبت سفارش که مکالمه‌شان منقضی شده (مثلاً بعد از ری‌استارت سرور)
     async def stale_checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
