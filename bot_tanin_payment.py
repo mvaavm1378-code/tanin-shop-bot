@@ -413,7 +413,7 @@ async def customer_profile_callback(update: Update, context: ContextTypes.DEFAUL
         prompts = {
             "name": "نام و نام خانوادگی اصلی را وارد کن:",
             "address": "آدرس اصلی و کامل را وارد کن:",
-            "birth": "تاریخ تولد شمسی را وارد کن؛ مثال ۱۳۷۵/۰۶/۲۰:",
+            "birth": "تاریخ تولد شمسی را بفرست. هر دو قالب پذیرفته می‌شود:\n• ۱۳۷۵/۰۶/۲۰ (سال/ماه/روز)\n• ۲۰/۰۶/۱۳۷۵ (روز/ماه/سال)\nاعداد فارسی یا انگلیسی قابل قبول است. برای لغو /cancel را بفرست:",
         }
         await q.message.reply_text(prompts[action])
         return
