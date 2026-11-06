@@ -10,6 +10,7 @@ import re
 import json
 import asyncio
 import logging
+from datetime import datetime, timezone, timedelta
 
 import aiohttp
 import psycopg
@@ -178,7 +179,7 @@ async def load_outbox_row(conn, outbox_id):
     return await (await conn.execute(
         """
         SELECT o.id,o.loyalty_customer_id,o.destination_phone,o.message_text,
-               o.template_id,o.template_vars,o.recipient_type,
+               o.template_id,o.template_vars,o.recipient_type,o.created_at,
                lc.phone_e164,lc.phone_verified_at,
                COALESCE(scp.transactional_sms_enabled,TRUE) AS sms_enabled
         FROM public.sms_outbox o
@@ -196,6 +197,19 @@ async def process_one(conn, session, outbox_id):
     if not row:
         return
     recipient_type = row["recipient_type"] or "customer"
+    if recipient_type == "verification":
+        created_at=row.get("created_at")
+        if created_at:
+            if created_at.tzinfo is None:
+                created_at=created_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc)-created_at.astimezone(timezone.utc) > timedelta(minutes=5):
+                await conn.execute(
+                    """UPDATE public.sms_outbox SET status='cancelled',last_error='OTP expired before delivery',
+                       template_vars='[]'::jsonb,updated_at=NOW() WHERE id=%s AND status='sending'""",
+                    (outbox_id,),
+                )
+                await conn.commit()
+                return
 
     if recipient_type == "admin":
         phone = normalize_mobile(row["destination_phone"] or SMS_ADMIN_PHONE)
@@ -208,6 +222,10 @@ async def process_one(conn, session, outbox_id):
             reason = "Transactional SMS disabled by customer preference"
         else:
             reason = "Invalid order customer phone"
+    elif recipient_type == "verification":
+        # Security/identity OTP is independent of optional transactional SMS preferences.
+        phone = normalize_mobile(row["destination_phone"])
+        reason = "Invalid verification phone"
     else:
         phone = normalize_mobile(row["phone_e164"])
         if not row["phone_verified_at"] or not row["sms_enabled"]:
@@ -218,7 +236,9 @@ async def process_one(conn, session, outbox_id):
 
     if not phone:
         await conn.execute(
-            """UPDATE public.sms_outbox SET status='cancelled',last_error=%s,updated_at=NOW()
+            """UPDATE public.sms_outbox SET status='cancelled',last_error=%s,
+               template_vars=CASE WHEN recipient_type='verification' THEN '[]'::jsonb ELSE template_vars END,
+               updated_at=NOW()
                WHERE id=%s AND status='sending'""",
             (reason, outbox_id),
         )
@@ -240,7 +260,9 @@ async def process_one(conn, session, outbox_id):
             )
             await conn.execute(
                 """UPDATE public.sms_outbox
-                   SET status='failed',last_error=%s,updated_at=NOW()
+                   SET status='failed',last_error=%s,
+                       template_vars=CASE WHEN recipient_type='verification' THEN '[]'::jsonb ELSE template_vars END,
+                       updated_at=NOW()
                    WHERE id=%s AND status='sending'""",
                 (reason, outbox_id),
             )
@@ -277,7 +299,9 @@ async def process_one(conn, session, outbox_id):
                 )
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         await conn.execute(
-            """UPDATE public.sms_outbox SET last_error=%s,updated_at=NOW()
+            """UPDATE public.sms_outbox SET last_error=%s,
+               template_vars=CASE WHEN recipient_type='verification' THEN '[]'::jsonb ELSE template_vars END,
+               updated_at=NOW()
                WHERE id=%s AND status='sending'""",
             (f"Delivery outcome uncertain; manual reconciliation required: {type(exc).__name__}", outbox_id),
         )
@@ -296,6 +320,7 @@ async def process_one(conn, session, outbox_id):
         await conn.execute(
             """UPDATE public.sms_outbox
                SET status='accepted',provider_message_id=%s,sent_at=NOW(),
+                   template_vars=CASE WHEN recipient_type='verification' THEN '[]'::jsonb ELSE template_vars END,
                    updated_at=NOW(),last_error=NULL
                WHERE id=%s AND status='sending'""",
             (provider_id, outbox_id),
@@ -303,7 +328,9 @@ async def process_one(conn, session, outbox_id):
     else:
         await conn.execute(
             """UPDATE public.sms_outbox
-               SET status='failed',last_error=%s,updated_at=NOW()
+               SET status='failed',last_error=%s,
+                   template_vars=CASE WHEN recipient_type='verification' THEN '[]'::jsonb ELSE template_vars END,
+                   updated_at=NOW()
                WHERE id=%s AND status='sending'""",
             (str(detail)[:1000], outbox_id),
         )
