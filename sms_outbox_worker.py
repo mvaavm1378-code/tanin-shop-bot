@@ -179,7 +179,7 @@ async def load_outbox_row(conn, outbox_id):
     return await (await conn.execute(
         """
         SELECT o.id,o.loyalty_customer_id,o.destination_phone,o.message_text,
-               o.template_id,o.template_vars,o.recipient_type,o.created_at,
+               o.template_id,o.template_vars,o.recipient_type,o.queued_at AS created_at,
                lc.phone_e164,lc.phone_verified_at,
                COALESCE(scp.transactional_sms_enabled,TRUE) AS sms_enabled
         FROM public.sms_outbox o
@@ -363,14 +363,23 @@ async def process_due_batch():
                 try:
                     await process_one(conn, session, outbox_id)
                 except Exception:
-                    await conn.execute(
-                        """UPDATE public.sms_outbox
-                           SET last_error='Unexpected worker error; manual reconciliation required',
-                               updated_at=NOW()
-                           WHERE id=%s AND status='sending'""",
-                        (outbox_id,),
-                    )
-                    await conn.commit()
+                    # A failed PostgreSQL statement aborts the current transaction.
+                    # Roll it back before attempting to record the worker error.
+                    await conn.rollback()
+                    try:
+                        await conn.execute(
+                            """UPDATE public.sms_outbox
+                               SET last_error='Unexpected worker error; manual reconciliation required',
+                                   updated_at=NOW()
+                               WHERE id=%s AND status='sending'""",
+                            (outbox_id,),
+                        )
+                        await conn.commit()
+                    except Exception:
+                        await conn.rollback()
+                        log.exception(
+                            "Could not record worker failure for outbox id=%s.", outbox_id
+                        )
                     log.exception("Worker error for outbox id=%s; left in sending state.", outbox_id)
         return reminders + len(ids)
 
