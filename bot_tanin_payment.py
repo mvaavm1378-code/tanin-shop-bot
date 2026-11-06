@@ -374,7 +374,7 @@ async def show_customer_profile(update: Update, context: ContextTypes.DEFAULT_TY
         await target.reply_text("فعلاً دریافت پروفایل ممکن نیست. چند لحظه بعد دوباره تلاش کن.")
         return
     phone = mobile_e164_to_local(profile.get("phone_e164") or "") or "ثبت نشده"
-    birth = gregorian_to_jalali(profile["birth_date"]) if profile.get("birth_date") else "ثبت نشده"
+    birth = format_iran_jalali(profile["birth_date"], include_time=False) if profile.get("birth_date") else "ثبت نشده"
     request_status = profile.get("wholesaler_request_status")
     wholesale_text = "فعال ✅" if profile.get("wholesaler_active") else ("در انتظار بررسی" if request_status == "pending" else "عضو نیست")
     text = (
@@ -2563,7 +2563,7 @@ async def admin_customer_detail(q, user_id):
         f"تلگرام: @{escape(c['username'] or '-')}\n"
         f"تلفن: {escape(current_phone)}\n"
         f"آدرس: {escape(current_address)}\n"
-        f"تاریخ تولد: {escape(gregorian_to_jalali(customer_profile['birth_date']) if customer_profile.get('birth_date') else 'ثبت نشده')}\n"
+        f"تاریخ تولد: {escape(format_iran_jalali(customer_profile['birth_date'], include_time=False) if customer_profile.get('birth_date') else 'ثبت نشده')}\n"
         f"جنسیت: {escape(c['gender'] or '-')}\n"
         f"اولین ورود: {escape(format_iran_jalali_fa(c.get('first_seen'), include_time=True))}\n"
         f"آخرین فعالیت: {escape(format_iran_jalali_fa(c.get('last_seen'), include_time=True))}\n\n"
