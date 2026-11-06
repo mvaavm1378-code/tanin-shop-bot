@@ -3260,7 +3260,7 @@ async def on_callback(api, cb):
                 state = restore_checkout(uid)
                 CHECKOUT[uid] = dict(state)
                 CHECKOUT[uid]["profile_flow"] = {"step":action}
-                prompts={"name":"نام و نام خانوادگی اصلی را وارد کن:","address":"آدرس اصلی و کامل را وارد کن:","birth":"تاریخ تولد شمسی را وارد کن؛ مثال ۱۳۷۵/۰۶/۲۰:"}
+                prompts={"name":"نام و نام خانوادگی اصلی را وارد کن:","address":"آدرس اصلی و کامل را وارد کن:","birth":"تاریخ تولد شمسی را بفرست. هر دو قالب پذیرفته می‌شود:\n• ۱۳۷۵/۰۶/۲۰ (سال/ماه/روز)\n• ۲۰/۰۶/۱۳۷۵ (روز/ماه/سال)\nاعداد فارسی یا انگلیسی قابل قبول است. برای لغو /cancel را بفرست:"}
                 await api.send(chat_id,prompts[action])
             elif action == "wholesaler":
                 try:
