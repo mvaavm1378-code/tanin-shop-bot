@@ -464,7 +464,7 @@ def save_profile_field(conn, platform: str, platform_user_id, field: str, value,
     else:
         birth = value if isinstance(value, date) else parse_jalali_date(str(value))
         if not birth:
-            raise ValueError("تاریخ تولد نامعتبر است. نمونه: ۱۳۷۵/۰۶/۲۰")
+            raise ValueError("تاریخ تولد معتبر نیست. یکی از این دو قالب را بفرست: ۱۳۷۵/۰۶/۲۰ یا ۲۰/۰۶/۱۳۷۵ (سال/ماه/روز یا روز/ماه/سال).")
         if current_profile.get("birth_date") != birth:
             _archive_profile_value(conn, customer_id, "birth_date", current_profile.get("birth_date"))
         conn.execute("UPDATE loyalty_customers SET birth_date=%s,birth_date_updated_at=NOW(),updated_at=NOW() WHERE id=%s", (birth, customer_id))
@@ -610,13 +610,25 @@ def update_wholesaler_phone(conn, member_id: int, phone: str):
 
 
 def parse_jalali_date(value: str, allow_future: bool = False) -> Optional[date]:
-    """Parse YYYY/MM/DD Jalali date and return Gregorian date."""
+    """Parse Jalali date in either YYYY/MM/DD or DD/MM/YYYY order.
+
+    Persian and Arabic-Indic digits are accepted. Separators may be /, - or .
+    The four-digit year determines the order, so the two formats are unambiguous.
+    Returns the corresponding Gregorian ``date`` for PostgreSQL DATE storage.
+    """
     text = str(value or "").translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
-    match = re.fullmatch(r"\s*(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})\s*", text)
+    text = text.replace("\u200c", "").replace("\u200f", "").replace("\ufeff", "").strip()
+    match = re.fullmatch(r"(\d{1,4})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(\d{1,4})", text)
     if not match:
         return None
-    jy, jm, jd = map(int, match.groups())
-    if not (1200 <= jy <= 1500 and 1 <= jm <= 12 and 1 <= jd <= (31 if jm <= 6 else 30 if jm <= 11 else 30)):
+    first, second, third = match.groups()
+    if len(first) == 4:
+        jy, jm, jd = int(first), int(second), int(third)
+    elif len(third) == 4:
+        jd, jm, jy = int(first), int(second), int(third)
+    else:
+        return None
+    if not (1200 <= jy <= 1500 and 1 <= jm <= 12 and 1 <= jd <= (31 if jm <= 6 else 30)):
         return None
     try:
         jy2 = jy + 1595
