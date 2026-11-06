@@ -19,6 +19,7 @@ TEMPLATE_IDS = {
     "order_confirmed_customer": 575449, # {0}=customer name, {1}=order number, {2}=details
     "wallet_notice": 575528,            # {0}=customer name, {1}=transaction type, {2}=description
     "cashback_notice": 575530,          # {0}=customer name, {1}=order number, {2}=credit description
+    "website_otp": 578916,             # {0}=six-digit website verification code
 }
 
 TEMPLATE_VARIABLE_COUNTS = {
