@@ -1452,7 +1452,7 @@ async def show_customer_profile_bale(api, chat_id, uid, mid=None):
         await api.send(chat_id, "فعلاً دریافت پروفایل ممکن نیست. چند لحظه بعد دوباره تلاش کن.")
         return
     phone = mobile_e164_to_local(profile.get("phone_e164") or "") or "ثبت نشده"
-    birth = gregorian_to_jalali(profile["birth_date"]) if profile.get("birth_date") else "ثبت نشده"
+    birth = format_iran_jalali(profile["birth_date"], include_time=False) if profile.get("birth_date") else "ثبت نشده"
     request_status = profile.get("wholesaler_request_status")
     wholesale_text = "فعال ✅" if profile.get("wholesaler_active") else ("در انتظار بررسی" if request_status == "pending" else "عضو نیست")
     text = ("👤 <b>پروفایل مشتری تنین ایران</b>\n\n"
@@ -2358,7 +2358,7 @@ async def show_admin_customer(api, chat_id, customer_id, mid=None):
     phone=mobile_e164_to_local(customer_profile["phone_e164"]) if customer_profile.get("phone_verified_at") and customer_profile.get("phone_e164") else (saved_phone[0]["value"] if saved_phone else c.get("phone") or "-")
     address=customer_profile.get("address") or (saved_address[0]["value"] if saved_address else "-")
     total=sum(int(o.get("total_price") or 0) for o in orders if o.get("status") not in ("رد شد","لغو شده"))
-    lines=["👤 <b>جزئیات مشتری</b>",f"نام: {escape(str(name))}",f"شناسه: <code>{customer_id}</code>",f"نام کاربری: @{escape(str(c.get('username') or '-'))}",f"تلفن: {escape(str(phone))}",f"آدرس ذخیره‌شده: {escape(str(address))}",f"تاریخ تولد: {escape(gregorian_to_jalali(customer_profile['birth_date']) if customer_profile.get('birth_date') else 'ثبت نشده')}",f"جنسیت: {escape(str(c.get('gender') or '-'))}",f"اولین ورود: {format_iran_jalali_fa(c.get('first_seen'),True)}",f"آخرین فعالیت: {format_iran_jalali_fa(c.get('last_seen'),True)}",f"تعداد سفارش‌های اخیر: {len(orders)}",f"مجموع سفارش‌های غیرلغوشده: {total:,} تومان",f"👛 موجودی کیف پول باشگاه: {int((loyalty_summary or {}).get('balance_toman') or 0):,} تومان",f"📩 پیامک سیستمی: {'فعال' if (loyalty_summary or {}).get('sms_enabled',True) else 'غیرفعال'}"]
+    lines=["👤 <b>جزئیات مشتری</b>",f"نام: {escape(str(name))}",f"شناسه: <code>{customer_id}</code>",f"نام کاربری: @{escape(str(c.get('username') or '-'))}",f"تلفن: {escape(str(phone))}",f"آدرس ذخیره‌شده: {escape(str(address))}",f"تاریخ تولد: {escape(format_iran_jalali(customer_profile['birth_date'], include_time=False) if customer_profile.get('birth_date') else 'ثبت نشده')}",f"جنسیت: {escape(str(c.get('gender') or '-'))}",f"اولین ورود: {format_iran_jalali_fa(c.get('first_seen'),True)}",f"آخرین فعالیت: {format_iran_jalali_fa(c.get('last_seen'),True)}",f"تعداد سفارش‌های اخیر: {len(orders)}",f"مجموع سفارش‌های غیرلغوشده: {total:,} تومان",f"👛 موجودی کیف پول باشگاه: {int((loyalty_summary or {}).get('balance_toman') or 0):,} تومان",f"📩 پیامک سیستمی: {'فعال' if (loyalty_summary or {}).get('sms_enabled',True) else 'غیرفعال'}"]
     buttons=[]
     for o in orders:
         buttons.append([{"text":f"📦 سفارش #{o['id']} · {str(o['status'])[:15]}",
