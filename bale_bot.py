@@ -13,6 +13,12 @@ import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from sms_templates import TEMPLATE_IDS, enqueue_pattern_sms, queue_order_created_sms, queue_order_assigned_sms, queue_order_confirmed_sms
+from customer_identity import (ensure_platform_account, get_profile, get_profile_for_platform,
+    start_phone_verification, verify_phone_code, save_profile_field, request_wholesaler,
+    approve_wholesaler_request, reject_wholesaler_request, add_wholesaler_by_phone,
+    remove_wholesaler, update_wholesaler_phone, customer_is_wholesaler, parse_jalali_date,
+    gregorian_to_jalali, queue_delivery_sms, normalize_mobile_e164, mobile_e164_to_local,
+    admin_update_wholesaler_profile)
 from html import escape
 import aiohttp
 from io import BytesIO
@@ -224,7 +230,7 @@ def main_keyboard(uid=None):
                              [{"text": "📢 مدیریت کانال"}, {"text": "💳 تنظیمات پرداخت"}]], "resize_keyboard": True}
     return {"keyboard": [[{"text": "🧾 کاتالوگ محصولات"}],
                          [{"text": "🛒 سبد خرید"}, {"text": "📦 سفارش‌های من"}],
-                         [{"text": "💬 مرکز پشتیبانی"}]], "resize_keyboard": True}
+                         [{"text": "👤 پروفایل من"}, {"text": "💬 مرکز پشتیبانی"}]], "resize_keyboard": True}
 
 
 def category_keyboard():
@@ -288,6 +294,7 @@ def admin_keyboard():
         [{"text": "👛 تنظیمات کیف پول", "callback_data": "adm:walletcap"},
          {"text": "🧾 مدیریت کیف پول‌ها", "callback_data": "adm:wallets"}],
         [{"text": "🧮 بررسی مغایرت کیف پول", "callback_data": "adm:walletreconcile"}],
+        [{"text": "🏬 مدیریت بنکداران", "callback_data": "adm:wholesalers"}],
         [{"text": "📨 ارسال پیامک دستی", "callback_data": "adm:smsmanual"}],
         [{"text": "🔄 بروزرسانی داشبورد", "callback_data": "adm:home"},
          {"text": "✕ بستن پنل", "callback_data": "adm:close"}],
@@ -303,6 +310,7 @@ def admin_order_buttons(order_id, status, customer_user_id=None, display_order_n
     context = f":customer:{int(customer_user_id)}" if customer_user_id is not None else ""
     if not display_order_number:
         rows.append([{"text": "🏷 تخصیص شماره TN", "callback_data": f"adm:assignordernumber:{order_id}{context}"}])
+    rows.append([{"text":"📅 تعیین / تغییر تاریخ تحویل","callback_data":f"adm:deliverydate:{order_id}{context}"}])
     if status == "در انتظار بررسی":
         rows.extend([
             [{"text": "✅ تأیید سفارش", "callback_data": f"adm:orderstatus:{order_id}:confirmed{context}"}],
@@ -379,7 +387,7 @@ def db_admin_stats():
             except Exception:
                 return 0
         return {
-            "pending": count("SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی'"),
+            "pending": count("SELECT COUNT(*) AS n FROM pending_payments WHERE payment_status='در انتظار بررسی' AND platform='bale'"),
             "orders": count("SELECT COUNT(*) AS n FROM orders WHERE status='در انتظار بررسی'"),
             "tickets": count("SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('new','admin_waiting')"),
             "products": count("SELECT COUNT(*) AS n FROM products WHERE active=TRUE"),
@@ -444,7 +452,7 @@ async def show_admin_section(api, chat_id, section):
         with get_conn() as conn:
             rows = conn.execute(
                 "SELECT id,full_name,total_price,created_at,payment_status FROM pending_payments "
-                "WHERE payment_status='در انتظار بررسی' ORDER BY id DESC LIMIT 30"
+                "WHERE payment_status='در انتظار بررسی' AND platform='bale' ORDER BY id DESC LIMIT 30"
             ).fetchall()
         if not rows:
             await api.send(chat_id, "💳 پرداخت‌های در انتظار بررسی\n\nموردی برای بررسی وجود ندارد.", admin_back())
@@ -517,7 +525,7 @@ async def show_admin_section(api, chat_id, section):
 
 async def show_admin_pending_detail(api, chat_id, pid):
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM pending_payments WHERE id=%s", (pid,)).fetchone()
+        row = conn.execute("SELECT * FROM pending_payments WHERE id=%s AND platform='bale'", (pid,)).fetchone()
     if not row:
         await api.send(chat_id, "پرداخت پیدا نشد.", admin_back("pending")); return
     caption = (f"💳 <b>پرداخت #{row['id']}</b>\n"
@@ -709,9 +717,12 @@ async def handle_admin_product_photo(api, msg, uid, chat_id):
         return True
 
 
-def db_products(category):
+def db_products(category, uid):
     with get_conn() as conn:
-        return conn.execute("SELECT id,name,category,size,color,price,photo_url,pack_info FROM products WHERE category=%s AND active=TRUE ORDER BY id DESC", (category,)).fetchall()
+        is_wholesaler = customer_is_wholesaler(conn, "bale", uid)
+        return conn.execute("""SELECT id,name,category,size,color,
+            CASE WHEN %s AND COALESCE(wholesale_price,0)>0 THEN wholesale_price ELSE price END AS price,
+            photo_url,pack_info FROM products WHERE category=%s AND active=TRUE ORDER BY id DESC""", (is_wholesaler, category)).fetchall()
 
 
 def db_product(pid):
@@ -731,9 +742,12 @@ def db_add_cart(uid, pid, qty):
 
 def db_cart(uid):
     with get_conn() as conn:
-        return conn.execute("""SELECT ci.id AS cart_id,p.name,p.price,p.pack_info,ci.qty,(p.price*ci.qty) AS line_total
+        is_wholesaler = customer_is_wholesaler(conn, "bale", uid)
+        return conn.execute("""SELECT ci.id AS cart_id,p.name,
+            CASE WHEN %s AND COALESCE(p.wholesale_price,0)>0 THEN p.wholesale_price ELSE p.price END AS price,
+            p.pack_info,ci.qty,(CASE WHEN %s AND COALESCE(p.wholesale_price,0)>0 THEN p.wholesale_price ELSE p.price END*ci.qty) AS line_total
             FROM cart_items ci JOIN products p ON p.id=ci.product_id
-            WHERE ci.user_id=%s AND p.active=TRUE ORDER BY ci.id""", (uid,)).fetchall()
+            WHERE ci.user_id=%s AND p.active=TRUE ORDER BY ci.id""", (is_wholesaler,is_wholesaler,uid)).fetchall()
 
 
 def db_remove_cart(uid, cid):
@@ -750,7 +764,8 @@ def saved_user_key(uid):
 def db_saved_data(uid, data_type):
     with get_conn() as conn:
         return conn.execute(
-            "SELECT id,value FROM customer_saved_data WHERE user_id=%s AND data_type=%s ORDER BY id DESC",
+            """SELECT id,value FROM customer_saved_data WHERE user_id=%s AND data_type=%s
+               ORDER BY COALESCE(NULLIF(updated_at,''),created_at) DESC NULLS LAST,id DESC LIMIT 1""",
             (saved_user_key(uid), data_type),
         ).fetchall()
 
@@ -759,27 +774,40 @@ def db_save_data(uid, data_type, value):
     value = re.sub(r"\s+", " ", str(value or "")).strip()
     if not value:
         return
+    now = __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT id FROM customer_saved_data WHERE user_id=%s AND data_type=%s AND value=%s LIMIT 1",
-            (saved_user_key(uid), data_type, value),
-        ).fetchone()
-        now = __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
-        if row:
-            conn.execute("UPDATE customer_saved_data SET updated_at=%s WHERE id=%s", (now, row["id"]))
-        else:
-            conn.execute("INSERT INTO customer_saved_data(user_id,data_type,value,created_at,updated_at) VALUES(%s,%s,%s,%s,%s)",
-                         (saved_user_key(uid), data_type, value, now, now))
-        conn.commit()
+        with conn.transaction():
+            if data_type in ("name", "address"):
+                save_profile_field(conn, "bale", uid, data_type, value)
+                return
+            row = conn.execute(
+                """SELECT id FROM customer_saved_data WHERE user_id=%s AND data_type=%s
+                   ORDER BY COALESCE(NULLIF(updated_at,''),created_at) DESC NULLS LAST,id DESC LIMIT 1""",
+                (saved_user_key(uid), data_type),
+            ).fetchone()
+            same = conn.execute("SELECT id FROM customer_saved_data WHERE user_id=%s AND data_type=%s AND value=%s ORDER BY id DESC LIMIT 1",
+                                (saved_user_key(uid), data_type, value)).fetchone()
+            if same:
+                conn.execute("UPDATE customer_saved_data SET updated_at=%s WHERE id=%s", (now, same["id"]))
+            elif row:
+                conn.execute("UPDATE customer_saved_data SET value=%s,updated_at=%s WHERE id=%s", (value, now, row["id"]))
+            else:
+                conn.execute("INSERT INTO customer_saved_data(user_id,data_type,value,created_at,updated_at) VALUES(%s,%s,%s,%s,%s)",
+                             (saved_user_key(uid), data_type, value, now, now))
+
 
 
 def db_update_saved(uid, data_id, data_type, value):
     value = re.sub(r"\s+", " ", str(value or "")).strip()
     now = __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
     with get_conn() as conn:
-        conn.execute("UPDATE customer_saved_data SET value=%s,updated_at=%s WHERE id=%s AND user_id=%s AND data_type=%s",
-                     (value, now, data_id, saved_user_key(uid), data_type))
-        conn.commit()
+        with conn.transaction():
+            if data_type in ("name", "address"):
+                save_profile_field(conn, "bale", uid, data_type, value)
+            else:
+                conn.execute("UPDATE customer_saved_data SET value=%s,updated_at=%s WHERE id=%s AND user_id=%s AND data_type=%s",
+                             (value, now, data_id, saved_user_key(uid), data_type))
+
 
 
 def db_delete_saved(uid, data_id, data_type):
@@ -792,14 +820,16 @@ def db_delete_saved(uid, data_id, data_type):
 def saved_keyboard(uid, data_type, step):
     rows = db_saved_data(uid, data_type)
     buttons = []
-    for row in rows[:8]:
+    if rows:
+        row = rows[0]
         val = str(row["value"])
         label = val if len(val) <= 34 else val[:31] + "..."
-        buttons.append([{"text": "استفاده: " + label, "callback_data": f"saved:use:{step}:{row['id']}"}])
-    buttons.append([{"text": "➕ وارد کردن اطلاعات جدید", "callback_data": f"saved:new:{step}"}])
-    if rows:
-        buttons.append([{"text": "✏️ ویرایش / 🗑 حذف اطلاعات ذخیره‌شده", "callback_data": f"saved:manage:{data_type}"}])
+        buttons.append([{"text": "استفاده از: " + label, "callback_data": f"saved:use:{step}:{row['id']}"}])
+        buttons.append([{"text": "✏️ ویرایش همین اطلاعات", "callback_data": f"saved:edit:{data_type}:{row['id']}"}])
+    else:
+        buttons.append([{"text": "➕ ثبت اطلاعات", "callback_data": f"saved:new:{step}"}])
     return {"inline_keyboard": buttons}
+
 
 
 def db_create_pending(uid, full_name, phone, gender, address, username):
@@ -811,24 +841,28 @@ def db_create_pending(uid, full_name, phone, gender, address, username):
             ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,full_name=excluded.full_name,
             phone=excluded.phone,gender=excluded.gender,last_seen=excluded.last_seen""",
             (uid, username or "", full_name, phone, gender, now, now))
-        rows = conn.execute("""SELECT p.name,p.price,p.pack_info,ci.qty FROM cart_items ci
-            JOIN products p ON p.id=ci.product_id WHERE ci.user_id=%s AND p.active=TRUE ORDER BY ci.id""", (uid,)).fetchall()
+        loyalty_customer_id = ensure_platform_account(conn, "bale", uid, full_name)
+        is_wholesaler = customer_is_wholesaler(conn, "bale", uid)
+        rows = conn.execute("""SELECT p.name,
+            CASE WHEN %s AND COALESCE(p.wholesale_price,0)>0 THEN p.wholesale_price ELSE p.price END AS price,
+            p.pack_info,ci.qty FROM cart_items ci
+            JOIN products p ON p.id=ci.product_id WHERE ci.user_id=%s AND p.active=TRUE ORDER BY ci.id""", (is_wholesaler,uid)).fetchall()
         if not rows:
             raise ValueError("سبد خرید خالی است.")
         total = sum(int(r["price"] or 0) * int(r["qty"] or 0) for r in rows)
         summary = "\n".join(f"{r['name']}" + (f" ({r['pack_info']})" if r["pack_info"] else "") + f" × {r['qty']}" for r in rows)
-        pending = conn.execute("""SELECT * FROM pending_payments WHERE user_id=%s
+        pending = conn.execute("""SELECT * FROM pending_payments WHERE user_id=%s AND platform='bale'
             AND payment_status IN ('در انتظار رسید','در انتظار بررسی') ORDER BY id DESC LIMIT 1""", (uid,)).fetchone()
         if pending and pending["payment_status"] == "در انتظار رسید":
-            conn.execute("""UPDATE pending_payments SET full_name=%s,phone=%s,address=%s,items_summary=%s,total_price=%s
-                WHERE id=%s AND payment_status='در انتظار رسید'""", (full_name, phone, address, summary, total, pending["id"]))
+            conn.execute("""UPDATE pending_payments SET full_name=%s,phone=%s,address=%s,items_summary=%s,total_price=%s,
+                platform='bale',loyalty_customer_id=%s WHERE id=%s AND payment_status='در انتظار رسید'""", (full_name, phone, address, summary, total, loyalty_customer_id, pending["id"]))
             pending = dict(pending)
             pending.update(full_name=full_name, phone=phone, address=address, items_summary=summary, total_price=total)
         elif not pending:
             pending = conn.execute("""INSERT INTO pending_payments
-                (user_id,full_name,phone,address,items_summary,total_price,payment_status,created_at)
-                VALUES(%s,%s,%s,%s,%s,%s,'در انتظار رسید',%s) RETURNING *""",
-                (uid, full_name, phone, address, summary, total, now)).fetchone()
+                (user_id,full_name,phone,address,items_summary,total_price,payment_status,created_at,platform,loyalty_customer_id)
+                VALUES(%s,%s,%s,%s,%s,%s,'در انتظار رسید',%s,'bale',%s) RETURNING *""",
+                (uid, full_name, phone, address, summary, total, now, loyalty_customer_id)).fetchone()
         bank = conn.execute("SELECT * FROM bank_accounts WHERE active=TRUE ORDER BY id DESC LIMIT 1").fetchone()
         conn.commit()
         return dict(pending), dict(bank) if bank else None
@@ -836,7 +870,7 @@ def db_create_pending(uid, full_name, phone, gender, address, username):
 
 def db_record_receipt(uid, file_id):
     with get_conn() as conn:
-        pending = conn.execute("""SELECT * FROM pending_payments WHERE user_id=%s AND payment_status='در انتظار رسید'
+        pending = conn.execute("""SELECT * FROM pending_payments WHERE user_id=%s AND platform='bale' AND payment_status='در انتظار رسید'
             ORDER BY id DESC LIMIT 1""", (uid,)).fetchone()
         if not pending:
             return None
@@ -885,14 +919,14 @@ def _award_loyalty_cashback(conn, platform, platform_user_id, order_id,
         )
         if display_name:
             conn.execute(
-                """UPDATE loyalty_customers SET display_name=%s, updated_at=NOW()
+                """UPDATE loyalty_customers SET display_name=COALESCE(NULLIF(display_name,''),%s), updated_at=NOW()
                    WHERE id=%s""",
                 (str(display_name)[:250], loyalty_customer_id),
             )
     else:
         customer = conn.execute(
-            """INSERT INTO loyalty_customers(display_name)
-               VALUES(%s) RETURNING id""",
+            """INSERT INTO loyalty_customers(display_name,display_name_updated_at)
+               VALUES(%s,NULL) RETURNING id""",
             (str(display_name)[:250] if display_name else None,),
         ).fetchone()
         loyalty_customer_id = customer["id"]
@@ -1014,12 +1048,12 @@ def _ensure_loyalty_profile_for_platform(conn, platform, platform_user_id, displ
         loyalty_customer_id = account["loyalty_customer_id"]
         if display_name:
             conn.execute(
-                "UPDATE loyalty_customers SET display_name=%s, updated_at=NOW() WHERE id=%s",
+                "UPDATE loyalty_customers SET display_name=COALESCE(NULLIF(display_name,''),%s), updated_at=NOW() WHERE id=%s",
                 (str(display_name)[:250], loyalty_customer_id),
             )
     else:
         customer = conn.execute(
-            "INSERT INTO loyalty_customers(display_name) VALUES(%s) RETURNING id",
+            "INSERT INTO loyalty_customers(display_name,display_name_updated_at) VALUES(%s,NULL) RETURNING id",
             (str(display_name)[:250] if display_name else None,),
         ).fetchone()
         loyalty_customer_id = customer["id"]
@@ -1223,8 +1257,8 @@ def db_pay_pending_order_with_wallet(pending_id, platform_user_id, platform):
     with get_conn() as conn:
         with conn.transaction():
             pending = conn.execute(
-                "SELECT * FROM pending_payments WHERE id=%s FOR UPDATE",
-                (int(pending_id),),
+                "SELECT * FROM pending_payments WHERE id=%s AND platform=%s FOR UPDATE",
+                (int(pending_id), platform),
             ).fetchone()
             if not pending or str(pending["user_id"]) != str(platform_user_id):
                 return {"status": "not_found"}
@@ -1258,13 +1292,13 @@ def db_pay_pending_order_with_wallet(pending_id, platform_user_id, platform):
             order = conn.execute(
                 """INSERT INTO orders
                    (user_id, full_name, phone, address, items_summary, total_price,
-                    status, created_at, finalized_at, payment_status, transaction_ref)
-                   VALUES(%s,%s,%s,%s,%s,%s,'در انتظار بررسی',%s,%s,'تأیید شده',%s)
+                    status, created_at, finalized_at, payment_status, transaction_ref, platform, loyalty_customer_id)
+                   VALUES(%s,%s,%s,%s,%s,%s,'در انتظار بررسی',%s,%s,'تأیید شده',%s,'bale',%s)
                    RETURNING id""",
                 (
                     pending["user_id"], pending["full_name"], pending["phone"],
                     pending["address"], pending["items_summary"], total,
-                    now, now, f"{platform.upper()}-WALLET-{pending_id}",
+                    now, now, f"{platform.upper()}-WALLET-{pending_id}", loyalty_customer_id,
                 ),
             ).fetchone()
             order_id = int(order["id"])
@@ -1348,7 +1382,7 @@ def db_review_payment(pid, admin_id, approve):
         now = __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
         with conn.transaction():
             pending = conn.execute(
-                "SELECT * FROM pending_payments WHERE id=%s FOR UPDATE", (pid,)
+                "SELECT * FROM pending_payments WHERE id=%s AND platform='bale' FOR UPDATE", (pid,)
             ).fetchone()
             if not pending or pending["payment_status"] != "در انتظار بررسی":
                 return None, "already"
@@ -1361,16 +1395,18 @@ def db_review_payment(pid, admin_id, approve):
                 )
                 return dict(pending), "rejected"
 
+            loyalty_customer_id = ensure_platform_account(conn, "bale", pending["user_id"], pending.get("full_name"))
+            conn.execute("UPDATE pending_payments SET platform='bale',loyalty_customer_id=%s WHERE id=%s", (loyalty_customer_id, int(pid)))
             order = conn.execute(
                 """INSERT INTO orders
                    (user_id,full_name,phone,address,items_summary,total_price,status,
-                    created_at,finalized_at,payment_status,transaction_ref)
-                   VALUES(%s,%s,%s,%s,%s,%s,'در انتظار بررسی',%s,%s,'تأیید شده',%s)
+                    created_at,finalized_at,payment_status,transaction_ref,platform,loyalty_customer_id)
+                   VALUES(%s,%s,%s,%s,%s,%s,'در انتظار بررسی',%s,%s,'تأیید شده',%s,'bale',%s)
                    RETURNING id""",
                 (
                     pending["user_id"], pending["full_name"], pending["phone"],
                     pending["address"], pending["items_summary"], pending["total_price"],
-                    now, now, f"BALE-CARD-TRANSFER-{pid}",
+                    now, now, f"BALE-CARD-TRANSFER-{pid}", loyalty_customer_id,
                 ),
             ).fetchone()
 
@@ -1382,6 +1418,15 @@ def db_review_payment(pid, admin_id, approve):
                 eligible_amount_toman=pending["total_price"],
                 display_name=pending["full_name"],
                 phone=pending["phone"],
+            )
+            # Every Bale order gets a platform link, even when cashback rounds to zero.
+            conn.execute(
+                """INSERT INTO loyalty_order_links
+                   (platform,source_order_id,loyalty_customer_id,order_status,
+                    eligible_items_amount_toman,shipping_amount_toman,paid_at,cashback_processed_at)
+                   VALUES('bale',%s,%s,'paid',0,0,NOW(),NOW())
+                   ON CONFLICT(platform,source_order_id) DO NOTHING""",
+                (str(order["id"]), loyalty_customer_id),
             )
             conn.execute("DELETE FROM cart_items WHERE user_id=%s", (pending["user_id"],))
             conn.execute(
@@ -1397,13 +1442,130 @@ def db_review_payment(pid, admin_id, approve):
             return dict(pending), f"approved:{order['id']}:{cashback_amount}"
 
 
+async def show_customer_profile_bale(api, chat_id, uid, mid=None):
+    try:
+        with get_conn() as conn:
+            with conn.transaction():
+                customer_id, profile = get_profile_for_platform(conn, "bale", uid)
+    except Exception:
+        log.exception("Could not load Bale customer profile")
+        await api.send(chat_id, "فعلاً دریافت پروفایل ممکن نیست. چند لحظه بعد دوباره تلاش کن.")
+        return
+    phone = mobile_e164_to_local(profile.get("phone_e164") or "") or "ثبت نشده"
+    birth = gregorian_to_jalali(profile["birth_date"]) if profile.get("birth_date") else "ثبت نشده"
+    request_status = profile.get("wholesaler_request_status")
+    wholesale_text = "فعال ✅" if profile.get("wholesaler_active") else ("در انتظار بررسی" if request_status == "pending" else "عضو نیست")
+    text = ("👤 <b>پروفایل مشتری تنین ایران</b>\n\n"
+            f"شناسه مشتری: <code>{customer_id}</code>\n"
+            f"نام و نام خانوادگی: {escape(str(profile.get('display_name') or 'ثبت نشده'))}\n"
+            f"شماره موبایل: {escape(phone)} {'✅ تأییدشده' if profile.get('phone_verified_at') else '⚠️ تأییدنشده'}\n"
+            f"آدرس اصلی: {escape(str(profile.get('address') or 'ثبت نشده'))}\n"
+            f"تاریخ تولد: {escape(birth)}\nوضعیت بنکداری: {wholesale_text}\n\n"
+            "اطلاعات اصلی فقط یک‌بار نگهداری می‌شود و در تلگرام و بله مشترک است.")
+    markup = {"inline_keyboard": [
+        [{"text":"📱 تأیید / تغییر شماره موبایل","callback_data":"profile:phone"}],
+        [{"text":"✏️ ویرایش نام","callback_data":"profile:name"},{"text":"📍 ویرایش آدرس","callback_data":"profile:address"}],
+        [{"text":"🎂 ثبت / ویرایش تاریخ تولد","callback_data":"profile:birth"}],
+        [{"text":"🏬 درخواست عضویت بنکداری","callback_data":"profile:wholesaler"}],
+        [{"text":"🔄 بروزرسانی","callback_data":"profile:refresh"}],
+    ]}
+    if mid:
+        try: await api.edit(chat_id, mid, text, markup); return
+        except Exception: pass
+    await api.send(chat_id, text, markup)
+
+
+async def handle_customer_profile_text_bale(api, msg, uid, chat_id, text):
+    state = restore_checkout(uid)
+    flow = state.get("profile_flow") or {}
+    if not flow:
+        return False
+    if text in ("/cancel", "لغو", "انصراف"):
+        state.pop("profile_flow", None)
+        if state:
+            CHECKOUT[uid] = dict(state)
+        else:
+            CHECKOUT.pop(uid, None)
+        await api.send(chat_id, "عملیات پروفایل لغو شد.", main_keyboard(uid))
+        return True
+    step = flow.get("step")
+    try:
+        if step == "phone":
+            with get_conn() as conn:
+                with conn.transaction():
+                    result = start_phone_verification(conn, "bale", uid, text)
+            flow["step"] = "otp"
+            state["profile_flow"] = flow
+            await api.send(chat_id, f"کد تأیید به شماره {result['masked_phone']} ارسال شد. کد ۶ رقمی را وارد کن؛ اعتبار آن ۵ دقیقه است.")
+            return True
+        if step == "otp":
+            with get_conn() as conn:
+                with conn.transaction():
+                    result = verify_phone_code(conn, "bale", uid, text)
+            if result["status"] != "verified":
+                errors = {"wrong":"کد اشتباه است؛ دوباره وارد کن.","expired":"کد منقضی شده؛ دوباره شماره را وارد کن.","locked":"کد به‌دلیل تلاش‌های ناموفق باطل شد؛ دوباره درخواست بده.","not_found":"کد فعالی پیدا نشد؛ شماره را دوباره وارد کن.","invalid_format":"کد باید ۶ رقم باشد."}
+                await api.send(chat_id, errors.get(result["status"], "تأیید شماره انجام نشد."))
+                if result["status"] in ("expired","locked","not_found"):
+                    flow["step"]="phone"
+                    state["profile_flow"] = flow
+                return True
+            after_verify=flow.get("after_verify")
+            if after_verify == "wholesaler_request":
+                customer_id=int(result["loyalty_customer_id"])
+                with get_conn() as conn:
+                    with conn.transaction():
+                        request_status=request_wholesaler(conn,customer_id)
+                        profile=get_profile(conn,customer_id)
+                if request_status == "submitted":
+                    for admin_id in ADMIN_IDS:
+                        try: await api.send(admin_id,f"🏬 درخواست عضویت بنکداری جدید\nشناسه مشتری: {customer_id}\nشماره: {mobile_e164_to_local(profile.get('phone_e164') or '')}",{"inline_keyboard":[[{"text":"بررسی درخواست‌ها","callback_data":"adm:wholesalers:requests"}]]})
+                        except Exception: log.exception("Could not notify Bale admin about wholesaler request")
+                state.pop("profile_flow",None)
+                if state: CHECKOUT[uid]=dict(state)
+                else: CHECKOUT.pop(uid,None)
+                message="✅ شماره تأیید شد و درخواست بنکداری برای مدیر ارسال شد." if request_status=="submitted" else ("عضویت بنکداری شما از قبل فعال است." if request_status=="already_active" else "درخواست شما قبلاً ثبت شده و در انتظار بررسی مدیر است.")
+                await api.send(chat_id,message)
+                await show_customer_profile_bale(api,chat_id,uid)
+                return True
+            state.pop("profile_flow", None)
+            if state:
+                CHECKOUT[uid] = dict(state)
+            else:
+                CHECKOUT.pop(uid, None)
+            await api.send(chat_id, "✅ شماره موبایل تأیید شد و حساب بله به پرونده مشترک مشتری متصل شد.")
+            await show_customer_profile_bale(api, chat_id, uid)
+            return True
+        field_map = {"name":"name","address":"address","birth":"birth_date"}
+        if step in field_map:
+            value = parse_jalali_date(text) if step == "birth" else text
+            with get_conn() as conn:
+                with conn.transaction():
+                    save_profile_field(conn, "bale", uid, field_map[step], value)
+            state.pop("profile_flow", None)
+            if state:
+                CHECKOUT[uid] = dict(state)
+            else:
+                CHECKOUT.pop(uid, None)
+            await api.send(chat_id, "✅ پروفایل به‌روزرسانی شد و در هر دو ربات قابل مشاهده است.")
+            await show_customer_profile_bale(api, chat_id, uid)
+            return True
+    except ValueError as exc:
+        await api.send(chat_id, str(exc))
+        return True
+    except Exception:
+        log.exception("Bale profile flow failed")
+        await api.send(chat_id, "عملیات انجام نشد. لطفاً دوباره تلاش کن.")
+        return True
+    return False
+
+
 async def show_catalog(api, chat_id):
     await api.send(chat_id, "یکی از دسته‌ها را انتخاب کن:", category_keyboard())
 
 
-async def show_category(api, chat_id, category):
+async def show_category(api, chat_id, category, uid):
     try:
-        products = await asyncio.to_thread(db_products, category)
+        products = await asyncio.to_thread(db_products, category, uid)
     except Exception:
         log.exception("Cannot read products")
         await api.send(chat_id, "❌ دریافت محصولات از دیتابیس ناموفق بود.")
@@ -1694,7 +1856,9 @@ def customer_order_keyboard(rows):
 
 async def show_my_orders(api, chat_id, uid, mid=None):
     with get_conn() as conn:
-        rows=conn.execute("SELECT id,created_at FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 30",(uid,)).fetchall()
+        with conn.transaction():
+            customer_id=ensure_platform_account(conn,"bale",uid)
+        rows=conn.execute("SELECT id,created_at FROM orders WHERE loyalty_customer_id=%s OR (platform='bale' AND user_id=%s) ORDER BY id DESC LIMIT 30",(customer_id,uid)).fetchall()
     if not rows:
         await api.send(chat_id,"📦 هنوز سفارشی برای این حساب ثبت نشده است.",main_keyboard(uid)); return
     text="📦 <b>سفارش‌های من</b>\n\nبرای مشاهده جزئیات، یک سفارش را انتخاب کن:"
@@ -1836,6 +2000,56 @@ async def handle_admin_text(api, msg, uid, chat_id, text):
         else:
             await show_admin_home(api,chat_id)
         return True
+    if flow.get("type") == "delivery_date":
+        delivery_date = parse_jalali_date(text, allow_future=True)
+        if not delivery_date:
+            await api.send(chat_id, "تاریخ نامعتبر است؛ نمونه درست: ۱۴۰۵/۰۸/۲۰")
+            return True
+        oid = int(flow["order_id"])
+        with get_conn() as conn:
+            order = conn.execute("UPDATE orders SET delivery_date=%s WHERE id=%s RETURNING *", (delivery_date, oid)).fetchone()
+            sms_queued = queue_delivery_sms(conn, order, gregorian_to_jalali(delivery_date)) if order else False
+        CHECKOUT.pop(uid, None)
+        if not order:
+            await api.send(chat_id,"سفارش پیدا نشد؛ تاریخ تحویل ثبت نشد.",admin_keyboard())
+            return True
+        if order.get("platform") == "bale":
+            try: await api.send(int(order["user_id"]), f"📅 تاریخ تحویل سفارش {order.get('display_order_number') or ('#'+str(oid))} تعیین شد: {gregorian_to_jalali(delivery_date)}")
+            except Exception: log.info("Could not send Bale delivery date notice", exc_info=True)
+        await api.send(chat_id, "✅ تاریخ تحویل سفارش ثبت شد و پیامک اطلاع‌رسانی در صف ارسال قرار گرفت." if sms_queued else "✅ تاریخ تحویل ثبت شد؛ اما برای سفارش شماره تماس معتبر وجود نداشت و پیامکی در صف قرار نگرفت.", admin_keyboard())
+        return True
+    if flow.get("type") == "wholesaler_profile_edit" and step == "value":
+        try:
+            with get_conn() as conn:
+                with conn.transaction():
+                    admin_update_wholesaler_profile(conn,int(flow["member_id"]),flow["field"],text)
+        except ValueError as exc:
+            await api.send(chat_id,str(exc)); return True
+        except Exception:
+            log.exception("Bale admin wholesaler profile edit failed")
+            await api.send(chat_id,"ویرایش اطلاعات بنکدار انجام نشد."); return True
+        CHECKOUT.pop(uid,None)
+        await api.send(chat_id,"✅ اطلاعات بنکدار ویرایش شد و در هر دو ربات به‌روزرسانی می‌شود.",admin_keyboard())
+        await show_wholesaler_admin_bale(api,chat_id,"members")
+        return True
+    if flow.get("type") in ("wholesaler_add", "wholesaler_edit") and step == "phone":
+        try:
+            with get_conn() as conn:
+                with conn.transaction():
+                    if flow["type"] == "wholesaler_add":
+                        normalized=add_wholesaler_by_phone(conn,text,uid)
+                    else:
+                        normalized=update_wholesaler_phone(conn,int(flow["member_id"]),text)
+        except ValueError as exc:
+            await api.send(chat_id,str(exc)); return True
+        except Exception:
+            log.exception("Bale admin wholesaler edit/add failed")
+            await api.send(chat_id,"ثبت تغییرات بنکدار انجام نشد؛ ممکن است شماره قبلاً برای بنکدار دیگری ثبت شده باشد.")
+            return True
+        CHECKOUT.pop(uid,None)
+        await api.send(chat_id,f"✅ شماره بنکدار ثبت شد: {mobile_e164_to_local(normalized)}\nپیامک خوشامدگویی در صف ارسال قرار گرفت.",admin_keyboard())
+        await show_wholesaler_admin_bale(api,chat_id,"members")
+        return True
     if flow.get("type") == "assign_order_number":
         raw = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")).strip().upper()
         suffix = raw[3:] if raw.startswith("TN-") else raw
@@ -1947,13 +2161,14 @@ async def handle_admin_text(api, msg, uid, chat_id, text):
             CHECKOUT.pop(uid,None); await api.send(chat_id,f"✅ محصول «{escape(state['name'])}» با شناسه #{row['id']} اضافه شد.",admin_keyboard()); return True
     if flow.get("type")=="product_field":
         pid=int(flow["product_id"]); field=flow["field"]
-        allowed={"name","category","size","color","pack_info","price","photo_url"}
+        allowed={"name","category","size","color","pack_info","price","wholesale_price","photo_url"}
         if field not in allowed: CHECKOUT.pop(uid,None); return True
         value=text.strip()
         if field=="category" and value not in ("بچگانه","زنانه"): await api.send(chat_id,"دسته باید بچگانه یا زنانه باشد."); return True
-        if field=="price":
+        if field in ("price","wholesale_price"):
             try: value=int(value.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹","0123456789")).replace(",","")); assert value>=0
             except Exception: await api.send(chat_id,"قیمت نامعتبر است؛ دوباره به تومان وارد کن."); return True
+            if field=="wholesale_price" and value==0: value=None
         if field=="pack_info" and value.lower() in ("ندارد","ندارم","-","no"): value=""
         if field=="photo_url" and value.lower() in ("ندارد","ندارم","-","no"): value=""
         with get_conn() as conn:
@@ -2036,9 +2251,10 @@ async def show_admin_product(api, chat_id, pid, mid=None, quick=False, price_qui
     if not p: await api.send(chat_id,"محصول پیدا نشد.",admin_back("products")); return
     text=(f"🛍 <b>{escape(str(p['name']))}</b>\nشناسه: #{pid}\nدسته: {escape(str(p['category'] or '-'))}\n"
           f"سایز: {escape(str(p['size'] or '-'))}\nرنگ‌بندی: {escape(str(p.get('color') or '-'))}\n"
-          f"پک: {escape(str(p.get('pack_info') or '-'))}\nقیمت: <b>{int(p['price'] or 0):,} تومان</b>\n"
+          f"پک: {escape(str(p.get('pack_info') or '-'))}\nقیمت عادی: <b>{int(p['price'] or 0):,} تومان</b>\nقیمت بنکداری: <b>{int(p.get('wholesale_price') or 0):,} تومان</b>\n"
           f"وضعیت: {'فعال 🟢' if p['active'] else 'غیرفعال ⚪'}")
-    buttons=[[{"text":"✏️ ویرایش نام","callback_data":f"adm:product_field:{pid}:name"},{"text":"💰 تغییر قیمت","callback_data":f"adm:price_set:{pid}"}],
+    buttons=[[{"text":"✏️ ویرایش نام","callback_data":f"adm:product_field:{pid}:name"},{"text":"💰 قیمت عادی","callback_data":f"adm:price_set:{pid}"}],
+             [{"text":"🏬 قیمت بنکداری","callback_data":f"adm:product_field:{pid}:wholesale_price"}],
              [{"text":"📂 دسته","callback_data":f"adm:product_field:{pid}:category"},{"text":"📏 سایز","callback_data":f"adm:product_field:{pid}:size"}],
              [{"text":"🎨 رنگ","callback_data":f"adm:product_field:{pid}:color"},{"text":"📦 اطلاعات پک","callback_data":f"adm:product_field:{pid}:pack_info"}],
              [{"text":"🖼 تغییر عکس با ارسال تصویر","callback_data":f"adm:product_field:{pid}:photo_url"}],
@@ -2086,21 +2302,63 @@ async def show_admin_bank(api, chat_id, aid, mid=None):
     await api.send(chat_id,text,{"inline_keyboard":buttons})
 
 
+async def show_wholesaler_admin_bale(api, chat_id, view="home", mid=None):
+    with get_conn() as conn:
+        if view == "requests":
+            rows = conn.execute("""SELECT wr.id,wr.phone_e164,wr.created_at,lc.display_name
+                FROM wholesaler_requests wr JOIN loyalty_customers lc ON lc.id=wr.loyalty_customer_id
+                WHERE wr.status='pending' ORDER BY wr.id DESC LIMIT 50""").fetchall()
+            buttons=[]
+            for r in rows:
+                buttons.append([{"text":f"درخواست #{r['id']} · {str(r.get('display_name') or '-')[:18]} · {mobile_e164_to_local(r['phone_e164'])}","callback_data":f"adm:whrequest:{r['id']}"}])
+                buttons.append([{"text":"✅ تأیید","callback_data":f"adm:whapprove:{r['id']}"},{"text":"❌ رد","callback_data":f"adm:whreject:{r['id']}"}])
+            buttons += [[{"text":"🔙 مدیریت بنکداران","callback_data":"adm:wholesalers"}]]
+            text="📨 <b>درخواست‌های عضویت بنکداری</b>\n" + (f"تعداد: {len(rows)}" if rows else "درخواست در انتظار بررسی وجود ندارد.")
+        elif view == "members":
+            rows = conn.execute("""SELECT wm.id,wm.phone_e164,wm.loyalty_customer_id,lc.display_name
+                FROM wholesaler_members wm LEFT JOIN loyalty_customers lc ON lc.id=wm.loyalty_customer_id
+                WHERE wm.active=TRUE ORDER BY wm.id DESC LIMIT 100""").fetchall()
+            buttons=[]
+            for r in rows:
+                label=f"{mobile_e164_to_local(r['phone_e164'])} · {str(r.get('display_name') or 'بدون پروفایل')[:18]}"
+                buttons.append([{"text":label[:60],"callback_data":f"adm:whmember:{r['id']}"}])
+            buttons += [[{"text":"➕ افزودن بنکدار با شماره","callback_data":"adm:whadd"}],
+                        [{"text":"🔙 مدیریت بنکداران","callback_data":"adm:wholesalers"}]]
+            text=f"👥 <b>فهرست بنکداران فعال</b>\nتعداد: {len(rows)}"
+        else:
+            req_count=conn.execute("SELECT COUNT(*) AS n FROM wholesaler_requests WHERE status='pending'").fetchone()["n"]
+            member_count=conn.execute("SELECT COUNT(*) AS n FROM wholesaler_members WHERE active=TRUE").fetchone()["n"]
+            text=("🏬 <b>مدیریت بنکداران تنین ایران</b>\n\n"
+                  f"بنکداران فعال: {member_count}\nدرخواست‌های در انتظار: {req_count}")
+            buttons=[[{"text":"📨 درخواست‌های عضویت","callback_data":"adm:wholesalers:requests"}],
+                     [{"text":"👥 فهرست بنکداران","callback_data":"adm:wholesalers:members"}],
+                     [{"text":"➕ افزودن مستقیم با شماره","callback_data":"adm:whadd"}],
+                     [{"text":"🔙 پنل اصلی","callback_data":"adm:home"}]]
+    markup={"inline_keyboard":buttons}
+    if mid:
+        try: await api.edit(chat_id,mid,text,markup); return
+        except Exception: pass
+    await api.send(chat_id,text,markup)
+
+
 async def show_admin_customer(api, chat_id, customer_id, mid=None):
     with get_conn() as conn:
         c=conn.execute("SELECT * FROM customers WHERE user_id=%s",(customer_id,)).fetchone()
-        orders=conn.execute("SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 10",(customer_id,)).fetchall()
+        account=conn.execute("SELECT loyalty_customer_id FROM customer_platform_accounts WHERE platform='bale' AND platform_user_id=%s",(str(customer_id),)).fetchone()
+        loyalty_customer_id=int(account["loyalty_customer_id"]) if account else None
+        customer_profile=get_profile(conn,loyalty_customer_id) if loyalty_customer_id else {}
+        orders=conn.execute("SELECT * FROM orders WHERE loyalty_customer_id=%s OR (platform='bale' AND user_id=%s) ORDER BY id DESC LIMIT 10",(loyalty_customer_id,customer_id)).fetchall()
         tickets=conn.execute("SELECT id,topic,status FROM support_tickets WHERE user_id=%s ORDER BY id DESC LIMIT 5",(customer_id,)).fetchall()
         loyalty_summary=_loyalty_admin_summary(conn,"bale",customer_id)
     if not c: await api.send(chat_id,"مشتری پیدا نشد.",admin_back("customers")); return
     saved_name=await asyncio.to_thread(db_saved_data,customer_id,"name")
     saved_phone=await asyncio.to_thread(db_saved_data,customer_id,"phone")
     saved_address=await asyncio.to_thread(db_saved_data,customer_id,"address")
-    name=saved_name[0]["value"] if saved_name else c.get("full_name") or "-"
-    phone=saved_phone[0]["value"] if saved_phone else c.get("phone") or "-"
-    address=saved_address[0]["value"] if saved_address else "-"
+    name=customer_profile.get("display_name") or (saved_name[0]["value"] if saved_name else c.get("full_name") or "-")
+    phone=mobile_e164_to_local(customer_profile["phone_e164"]) if customer_profile.get("phone_verified_at") and customer_profile.get("phone_e164") else (saved_phone[0]["value"] if saved_phone else c.get("phone") or "-")
+    address=customer_profile.get("address") or (saved_address[0]["value"] if saved_address else "-")
     total=sum(int(o.get("total_price") or 0) for o in orders if o.get("status") not in ("رد شد","لغو شده"))
-    lines=["👤 <b>جزئیات مشتری</b>",f"نام: {escape(str(name))}",f"شناسه: <code>{customer_id}</code>",f"نام کاربری: @{escape(str(c.get('username') or '-'))}",f"تلفن: {escape(str(phone))}",f"آدرس ذخیره‌شده: {escape(str(address))}",f"جنسیت: {escape(str(c.get('gender') or '-'))}",f"اولین ورود: {format_iran_jalali_fa(c.get('first_seen'),True)}",f"آخرین فعالیت: {format_iran_jalali_fa(c.get('last_seen'),True)}",f"تعداد سفارش‌های اخیر: {len(orders)}",f"مجموع سفارش‌های غیرلغوشده: {total:,} تومان",f"👛 موجودی کیف پول باشگاه: {int((loyalty_summary or {}).get('balance_toman') or 0):,} تومان",f"📩 پیامک سیستمی: {'فعال' if (loyalty_summary or {}).get('sms_enabled',True) else 'غیرفعال'}"]
+    lines=["👤 <b>جزئیات مشتری</b>",f"نام: {escape(str(name))}",f"شناسه: <code>{customer_id}</code>",f"نام کاربری: @{escape(str(c.get('username') or '-'))}",f"تلفن: {escape(str(phone))}",f"آدرس ذخیره‌شده: {escape(str(address))}",f"تاریخ تولد: {escape(gregorian_to_jalali(customer_profile['birth_date']) if customer_profile.get('birth_date') else 'ثبت نشده')}",f"جنسیت: {escape(str(c.get('gender') or '-'))}",f"اولین ورود: {format_iran_jalali_fa(c.get('first_seen'),True)}",f"آخرین فعالیت: {format_iran_jalali_fa(c.get('last_seen'),True)}",f"تعداد سفارش‌های اخیر: {len(orders)}",f"مجموع سفارش‌های غیرلغوشده: {total:,} تومان",f"👛 موجودی کیف پول باشگاه: {int((loyalty_summary or {}).get('balance_toman') or 0):,} تومان",f"📩 پیامک سیستمی: {'فعال' if (loyalty_summary or {}).get('sms_enabled',True) else 'غیرفعال'}"]
     buttons=[]
     for o in orders:
         buttons.append([{"text":f"📦 سفارش #{o['id']} · {str(o['status'])[:15]}",
@@ -2324,13 +2582,14 @@ async def on_message(api, msg):
         if text and await handle_admin_text(api, msg, uid, chat_id, text):
             return
         clean_admin_text = re.sub(r"\s+\(\d+\)$", "", text)
-        if clean_admin_text in ("📦 سفارش‌ها", "💳 پرداخت‌های در انتظار", "🛠 مدیریت محصولات", "🎫 پشتیبانی", "👥 مشتری‌ها", "📊 فروش و آمار", "💳 تنظیمات پرداخت", "📢 مدیریت کانال"):
-            section_map={"📦 سفارش‌ها":"orders","💳 پرداخت‌های در انتظار":"pending","🛠 مدیریت محصولات":"products","🎫 پشتیبانی":"tickets","👥 مشتری‌ها":"customers","📊 فروش و آمار":"sales","💳 تنظیمات پرداخت":"payment","📢 مدیریت کانال":"channel"}
+        if clean_admin_text in ("📦 سفارش‌ها", "💳 پرداخت‌های در انتظار", "🛠 مدیریت محصولات", "🎫 پشتیبانی", "👥 مشتری‌ها", "📊 فروش و آمار", "💳 تنظیمات پرداخت", "📢 مدیریت کانال", "🏬 مدیریت بنکداران"):
+            section_map={"📦 سفارش‌ها":"orders","💳 پرداخت‌های در انتظار":"pending","🛠 مدیریت محصولات":"products","🎫 پشتیبانی":"tickets","👥 مشتری‌ها":"customers","📊 فروش و آمار":"sales","💳 تنظیمات پرداخت":"payment","📢 مدیریت کانال":"channel","🏬 مدیریت بنکداران":"wholesalers"}
             section=section_map[clean_admin_text]
             if section=="products": await show_admin_products(api,chat_id)
             elif section=="payment": await show_admin_banks(api,chat_id)
             elif section=="tickets": await show_support_tickets(api,chat_id,uid,None,True)
             elif section=="channel": await show_admin_channel(api,chat_id)
+            elif section=="wholesalers": await show_wholesaler_admin_bale(api,chat_id)
             else: await show_admin_section(api,chat_id,section)
             return
         if msg.get("photo") or msg.get("document"):
@@ -2341,9 +2600,23 @@ async def on_message(api, msg):
 
     if text.startswith("/start"):
         CHECKOUT.pop(uid, None)
-        try: await asyncio.to_thread(db_register_customer, uid, user.get("username", ""))
-        except Exception: log.exception("Could not register Bale customer on /start")
-        await api.send(chat_id, "🌸 به «تولیدی تنین ایران» خوش آمدی.\n\nاز کاتالوگ محصولات دیدن کن، سبد خریدت را مدیریت کن، سفارش‌هایت را پیگیری کن یا از مرکز پشتیبانی کمک بگیر.", main_keyboard(uid))
+        try:
+            await asyncio.to_thread(db_register_customer, uid, user.get("username", ""))
+            def ensure_bale_identity():
+                with get_conn() as conn:
+                    with conn.transaction():
+                        customer_id=ensure_platform_account(conn, "bale", uid, user.get("first_name") or user.get("username"))
+                        return get_profile(conn,customer_id)
+            profile=await asyncio.to_thread(ensure_bale_identity)
+        except Exception:
+            profile={}
+            log.exception("Could not register Bale customer on /start")
+        welcome="🌸 به «تولیدی تنین ایران» خوش آمدی.\n\nاز کاتالوگ محصولات دیدن کن، سبد خریدت را مدیریت کن، سفارش‌هایت را پیگیری کن یا از مرکز پشتیبانی کمک بگیر."
+        if not profile.get("phone_verified_at"):
+            welcome += "\n\n📱 برای یکپارچه شدن اطلاعات و سوابق خرید تلگرام و بله، از بخش «👤 پروفایل من» شماره موبایلت را با پیامک تأیید کن."
+        await api.send(chat_id, welcome, main_keyboard(uid))
+    elif text == "/profile" or text == "👤 پروفایل من":
+        await show_customer_profile_bale(api, chat_id, uid)
     elif text == "/cancel":
         CHECKOUT.pop(uid, None)
         await api.send(chat_id, "عملیات جاری لغو شد.", main_keyboard())
@@ -2351,6 +2624,8 @@ async def on_message(api, msg):
         await api.send(chat_id, "دسترسی مدیر لازم است.", main_keyboard())
     elif text.startswith("/") and text not in ("/catalog", "/cart", "/checkout", "/orders", "/support"):
         await api.send(chat_id, "از دکمه‌های منو استفاده کن.", main_keyboard())
+    elif await handle_customer_profile_text_bale(api, msg, uid, chat_id, text):
+        return
     elif await handle_checkout_text(api, msg, uid, chat_id, text):
         return
     elif await handle_customer_support_text(api, msg, uid, chat_id, text):
@@ -2569,7 +2844,56 @@ async def on_callback(api, cb):
             action = data.split(":")
             section = action[1] if len(action) > 1 else "home"
             await api.answer(cbid)
-            if section == "smsmanual":
+            if section == "wholesalers":
+                view=action[2] if len(action)>2 else "home"
+                await show_wholesaler_admin_bale(api,chat_id,view,mid)
+            elif section == "whrequest" and len(action)==3:
+                request_id=int(action[2])
+                with get_conn() as conn:
+                    row=conn.execute("""SELECT wr.*,lc.display_name FROM wholesaler_requests wr
+                        JOIN loyalty_customers lc ON lc.id=wr.loyalty_customer_id WHERE wr.id=%s""",(request_id,)).fetchone()
+                if not row:
+                    await api.send(chat_id,"درخواست پیدا نشد.",admin_back("wholesalers:requests"))
+                else:
+                    text=(f"🏬 <b>درخواست بنکداری #{request_id}</b>\nنام: {escape(str(row.get('display_name') or '-'))}\n"
+                          f"شماره تأییدشده: {escape(mobile_e164_to_local(row['phone_e164']))}\nتاریخ درخواست: {escape(str(row['created_at']))}")
+                    await api.send(chat_id,text,{"inline_keyboard":[[{"text":"✅ تأیید عضویت","callback_data":f"adm:whapprove:{request_id}"},{"text":"❌ رد","callback_data":f"adm:whreject:{request_id}"}],[{"text":"🔙 درخواست‌ها","callback_data":"adm:wholesalers:requests"}]]})
+            elif section == "whapprove" and len(action)==3:
+                with get_conn() as conn:
+                    with conn.transaction(): ok=approve_wholesaler_request(conn,int(action[2]),uid)
+                await api.send(chat_id,"✅ درخواست تأیید شد؛ پیامک خوشامدگویی در صف ارسال قرار گرفت." if ok else "درخواست پیدا نشد یا قبلاً بررسی شده است.",admin_back("wholesalers"))
+            elif section == "whreject" and len(action)==3:
+                with get_conn() as conn:
+                    with conn.transaction(): ok=reject_wholesaler_request(conn,int(action[2]),uid)
+                await api.send(chat_id,"درخواست رد شد." if ok else "درخواست پیدا نشد یا قبلاً بررسی شده است.",admin_back("wholesalers:requests"))
+            elif section == "whadd":
+                CHECKOUT[uid]={"admin_flow":{"type":"wholesaler_add","step":"phone","return_to":"wholesalers"}}
+                await api.send(chat_id,"شماره موبایل بنکدار را وارد کن (مثال 09123456789):")
+            elif section == "whmember" and len(action)==3:
+                member_id=int(action[2])
+                with get_conn() as conn:
+                    row=conn.execute("""SELECT wm.*,lc.display_name,lc.address FROM wholesaler_members wm
+                        LEFT JOIN loyalty_customers lc ON lc.id=wm.loyalty_customer_id WHERE wm.id=%s""",(member_id,)).fetchone()
+                if not row: await api.send(chat_id,"بنکدار پیدا نشد.",admin_back("wholesalers:members"))
+                else:
+                    text=(f"🏬 بنکدار #{member_id}\nشماره: {mobile_e164_to_local(row['phone_e164'])}\n"
+                          f"نام: {escape(str(row.get('display_name') or 'هنوز پروفایل متصل نشده'))}\nآدرس: {escape(str(row.get('address') or 'ثبت نشده'))}\nوضعیت: {'فعال' if row['active'] else 'غیرفعال'}")
+                    buttons=[[{"text":"✏️ ویرایش شماره","callback_data":f"adm:whedit:{member_id}"}],
+                             [{"text":"✏️ ویرایش نام","callback_data":f"adm:whprofileedit:{member_id}:name"},{"text":"📍 ویرایش آدرس","callback_data":f"adm:whprofileedit:{member_id}:address"}],
+                             [{"text":"🗑 حذف از بنکداران","callback_data":f"adm:whremove:{member_id}"}],
+                             [{"text":"🔙 فهرست","callback_data":"adm:wholesalers:members"}]]
+                    await api.send(chat_id,text,{"inline_keyboard":buttons})
+            elif section == "whedit" and len(action)==3:
+                CHECKOUT[uid]={"admin_flow":{"type":"wholesaler_edit","step":"phone","member_id":int(action[2]),"return_to":"wholesalers:members"}}
+                await api.send(chat_id,"شماره موبایل جدید بنکدار را وارد کن:")
+            elif section == "whprofileedit" and len(action)==4:
+                CHECKOUT[uid]={"admin_flow":{"type":"wholesaler_profile_edit","step":"value","member_id":int(action[2]),"field":action[3],"return_to":"wholesalers:members"}}
+                await api.send(chat_id,"نام و نام خانوادگی جدید را وارد کن:" if action[3]=="name" else "آدرس اصلی جدید را وارد کن:")
+            elif section == "whremove" and len(action)==3:
+                with get_conn() as conn:
+                    with conn.transaction(): ok=remove_wholesaler(conn,int(action[2]))
+                await api.send(chat_id,"عضویت بنکداری حذف شد." if ok else "بنکدار پیدا نشد.",admin_back("wholesalers:members"))
+            elif section == "smsmanual":
                 choices = [
                     ("صف بررسی مشتری", "order_waiting_customer"),
                     ("اعلان سفارش جدید مدیر", "order_admin_new"),
@@ -2588,6 +2912,12 @@ async def on_callback(api, cb):
                     await api.answer(cbid, "الگوی نامعتبر است.", True); return
                 CHECKOUT[int(uid)] = {"admin_flow":{"type":"manual_pattern_sms","step":"phone","template_key":key}}
                 await api.send(chat_id, "شماره موبایل گیرنده را وارد کن (09xxxxxxxxx). برای لغو /cancel را بفرست.")
+            elif section == "deliverydate" and len(action) >= 3:
+                oid = int(action[2])
+                customer_uid = int(action[4]) if len(action) >= 5 and action[3] == "customer" else None
+                CHECKOUT[uid] = {"admin_flow":{"type":"delivery_date","order_id":oid,
+                    "return_to":f"customer:{customer_uid}" if customer_uid is not None else "orders"}}
+                await api.send(chat_id, f"📅 تاریخ تحویل سفارش #{oid} را به شمسی وارد کن؛ مثال ۱۴۰۵/۰۸/۲۰. برای لغو /cancel را بفرست.")
             elif section == "assignordernumber" and len(action) >= 3:
                 oid = int(action[2])
                 customer_uid = int(action[4]) if len(action) >= 5 and action[3] == "customer" else None
@@ -2706,7 +3036,7 @@ async def on_callback(api, cb):
                 await show_admin_pending_detail(api, chat_id, int(action[2]))
             elif section == "receipt" and len(action) == 3:
                 with get_conn() as conn:
-                    rec = conn.execute("SELECT receipt_file_id FROM pending_payments WHERE id=%s", (int(action[2]),)).fetchone()
+                    rec = conn.execute("SELECT receipt_file_id FROM pending_payments WHERE id=%s AND platform='bale'", (int(action[2]),)).fetchone()
                 if rec and rec["receipt_file_id"]:
                     await api.call("sendPhoto", {"chat_id": chat_id, "photo": rec["receipt_file_id"], "caption": f"رسید پرداخت #{action[2]}"})
                 else:
@@ -2738,6 +3068,7 @@ async def on_callback(api, cb):
                             f"مشتری: {escape(str(o['full_name'] or '-'))}\n"
                             f"تلفن: {escape(str(o['phone'] or '-'))}\n"
                             f"آدرس: {escape(str(o['address'] or '-'))}\n"
+                            f"تاریخ تحویل: {escape(format_iran_jalali_fa(o.get('delivery_date'),False) if o.get('delivery_date') else 'هنوز تعیین نشده')}\n"
                             f"محصولات: {escape(str(o['items_summary'] or '-'))}\n"
                             f"مبلغ: {int(o['total_price'] or 0):,} تومان\n"
                             f"وضعیت: {escape(str(o['status'] or '-'))}")
@@ -2783,9 +3114,9 @@ async def on_callback(api, cb):
                 await show_admin_product(api,chat_id,int(action[2]),mid)
             elif section == "product_field" and len(action)==4:
                 pid=int(action[2]); field=action[3]
-                if field not in {"name","category","size","color","pack_info","price","photo_url"}: await api.send(chat_id,"فیلد نامعتبر است."); return
+                if field not in {"name","category","size","color","pack_info","price","wholesale_price","photo_url"}: await api.send(chat_id,"فیلد نامعتبر است."); return
                 CHECKOUT[uid]={"admin_flow":{"type":"product_field","product_id":pid,"field":field,"return_to":"products"}}
-                labels={"name":"نام جدید را وارد کن:","category":"دسته جدید را وارد کن: بچگانه یا زنانه","size":"سایز جدید را وارد کن:","color":"رنگ‌بندی جدید را وارد کن:","pack_info":"اطلاعات پک جدید را وارد کن (یا ندارد):","price":"قیمت جدید را به تومان وارد کن:","photo_url":"🖼 عکس جدید محصول را مستقیماً از گالری ارسال کن؛ یا برای حذف عکس «ندارد» بنویس:"}
+                labels={"name":"نام جدید را وارد کن:","category":"دسته جدید را وارد کن: بچگانه یا زنانه","size":"سایز جدید را وارد کن:","color":"رنگ‌بندی جدید را وارد کن:","pack_info":"اطلاعات پک جدید را وارد کن (یا ندارد):","price":"قیمت عادی جدید را به تومان وارد کن:","wholesale_price":"قیمت بنکداری را به تومان وارد کن؛ برای حذف عدد ۰ را بفرست:","photo_url":"🖼 عکس جدید محصول را مستقیماً از گالری ارسال کن؛ یا برای حذف عکس «ندارد» بنویس:"}
                 await api.send(chat_id,labels[field])
             elif section == "price_adjust" and len(action)==4:
                 pid=int(action[2]); delta=int(action[3])
@@ -2915,6 +3246,47 @@ async def on_callback(api, cb):
                 await api.send(chat_id, "این عملیات مدیریتی هنوز پیاده‌سازی نشده است.", admin_keyboard())
             return
 
+        if data.startswith("profile:"):
+            action = data.split(":", 1)[1]
+            await api.answer(cbid)
+            if action == "refresh":
+                await show_customer_profile_bale(api, chat_id, uid, mid)
+            elif action == "phone":
+                state = restore_checkout(uid)
+                CHECKOUT[uid] = dict(state)
+                CHECKOUT[uid]["profile_flow"] = {"step":"phone"}
+                await api.send(chat_id, "📱 شماره موبایل خودت را وارد کن (مثال 09123456789). کد تأیید پیامکی ارسال می‌شود. برای لغو /cancel را بفرست.")
+            elif action in ("name", "address", "birth"):
+                state = restore_checkout(uid)
+                CHECKOUT[uid] = dict(state)
+                CHECKOUT[uid]["profile_flow"] = {"step":action}
+                prompts={"name":"نام و نام خانوادگی اصلی را وارد کن:","address":"آدرس اصلی و کامل را وارد کن:","birth":"تاریخ تولد شمسی را وارد کن؛ مثال ۱۳۷۵/۰۶/۲۰:"}
+                await api.send(chat_id,prompts[action])
+            elif action == "wholesaler":
+                try:
+                    with get_conn() as conn:
+                        with conn.transaction():
+                            customer_id=ensure_platform_account(conn,"bale",uid)
+                            status=request_wholesaler(conn,customer_id)
+                            profile=get_profile(conn,customer_id)
+                except Exception:
+                    log.exception("Bale wholesaler request failed")
+                    await api.send(chat_id,"ثبت درخواست انجام نشد؛ دوباره تلاش کن.")
+                    return
+                if status=="phone_unverified":
+                    state=restore_checkout(uid)
+                    state["profile_flow"]={"step":"phone","after_verify":"wholesaler_request"}
+                    CHECKOUT[uid]=dict(state)
+                    await api.send(chat_id,"برای ثبت درخواست بنکداری، شماره موبایلت را وارد کن تا با پیامک تأیید شود:")
+                    return
+                messages={"phone_unverified":"ابتدا شماره موبایل را با پیامک تأیید کن.","already_active":"عضویت بنکداری شما فعال است.","pending":"درخواست شما قبلاً ثبت شده و در انتظار بررسی است.","submitted":"✅ درخواست عضویت بنکداری برای مدیر ارسال شد."}
+                await api.send(chat_id,messages.get(status,"درخواست بررسی شد."))
+                if status=="submitted":
+                    for aid in ADMIN_IDS:
+                        try: await api.send(aid, f"🏬 درخواست عضویت بنکداری جدید\nشناسه مشتری: {customer_id}\nشماره: {mobile_e164_to_local(profile.get('phone_e164') or '')}", {"inline_keyboard":[[{"text":"بررسی درخواست‌ها","callback_data":"adm:wholesalers:requests"}]]})
+                        except Exception: log.exception("Could not notify Bale admin about wholesaler request")
+            return
+
         # مدیر نباید بتواند از callbackهای مشتری برای ساخت سبد یا سفارش استفاده کند.
         if is_admin(uid) and data.startswith(("cat:", "add:", "qty:", "remove:", "checkout:", "checkoutqty:", "saved:", "customer_order:", "support:", "nameconfirm:", "checkoutgender:", "pay:receipt:", "pay:card:")):
             await api.answer(cbid, "این حساب فقط برای مدیریت فروشگاه است.", True)
@@ -2987,7 +3359,9 @@ async def on_callback(api, cb):
             if action=="list": await api.answer(cbid); await show_my_orders(api,chat_id,uid,mid); return
             if action=="view" and len(parts)==3:
                 oid=int(parts[2])
-                with get_conn() as conn: order=conn.execute("SELECT * FROM orders WHERE id=%s AND user_id=%s",(oid,uid)).fetchone()
+                with get_conn() as conn:
+                    with conn.transaction(): customer_id=ensure_platform_account(conn,"bale",uid)
+                    order=conn.execute("SELECT * FROM orders WHERE id=%s AND (loyalty_customer_id=%s OR (platform='bale' AND user_id=%s))",(oid,customer_id,uid)).fetchone()
                 if not order: await api.answer(cbid,"این سفارش برای حساب شما پیدا نشد.",True); return
                 finalized=order.get("finalized_at") or order.get("created_at")
                 text=(f"📦 <b>جزئیات سفارش #{oid}</b>\n━━━━━━━━━━━━━━\n"
@@ -2996,7 +3370,8 @@ async def on_callback(api, cb):
                       f"📌 وضعیت: {escape(str(order.get('status') or '-'))}\n"
                       f"💳 پرداخت: {escape(str(order.get('payment_status') or '-'))}\n\n"
                       f"👤 نام: {escape(str(order.get('full_name') or '-'))}\n📞 تلفن: {escape(str(order.get('phone') or '-'))}\n"
-                      f"📍 آدرس: {escape(str(order.get('address') or '-'))}\n\n🛍 محصولات:\n{escape(str(order.get('items_summary') or '-'))}\n\n"
+                      f"📍 آدرس: {escape(str(order.get('address') or '-'))}\n"
+                      f"📅 تاریخ تحویل: {escape(format_iran_jalali_fa(order.get('delivery_date'),False) if order.get('delivery_date') else 'هنوز تعیین نشده')}\n\n🛍 محصولات:\n{escape(str(order.get('items_summary') or '-'))}\n\n"
                       f"💰 مبلغ: <b>{int(order.get('total_price') or 0):,} تومان</b>")
                 await api.answer(cbid)
                 try: await api.edit(chat_id,mid,text,{"inline_keyboard":[[{"text":"🔙 بازگشت به سفارش‌ها","callback_data":"customer_order:list"}]]})
@@ -3007,7 +3382,9 @@ async def on_callback(api, cb):
             await api.answer(cbid)
             if action=="home": await api.send(chat_id,"💬 <b>مرکز پشتیبانی</b>\n\nیک گزینه را انتخاب کن:",support_home_keyboard()); return
             if action=="orders":
-                with get_conn() as conn: rows=conn.execute("SELECT id,created_at,status FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 20",(uid,)).fetchall()
+                with get_conn() as conn:
+                    with conn.transaction(): customer_id=ensure_platform_account(conn,"bale",uid)
+                    rows=conn.execute("SELECT id,created_at,status FROM orders WHERE loyalty_customer_id=%s OR (platform='bale' AND user_id=%s) ORDER BY id DESC LIMIT 20",(customer_id,uid)).fetchall()
                 buttons=[[{"text":f"📦 سفارش #{o['id']} · {format_iran_jalali_fa(o.get('created_at'),False)} · {str(o['status'])[:12]}","callback_data":f"customer_order:view:{o['id']}"}] for o in rows]
                 buttons.append([{"text":"🔙 مرکز پشتیبانی","callback_data":"support:home"}])
                 await api.send(chat_id,"📦 سفارش موردنظر را برای مشاهده جزئیات انتخاب کن:",{"inline_keyboard":buttons}); return
@@ -3039,7 +3416,7 @@ async def on_callback(api, cb):
             if category not in ("بچگانه", "زنانه"):
                 await api.send(chat_id, "دسته‌بندی نامعتبر است.")
             else:
-                await show_category(api, chat_id, category)
+                await show_category(api, chat_id, category, uid)
         elif data.startswith("add:"):
             pid = int(data.split(":", 1)[1])
             product = await asyncio.to_thread(db_product, pid)
@@ -3147,6 +3524,15 @@ async def on_callback(api, cb):
                 await api.send(chat_id, "اطلاعات ذخیره‌شده به‌روزرسانی شد.", main_keyboard())
             elif action == "edit":
                 data_type, row_id = parts[2], int(parts[3])
+                if data_type == "phone":
+                    with get_conn() as conn:
+                        with conn.transaction():
+                            customer_id=ensure_platform_account(conn,"bale",uid)
+                            profile=get_profile(conn,customer_id)
+                    if profile.get("phone_verified_at"):
+                        await api.answer(cbid)
+                        await api.send(chat_id,"برای تغییر شماره اصلی، از «👤 پروفایل من» گزینه «تأیید / تغییر شماره موبایل» را بزن؛ شماره جدید با پیامک تأیید می‌شود.")
+                        return
                 CHECKOUT[uid] = {"step": "edit_saved", "edit_type": data_type, "edit_id": row_id}
                 await api.answer(cbid)
                 labels={"name":"نام و نام خانوادگی جدید را وارد کن:","phone":"شماره موبایل جدید را وارد کن:","address":"آدرس جدید را وارد کن:"}
@@ -3193,7 +3579,7 @@ async def on_callback(api, cb):
         elif data.startswith("pay:card:"):
             parts=data.split(":"); pid=int(parts[2]) if len(parts)>2 else 0
             with get_conn() as conn:
-                pending=conn.execute("SELECT id,user_id,payment_status FROM pending_payments WHERE id=%s",(pid,)).fetchone()
+                pending=conn.execute("SELECT id,user_id,payment_status FROM pending_payments WHERE id=%s AND platform='bale'",(pid,)).fetchone()
                 bank=conn.execute("SELECT card_number,bank_name,owner_name FROM bank_accounts WHERE active=TRUE ORDER BY id DESC LIMIT 1").fetchone()
             if not pending or int(pending["user_id"])!=int(uid):
                 await api.answer(cbid,"این پرداخت برای حساب شما نیست.",True); return
@@ -3256,23 +3642,33 @@ async def main():
     if not DB_URL:
         raise RuntimeError("متغیر SUPABASE_DB_URL یا DATABASE_URL تنظیم نشده است.")
     def check_db():
-        required = {"products", "customers", "customer_saved_data", "support_tickets", "support_ticket_messages", "cart_items", "bank_accounts", "pending_payments", "orders", "app_meta"}
+        required = {"products", "customers", "customer_saved_data", "support_tickets", "support_ticket_messages", "cart_items", "bank_accounts", "pending_payments", "orders", "app_meta", "loyalty_customers", "customer_platform_accounts", "customer_phone_verifications", "customer_profile_history", "wholesaler_requests", "wholesaler_members", "sms_outbox", "sms_customer_preferences", "wallet_accounts", "loyalty_order_links"}
         with get_conn() as conn:
             found = {r["table_name"] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public'").fetchall()}
             missing = sorted(required - found)
             if missing:
                 raise RuntimeError("جدول‌های لازم در Supabase پیدا نشدند: " + ", ".join(missing))
             for table, columns in {
-                "products": {"id", "name", "category", "price", "active", "photo_url", "pack_info", "size", "color"},
+                "products": {"id", "name", "category", "price", "wholesale_price", "active", "photo_url", "pack_info", "size", "color"},
                 "cart_items": {"id", "user_id", "product_id", "qty"},
                 "bank_accounts": {"id", "bank_name", "owner_name", "card_number", "account_number", "iban", "active", "created_at", "updated_at"},
-                "pending_payments": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "payment_status", "receipt_file_id", "created_at", "reviewed_at", "order_id", "admin_id"},
-                "orders": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "status", "created_at", "finalized_at", "payment_status", "transaction_ref"},
+                "pending_payments": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "payment_status", "receipt_file_id", "created_at", "reviewed_at", "order_id", "admin_id", "platform", "loyalty_customer_id"},
+                "orders": {"id", "user_id", "full_name", "phone", "address", "items_summary", "total_price", "status", "created_at", "finalized_at", "payment_status", "transaction_ref", "delivery_date", "platform", "loyalty_customer_id"},
                 "customers": {"user_id", "username", "full_name", "phone", "gender", "first_seen", "last_seen"},
                 "customer_saved_data": {"id", "user_id", "data_type", "value", "created_at", "updated_at"},
                 "support_tickets": {"id", "user_id", "order_id", "topic", "status", "created_at", "updated_at", "closed_at"},
                 "support_ticket_messages": {"id", "ticket_id", "sender_id", "sender_type", "message", "created_at"},
                 "app_meta": {"key", "value"},
+                "loyalty_customers": {"id", "display_name", "phone_e164", "phone_verified_at", "birth_date", "address", "display_name_updated_at", "address_updated_at", "birth_date_updated_at", "is_wholesaler", "merged_into_id"},
+                "customer_platform_accounts": {"loyalty_customer_id", "platform", "platform_user_id", "linked_at", "last_seen_at"},
+                "customer_phone_verifications": {"id", "platform", "platform_user_id", "loyalty_customer_id", "phone_e164", "code_hash", "salt", "attempts", "created_at", "expires_at", "verified_at", "consumed_at"},
+                "customer_profile_history": {"id", "loyalty_customer_id", "legacy_platform", "data_type", "value", "archived_at"},
+                "wholesaler_requests": {"id", "loyalty_customer_id", "phone_e164", "status", "created_at", "reviewed_at", "reviewed_by"},
+                "wholesaler_members": {"id", "phone_e164", "loyalty_customer_id", "active", "added_by", "created_at", "updated_at"},
+                "sms_outbox": {"id", "destination_phone", "message_text", "message_category", "recipient_type", "status", "idempotency_key"},
+                "sms_customer_preferences": {"loyalty_customer_id", "transactional_sms_enabled", "marketing_enabled_by_admin", "updated_at"},
+                "wallet_accounts": {"id", "loyalty_customer_id", "balance_toman", "updated_at"},
+                "loyalty_order_links": {"platform", "source_order_id", "loyalty_customer_id"},
             }.items():
                 actual = {r["column_name"] for r in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=%s", (table,)).fetchall()}
                 miss = sorted(columns - actual)
