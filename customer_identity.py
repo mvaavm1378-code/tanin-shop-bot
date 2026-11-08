@@ -174,7 +174,7 @@ def get_profile_for_platform(conn, platform: str, platform_user_id, display_name
 
 
 def start_phone_verification(conn, platform: str, platform_user_id, phone: str, display_name=None):
-    """Create OTP and enqueue approved Melipayamak pattern 578916."""
+    """Create OTP and enqueue the approved one-variable Melipayamak pattern 578916."""
     normalized = normalize_mobile_e164(phone)
     if not normalized:
         raise ValueError("شماره موبایل معتبر نیست؛ نمونه: 09123456789")
