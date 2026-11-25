@@ -4739,6 +4739,12 @@ async def async_main():
     # HEAD route would cause a duplicate-route RuntimeError.
     web_app.router.add_get("/health", health_handler)
     web_app.router.add_post(f"/{webhook_path}", webhook_handler)
+    # --- Torob feed: صفحه‌های ساده برای ترب (در صورت خطا، ربات بدون تغییر کار می‌کند) ---
+    try:
+        from torob_feed import register_torob_routes
+        register_torob_routes(web_app, get_conn)
+    except Exception:
+        logger.exception("Torob feed routes could not be registered")
 
     runner = web.AppRunner(web_app)
     await runner.setup()
